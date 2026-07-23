@@ -63,9 +63,19 @@ class _BenchEventSubscriber:
             return
         raw_hex = str(event.payload.get("raw_hex") or "")
         raw = bytes.fromhex(raw_hex.replace(" ", "")) if raw_hex else b""
-        if event.type is ControllerEventType.POLL_SENT:
-            self._tracker.mark_write_start(event.address, monotonic_s=now)
-            self._tracker.mark_write_complete(event.address, monotonic_s=now)
+        write_start = event.payload.get("write_start_monotonic_s")
+        write_complete = event.payload.get("write_complete_monotonic_s")
+        first_byte = event.payload.get("first_byte_monotonic_s")
+
+        if event.type is ControllerEventType.FRAME_SENT and event.detail in {
+            "POLL",
+            "POLL_RETRY",
+        }:
+            # Prefer transport-adjacent monotonic stamps from the controller write path.
+            start_s = float(write_start) if write_start is not None else now
+            complete_s = float(write_complete) if write_complete is not None else now
+            self._tracker.mark_write_start(event.address, monotonic_s=start_s)
+            self._tracker.mark_write_complete(event.address, monotonic_s=complete_s)
             if self._capture is not None and raw:
                 self._capture.record_bytes(
                     direction="TX",
@@ -73,13 +83,16 @@ class _BenchEventSubscriber:
                     port=self._port,
                     adapter_stable_id=self._stable_id,
                     raw=raw,
-                    parsed_frame_type="POLL",
+                    parsed_frame_type=event.detail,
                     dart_address=event.address,
                     sequence=None,
                     crc_valid=None,
                 )
         elif event.type is ControllerEventType.FRAME_SENT and event.detail == "ACK":
-            self._tracker.mark_ack_write(event.address, monotonic_s=now)
+            start_s = float(write_start) if write_start is not None else now
+            complete_s = float(write_complete) if write_complete is not None else now
+            self._tracker.mark_ack_write_start(event.address, monotonic_s=start_s)
+            self._tracker.mark_ack_write(event.address, monotonic_s=complete_s)
             if self._capture is not None and raw:
                 self._capture.record_bytes(
                     direction="TX",
@@ -90,13 +103,16 @@ class _BenchEventSubscriber:
                     parsed_frame_type="ACK",
                     dart_address=event.address,
                 )
+        elif event.type is ControllerEventType.FIRST_RESPONSE_BYTE:
+            byte_s = float(first_byte) if first_byte is not None else now
+            self._tracker.mark_first_response_byte(event.address, monotonic_s=byte_s)
         elif event.type in {
             ControllerEventType.DATA_RECEIVED,
             ControllerEventType.EOT_RECEIVED,
             ControllerEventType.NAK_RECEIVED,
-            ControllerEventType.FRAME_RECEIVED,
         }:
-            self._tracker.mark_first_response_byte(event.address, monotonic_s=now)
+            # Interval 2 uses complete-frame events only (not FRAME_RECEIVED, which
+            # fires before EOT/DATA specialization and would double-count).
             kind = event.type.value
             sample = self._tracker.mark_response(
                 event.address, monotonic_s=now, response_kind=kind
@@ -110,7 +126,11 @@ class _BenchEventSubscriber:
                     raw=raw,
                     parsed_frame_type=kind,
                     dart_address=event.address,
-                    latency_ms=sample.poll_to_response_ms if sample else None,
+                    latency_ms=(
+                        sample.write_complete_to_complete_response_ms
+                        if sample
+                        else None
+                    ),
                 )
         elif event.type is ControllerEventType.RESPONSE_TIMEOUT:
             self._tracker.mark_response(
@@ -169,17 +189,21 @@ async def run_rs485_bench(
             if not skip_open_validation and not path.startswith("/tmp/"):
                 raise
 
+    # pyserial read timeout must stay short (inter-chunk). The configured bench
+    # response timeout remains the software deadline in ControllerLoop only.
+    # Setting read_timeout_s == response_timeout_ms makes every successful
+    # read(n>available) wait ~timeout and falsely clusters latency near 100 ms.
     controller_cfg = expected_serial_config(
         controller_dev.device_path,
         baud_rate=config.baud_rate,
         exclusive_open=config.exclusive_open,
-        read_timeout_s=max(0.01, config.response_timeout_ms / 1000.0),
+        read_timeout_s=0.02,
     )
     simulator_cfg = expected_serial_config(
         simulator_dev.device_path,
         baud_rate=config.baud_rate,
         exclusive_open=config.exclusive_open,
-        read_timeout_s=0.05,
+        read_timeout_s=0.02,
     )
 
     evidence = BenchEvidence(
@@ -226,7 +250,12 @@ async def run_rs485_bench(
         protocol_target_ms=float(config.protocol_target_ms),
         configured_bench_timeout_ms=float(config.response_timeout_ms),
     )
-    evidence.latency = tracker.stats
+    evidence.latency = tracker
+    evidence.notes.append(
+        "latency intervals: write_complete→first_byte, "
+        "write_complete→complete_response, data→ack_start, ack_complete→next_poll; "
+        "protocol_target_ms and configured_bench_timeout_ms are not part of samples"
+    )
 
     capture: JsonlCaptureWriter | None = None
     if capture_path is not None:

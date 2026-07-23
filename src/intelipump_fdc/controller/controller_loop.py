@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -125,7 +126,9 @@ class ControllerLoop:
 
         await self._write_frame(session.build_poll(), address=address, note="POLL")
 
-        frame = await self._read_one_frame(self.runtime.config.response_timeout_ms)
+        frame = await self._read_one_frame(
+            self.runtime.config.response_timeout_ms, address=address
+        )
         if frame is None:
             await self._handle_timeout_with_retries(session)
             self._refresh_totals()
@@ -151,7 +154,9 @@ class ControllerLoop:
             await self._write_frame(
                 session.build_poll(), address=session.address, note="POLL_RETRY"
             )
-            frame = await self._read_one_frame(self.runtime.config.response_timeout_ms)
+            frame = await self._read_one_frame(
+                self.runtime.config.response_timeout_ms, address=session.address
+            )
             if frame is not None and frame.address == session.address:
                 ack = session.handle_response_frame(frame)
                 if ack is not None:
@@ -170,7 +175,9 @@ class ControllerLoop:
         seq = session.state.tx_sequence
         wire = build_data_frame(session.address, seq, item.application_payload)
         await self._write_frame(wire, address=session.address, note="DATA_OUT")
-        resp = await self._read_one_frame(self.runtime.config.response_timeout_ms)
+        resp = await self._read_one_frame(
+            self.runtime.config.response_timeout_ms, address=session.address
+        )
         if resp is None:
             session.state.stats.timeout_count += 1
             return
@@ -182,28 +189,57 @@ class ControllerLoop:
             session.state.stats.nak_count += 1
 
     async def _write_frame(self, data: bytes, *, address: int, note: str) -> None:
+        write_start_s = time.monotonic()
         await self.runtime.transport.write(data)
         await self.runtime.transport.drain()
+        write_complete_s = time.monotonic()
         self.runtime.events.publish(
             ControllerEvent(
                 type=ControllerEventType.FRAME_SENT,
                 address=address,
                 timestamp=datetime.now(UTC),
                 detail=note,
-                payload={"raw_hex": data.hex(" ")},
+                payload={
+                    "raw_hex": data.hex(" "),
+                    "write_start_monotonic_s": write_start_s,
+                    "write_complete_monotonic_s": write_complete_s,
+                },
             )
         )
         if self.runtime.log_frames:
             print(f"TX [{note}] addr={address} {data.hex(' ')}")
 
-    async def _read_one_frame(self, timeout_ms: int) -> DartLineFrame | None:
+    async def _read_one_frame(
+        self, timeout_ms: int, *, address: int | None = None
+    ) -> DartLineFrame | None:
+        """Read until one frame or software deadline.
+
+        The deadline is ``timeout_ms`` (configured bench/protocol timeout).
+        Transport read timeout must stay short so pyserial returns as soon as
+        bytes arrive; it must not equal this deadline or every sample clusters
+        near the timeout.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + (timeout_ms / 1000)
+        first_byte_marked = False
         while loop.time() < deadline:
             chunk = await self.runtime.transport.read(
                 self.runtime.config.read_chunk_size
             )
             if chunk:
+                if not first_byte_marked and address is not None:
+                    first_byte_marked = True
+                    self.runtime.events.publish(
+                        ControllerEvent(
+                            type=ControllerEventType.FIRST_RESPONSE_BYTE,
+                            address=address,
+                            timestamp=datetime.now(UTC),
+                            payload={
+                                "first_byte_monotonic_s": time.monotonic(),
+                                "raw_hex": chunk.hex(" "),
+                            },
+                        )
+                    )
                 if self.runtime.log_frames:
                     print(f"RX raw {chunk.hex(' ')}")
                 for event in self.assembler.feed(chunk):

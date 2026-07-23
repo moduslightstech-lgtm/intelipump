@@ -30,7 +30,11 @@ Fill after a physical two-adapter run. Until adapters are available, set
 - timeouts:
 - retries:
 - reconnects:
-- latency: count/min/max/mean/p50/p95/p99/jitter
+- latency (interval 2 primary): count/min/max/mean/p50/p95/p99/jitter
+- interval 1 write_complete→first_byte:
+- interval 2 write_complete→complete_response:
+- interval 3 data→ack_write_start:
+- interval 4 ack_complete→next_poll:
 - protocol_target_ms: 25
 - configured_bench_timeout_ms: 100
 - fault results:

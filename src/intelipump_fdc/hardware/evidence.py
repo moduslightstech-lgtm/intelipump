@@ -132,6 +132,8 @@ def write_markdown_report(evidence: BenchEvidence, path: Path | str) -> Path:
         "",
         "## Latency",
         "",
+        "_Primary series (interval 2: POLL write complete → complete response)_",
+        "",
         f"- count: {lat.get('count')}",
         f"- min_ms: {lat.get('minimum_ms')}",
         f"- max_ms: {lat.get('maximum_ms')}",
@@ -141,10 +143,43 @@ def write_markdown_report(evidence: BenchEvidence, path: Path | str) -> Path:
         f"- p99_ms: {lat.get('p99_ms')}",
         f"- jitter_ms: {lat.get('jitter_ms')}",
         f"- timeout_count: {lat.get('timeout_count')}",
+        f"- protocol_target_ms: {lat.get('protocol_target_ms')}",
+        f"- configured_bench_timeout_ms: {lat.get('configured_bench_timeout_ms')}",
         "",
-        "## Fault results",
+        "### Separate intervals",
         "",
     ]
+    intervals = lat.get("intervals") or {}
+    for key, label in (
+        (
+            "poll_write_complete_to_first_response_byte",
+            "1. POLL write complete → first response byte",
+        ),
+        (
+            "poll_write_complete_to_complete_response",
+            "2. POLL write complete → complete response",
+        ),
+        (
+            "data_receive_complete_to_ack_write_start",
+            "3. DATA receive complete → ACK write start",
+        ),
+        (
+            "ack_write_complete_to_next_poll_write_start",
+            "4. ACK write complete → next POLL write start",
+        ),
+    ):
+        series = intervals.get(key) or {}
+        lines.append(
+            f"- **{label}**: mean={series.get('mean_ms')} "
+            f"p95={series.get('p95_ms')} count={series.get('count')}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Fault results",
+            "",
+        ]
+    )
     if evidence.fault_scenarios:
         lines.extend(f"- {f}" for f in evidence.fault_scenarios)
     else:

@@ -60,6 +60,20 @@ Outputs:
 `protocol_target_ms` stays **25**. `response-timeout-ms` is the configured bench
 timeout (commonly **100**) and is never used to redefine the protocol target.
 
+### Latency intervals (separate series)
+
+Do **not** interpret a single generic latency as turnaround. Reports track:
+
+1. POLL write complete → first response byte
+2. POLL write complete → complete response frame
+3. DATA receive complete → ACK write start
+4. ACK write complete → next POLL write start
+
+Transport `read_timeout_s` is short (~20 ms inter-chunk). The 100 ms value is
+only the software response deadline. Setting pyserial's read timeout equal to
+the bench deadline makes `read(n)` wait for the full timeout when fewer than
+`n` bytes arrive, falsely clustering means near ~100 ms.
+
 ## Pytest marker
 
 Consistent marker: **`rs485_bench`**

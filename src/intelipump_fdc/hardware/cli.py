@@ -173,11 +173,24 @@ def run(argv: list[str] | None = None) -> None:
                     if evidence.latency is not None and hasattr(evidence.latency, "to_dict")
                     else {}
                 )
+                intervals = lat.get("intervals") or {}
                 print(
-                    f"latency mean_ms={lat.get('mean_ms')} "
+                    "latency (write_complete→complete_response) "
+                    f"mean_ms={lat.get('mean_ms')} "
                     f"p95_ms={lat.get('p95_ms')} p99_ms={lat.get('p99_ms')} "
                     f"jitter_ms={lat.get('jitter_ms')}"
                 )
+                for key in (
+                    "poll_write_complete_to_first_response_byte",
+                    "poll_write_complete_to_complete_response",
+                    "data_receive_complete_to_ack_write_start",
+                    "ack_write_complete_to_next_poll_write_start",
+                ):
+                    series = intervals.get(key) or {}
+                    print(
+                        f"  {key}: mean_ms={series.get('mean_ms')} "
+                        f"count={series.get('count')}"
+                    )
                 print(f"capture={evidence.capture_path}")
                 print(f"evidence_json={evidence.evidence_json_path}")
                 print(f"report={evidence.report_markdown_path}")
