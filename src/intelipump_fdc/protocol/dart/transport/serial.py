@@ -80,6 +80,38 @@ def _parity_constant(parity: SerialParity) -> str:
     }[parity]
 
 
+def read_serial_chunk(ser: object, max_bytes: int) -> bytes:
+    """Read bytes without waiting out the full timeout for a large ``read(n)``.
+
+    pyserial's ``read(n)`` returns only when *n* bytes are available or the
+    port timeout expires. Short DART frames (POLL/EOT) are much smaller than
+    typical chunk sizes, so ``read(256)`` after the first bytes arrive still
+    blocks until timeout — adding tens of ms of false latency.
+
+    Strategy (no busy-spin):
+
+    1. If ``in_waiting > 0``, drain up to ``max_bytes`` immediately.
+    2. Otherwise ``read(1)`` — returns as soon as the first byte arrives
+       (or on timeout if idle).
+    3. Drain any further buffered bytes in the same call.
+    """
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be >= 1")
+    waiting = int(getattr(ser, "in_waiting", 0) or 0)
+    if waiting > 0:
+        return bytes(ser.read(min(max_bytes, waiting)))  # type: ignore[attr-defined]
+    first = bytes(ser.read(1) or b"")  # type: ignore[attr-defined]
+    if not first:
+        return b""
+    if max_bytes == 1:
+        return first
+    waiting = int(getattr(ser, "in_waiting", 0) or 0)
+    if waiting <= 0:
+        return first
+    more = bytes(ser.read(min(max_bytes - 1, waiting)) or b"")  # type: ignore[attr-defined]
+    return first + more
+
+
 class SerialTransport(ByteTransport):
     """Async wrapper around pyserial. Protocol code must not import pyserial."""
 
@@ -159,7 +191,8 @@ class SerialTransport(ByteTransport):
         if max_bytes < 1:
             raise ValueError("max_bytes must be >= 1")
         n = min(max_bytes, self._config.read_chunk_size)
-        return await asyncio.to_thread(self._ser.read, n)  # type: ignore[attr-defined]
+        ser = self._ser
+        return await asyncio.to_thread(read_serial_chunk, ser, n)
 
     async def write(self, data: bytes) -> int:
         if not self.is_open or self._ser is None:

@@ -189,21 +189,23 @@ async def run_rs485_bench(
             if not skip_open_validation and not path.startswith("/tmp/"):
                 raise
 
-    # pyserial read timeout must stay short (inter-chunk). The configured bench
-    # response timeout remains the software deadline in ControllerLoop only.
-    # Setting read_timeout_s == response_timeout_ms makes every successful
-    # read(n>available) wait ~timeout and falsely clusters latency near 100 ms.
+    # Transport read timeout is idle wake spacing only (not the protocol deadline).
+    # SerialTransport uses read(1)+drain so first bytes return immediately; a large
+    # read(n) must not be used as the blocking primitive. Software deadline stays
+    # config.response_timeout_ms (commonly 100). CPU: ~2 ports x (1/timeout) blocking
+    # reads/s when idle - bounded, not a busy-spin (5 ms => ~400 wakes/s total).
+    bench_read_timeout_s = 0.005
     controller_cfg = expected_serial_config(
         controller_dev.device_path,
         baud_rate=config.baud_rate,
         exclusive_open=config.exclusive_open,
-        read_timeout_s=0.02,
+        read_timeout_s=bench_read_timeout_s,
     )
     simulator_cfg = expected_serial_config(
         simulator_dev.device_path,
         baud_rate=config.baud_rate,
         exclusive_open=config.exclusive_open,
-        read_timeout_s=0.02,
+        read_timeout_s=bench_read_timeout_s,
     )
 
     evidence = BenchEvidence(
@@ -256,6 +258,11 @@ async def run_rs485_bench(
         "write_complete→complete_response, data→ack_start, ack_complete→next_poll; "
         "protocol_target_ms and configured_bench_timeout_ms are not part of samples"
     )
+    evidence.notes.append(
+        f"transport_read_timeout_s={bench_read_timeout_s} "
+        "(idle wake only; read(1)+drain); "
+        "ack_to_next_poll includes intentional inter_poll_delay_ms / idle_sleep_ms"
+    )
 
     capture: JsonlCaptureWriter | None = None
     if capture_path is not None:
@@ -269,11 +276,14 @@ async def run_rs485_bench(
         config=PollSchedulerConfig(
             addresses=config.addresses,
             response_timeout_ms=config.response_timeout_ms,
+            # Intentional RS-485 gap between addresses (interval 4 contributor).
             inter_poll_delay_ms=max(1, int(config.inter_frame_delay_ms)),
-            idle_sleep_ms=max(5, int(config.turnaround_delay_ms * 2)),
+            # Round-robin pause; floor matches turnaround, not an extra 5 ms pad.
+            idle_sleep_ms=max(1, int(config.turnaround_delay_ms * 2)),
             max_retries=1,
             max_consecutive_timeouts=5,
             reconnect_delay_s=reconnect.min_delay_s,
+            read_chunk_size=64,
         ),
         log_frames=log_frames,
     )
@@ -297,7 +307,8 @@ async def run_rs485_bench(
     bridge = SimulatorSerialBridge(
         SerialTransport(simulator_cfg),
         config=SerialBridgeConfig(
-            idle_sleep_ms=2,
+            read_chunk_size=64,
+            idle_sleep_ms=0,
             sim_time_step_ms=20,
             log_frames=log_frames,
         ),

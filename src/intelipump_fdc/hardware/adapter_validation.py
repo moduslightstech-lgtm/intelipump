@@ -17,6 +17,7 @@ def expected_serial_config(
     exclusive_open: bool = True,
     read_timeout_s: float = 0.05,
     write_timeout_s: float = 2.0,
+    read_chunk_size: int = 64,
 ) -> SerialConfig:
     return SerialConfig(
         device=device,
@@ -24,6 +25,7 @@ def expected_serial_config(
         data_bits=8,
         parity=SerialParity.ODD,
         stop_bits=1,
+        read_chunk_size=read_chunk_size,
         read_timeout_s=read_timeout_s,
         write_timeout_s=write_timeout_s,
         exclusive_open=exclusive_open,

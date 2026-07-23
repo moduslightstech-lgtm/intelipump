@@ -69,10 +69,18 @@ Do **not** interpret a single generic latency as turnaround. Reports track:
 3. DATA receive complete → ACK write start
 4. ACK write complete → next POLL write start
 
-Transport `read_timeout_s` is short (~20 ms inter-chunk). The 100 ms value is
-only the software response deadline. Setting pyserial's read timeout equal to
-the bench deadline makes `read(n)` wait for the full timeout when fewer than
-`n` bytes arrive, falsely clustering means near ~100 ms.
+Transport `read_timeout_s` is short (~5 ms idle wake). The 100 ms value is
+only the software response deadline. `SerialTransport` uses **read(1)+drain**
+so the first response byte returns as soon as it arrives; a bare `read(256)`
+must not be used as the blocking primitive (it waits out the timeout for short
+DART frames).
+
+**CPU impact (bench):** two ports × ~200 blocking reads/s when idle ≈ 400
+thread-pool wakes/s — bounded, not a busy-spin. Expect low single-digit % CPU
+on a Pi 4/5 versus prior 20 ms wakes (~100/s/port).
+
+**ACK → next POLL** includes intentional `inter_frame_delay_ms` (default 5) and
+round `idle_sleep_ms` (= `2 × turnaround_delay_ms`). It is not pure wire latency.
 
 ## Pytest marker
 

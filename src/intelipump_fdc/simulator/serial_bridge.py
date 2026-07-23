@@ -17,8 +17,10 @@ from intelipump_fdc.simulator.session import SimulatorSession
 
 @dataclass
 class SerialBridgeConfig:
-    read_chunk_size: int = 256
-    idle_sleep_ms: int = 5
+    read_chunk_size: int = 64
+    # When the transport read already blocks on read_timeout_s, keep this at 0
+    # so an empty read does not add a second sleep before the next POLL is seen.
+    idle_sleep_ms: int = 0
     sim_time_step_ms: int = 50
     log_frames: bool = False
     cold_start_on_open: bool = True
@@ -72,8 +74,13 @@ class SimulatorSerialBridge:
                             await self._handle_frame(event.raw)
                         elif self.config.log_frames:
                             print(f"SIM reject {event.kind}: {event.raw.hex(' ')}")
-                else:
+                elif self.config.idle_sleep_ms > 0:
                     await asyncio.sleep(self.config.idle_sleep_ms / 1000)
+                else:
+                    # Transport already waited on read timeout; yield to peer tasks.
+                    await asyncio.sleep(0)
+                # Sim clock advance is independent of wire reply timing; responses
+                # are written in _handle_frame before this tick.
                 self.simulator.advance(self.config.sim_time_step_ms)
         finally:
             await self.transport.close()

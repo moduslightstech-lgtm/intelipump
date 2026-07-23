@@ -264,7 +264,8 @@ class ControllerLoop:
                             )
                         )
             else:
-                await asyncio.sleep(0.001)
+                # Transport read already blocked up to read_timeout_s; yield only.
+                await asyncio.sleep(0)
         return None
 
     def _refresh_totals(self) -> None:
