@@ -1,0 +1,163 @@
+[
+  {
+    "name": "ambiguous_cd1_or_dc1-0",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "UNKNOWN",
+    "expectedTransactionType": "AMBIGUOUS_CD1_OR_DC1",
+    "expectedDecodeStatus": "PARTIAL",
+    "rawTransactionHex": "01 01 05",
+    "sourceFrameRawHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05 60 27 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 10,
+    "notes": "TRANS 0x01 LNG=1 is ambiguous: CD1 (command) and DC1 (pump status) share this wire encoding (Pump Interface Rev 2.11, pages 13 and 20). Merged-bus captures cannot distinguish direction; both interpretations are preserved."
+  },
+  {
+    "name": "ambiguous_cd1_or_dc1-1",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "UNKNOWN",
+    "expectedTransactionType": "AMBIGUOUS_CD1_OR_DC1",
+    "expectedDecodeStatus": "PARTIAL",
+    "rawTransactionHex": "01 01 00",
+    "sourceFrameRawHex": "51 30 01 01 00 A2 9C 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 0,
+    "notes": "TRANS 0x01 LNG=1 is ambiguous: CD1 (command) and DC1 (pump status) share this wire encoding (Pump Interface Rev 2.11, pages 13 and 20). Merged-bus captures cannot distinguish direction; both interpretations are preserved."
+  },
+  {
+    "name": "dc2_filled_volume_amount-2",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "SLAVE_TO_MASTER",
+    "expectedTransactionType": "DC2_FILLED_VOLUME_AMOUNT",
+    "expectedDecodeStatus": "DECODED",
+    "rawTransactionHex": "02 08 00 00 00 00 00 00 00 00",
+    "sourceFrameRawHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05 60 27 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 10,
+    "notes": "Interpreted TRANS 0x02 LNG=8 as DC2 (VOL+AMO). CD2 shares TRANS=0x02 but has a variable nozzle-list layout (Pump Interface pp. 14 and 20).; Volume/amount Decimal values omitted: pump decimal parameters (DC7 DPVOL/DPAMO) were not provided."
+  },
+  {
+    "name": "dc2_filled_volume_amount-3",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "SLAVE_TO_MASTER",
+    "expectedTransactionType": "DC2_FILLED_VOLUME_AMOUNT",
+    "expectedDecodeStatus": "DECODED",
+    "rawTransactionHex": "02 08 00 00 00 00 00 00 00 00",
+    "sourceFrameRawHex": "51 3B 02 08 00 00 00 00 00 00 00 00 21 2D 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 11,
+    "notes": "Interpreted TRANS 0x02 LNG=8 as DC2 (VOL+AMO). CD2 shares TRANS=0x02 but has a variable nozzle-list layout (Pump Interface pp. 14 and 20).; Volume/amount Decimal values omitted: pump decimal parameters (DC7 DPVOL/DPAMO) were not provided."
+  },
+  {
+    "name": "dc3_nozzle_status_price-4",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "SLAVE_TO_MASTER",
+    "expectedTransactionType": "DC3_NOZZLE_STATUS_PRICE",
+    "expectedDecodeStatus": "PARTIAL",
+    "rawTransactionHex": "03 04 00 11 75 01",
+    "sourceFrameRawHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05 60 27 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 10,
+    "notes": "Interpreted TRANS 0x03 LNG=4 as DC3 (PRI+NOZIO). CD3 preset volume shares this wire size (Pump Interface pp. 14 and 21).; Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) were not provided."
+  },
+  {
+    "name": "dc3_nozzle_status_price-5",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "SLAVE_TO_MASTER",
+    "expectedTransactionType": "DC3_NOZZLE_STATUS_PRICE",
+    "expectedDecodeStatus": "PARTIAL",
+    "rawTransactionHex": "03 04 00 11 75 01",
+    "sourceFrameRawHex": "51 3C 01 01 05 03 04 00 11 75 01 1A C7 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 12,
+    "notes": "Interpreted TRANS 0x03 LNG=4 as DC3 (PRI+NOZIO). CD3 preset volume shares this wire size (Pump Interface pp. 14 and 21).; Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) were not provided."
+  },
+  {
+    "name": "cd5_price_update-6",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "MASTER_TO_SLAVE",
+    "expectedTransactionType": "CD5_PRICE_UPDATE",
+    "expectedDecodeStatus": "DECODED",
+    "rawTransactionHex": "05 03 00 11 75",
+    "sourceFrameRawHex": "51 34 05 03 00 11 75 45 42 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 4,
+    "notes": "Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) were not provided."
+  },
+  {
+    "name": "cd5_price_update-7",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "MASTER_TO_SLAVE",
+    "expectedTransactionType": "CD5_PRICE_UPDATE",
+    "expectedDecodeStatus": "DECODED",
+    "rawTransactionHex": "05 03 00 11 75",
+    "sourceFrameRawHex": "50 35 05 03 00 11 75 54 53 03 FA",
+    "pumpAddress": 80,
+    "lineSequence": 5,
+    "notes": "Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) were not provided."
+  },
+  {
+    "name": "cd101_request_totals-8",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "MASTER_TO_SLAVE",
+    "expectedTransactionType": "CD101_REQUEST_TOTALS",
+    "expectedDecodeStatus": "DECODED",
+    "rawTransactionHex": "65 01 01",
+    "sourceFrameRawHex": "51 30 65 01 01 22 83 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 0,
+    "notes": "Decoded from merged-bus capture."
+  },
+  {
+    "name": "cd101_request_totals-9",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "MASTER_TO_SLAVE",
+    "expectedTransactionType": "CD101_REQUEST_TOTALS",
+    "expectedDecodeStatus": "DECODED",
+    "rawTransactionHex": "65 01 01",
+    "sourceFrameRawHex": "51 31 65 01 01 23 7F 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 1,
+    "notes": "Decoded from merged-bus capture."
+  },
+  {
+    "name": "dc101_total_counters-10",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "SLAVE_TO_MASTER",
+    "expectedTransactionType": "DC101_TOTAL_COUNTERS",
+    "expectedDecodeStatus": "DECODED",
+    "rawTransactionHex": "65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00",
+    "sourceFrameRawHex": "51 3D 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 58 F8 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 13,
+    "notes": "DC101 Decimal presentation omitted: decimal parameters unknown and/or COUN meaning does not select a provided scale."
+  },
+  {
+    "name": "dc101_total_counters-11",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "SLAVE_TO_MASTER",
+    "expectedTransactionType": "DC101_TOTAL_COUNTERS",
+    "expectedDecodeStatus": "DECODED",
+    "rawTransactionHex": "65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00",
+    "sourceFrameRawHex": "51 3E 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 1C BC 03 FA",
+    "pumpAddress": 81,
+    "lineSequence": 14,
+    "notes": "DC101 Decimal presentation omitted: decimal parameters unknown and/or COUN meaning does not select a provided scale."
+  },
+  {
+    "name": "multi-transaction-payload",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "direction": "UNKNOWN",
+    "expectedTransactionType": "MULTI",
+    "expectedDecodeStatus": "MIXED",
+    "payloadHex": "02 08 00 00 00 00 00 00 00 00 03 04 00 99 07 07 01 01 05 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00",
+    "sourceFrameRawHex": "50 3E 02 08 00 00 00 00 00 00 00 00 03 04 00 99 07 07 01 01 05 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00 39 10 FA 03 FA",
+    "expectedTransactionCount": 4,
+    "transactionTypes": [
+      "DC2_FILLED_VOLUME_AMOUNT",
+      "DC3_NOZZLE_STATUS_PRICE",
+      "AMBIGUOUS_CD1_OR_DC1",
+      "DC101_TOTAL_COUNTERS"
+    ],
+    "notes": "Single DATA payload containing multiple application transactions."
+  }
+]

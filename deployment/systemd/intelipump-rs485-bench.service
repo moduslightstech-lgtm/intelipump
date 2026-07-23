@@ -1,0 +1,36 @@
+[Unit]
+Description=InteliPump LAB RS-485 office bench (controller side helper)
+Documentation=file:///opt/intelipump-fdc/docs/testing/rs485-office-bench.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=intelipump
+Group=dialout
+WorkingDirectory=/opt/intelipump-fdc
+EnvironmentFile=-/etc/intelipump/lab-rs485-bench.env
+# LAB-only: never set INTELIPUMP_SAFETY__ACTIVE_COMMANDS_ENABLED=true here.
+Environment=INTELIPUMP_ENVIRONMENT=LAB
+Environment=INTELIPUMP_CONTROLLER__MODE=LISTEN_ONLY
+Environment=INTELIPUMP_SAFETY__ACTIVE_COMMANDS_ENABLED=false
+Environment=INTELIPUMP_SAFETY__REMOTE_AUTHORIZATION_ENABLED=false
+ExecStart=/opt/intelipump-fdc/.venv/bin/intelipump-rs485-bench run \
+  --controller-port ${INTELIPUMP_BENCH__CONTROLLER_PORT} \
+  --simulator-port ${INTELIPUMP_BENCH__SIMULATOR_PORT} \
+  --addresses 1,2 \
+  --duration ${INTELIPUMP_BENCH__DURATION_S:-300} \
+  --baud 9600 \
+  --response-timeout-ms 100 \
+  --evidence /var/lib/intelipump/bench/rs485-bench.jsonl \
+  --report /var/lib/intelipump/bench/rs485-bench.md
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=intelipump-rs485-bench
+# Do not auto-enable production or field control.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,916 @@
+{
+  "meta": {
+    "directionPolicy": "All JSONL DATA records use direction=MERGED_BUS; frame direction is UNKNOWN (do not infer from CTRL).",
+    "captureFiles": [
+      "capture_2026-07-19_merged_a.jsonl",
+      "capture_2026-07-19_merged_b.jsonl",
+      "capture_2026-07-19_merged_c.jsonl"
+    ],
+    "provenCrcCandidate": "dart_ibm_ansi_init_0000",
+    "canonicalCrcCandidate": "dart_ibm_ansi_init_0000"
+  },
+  "controlFrames": [
+    {
+      "name": "ctrl-POLL-addr50-ctrl20",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 20 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "POLL",
+      "expectedSequence": null,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-POLL-addr51-ctrl20",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 20 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "POLL",
+      "expectedSequence": null,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-EOT-addr50-ctrl70",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 70 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "EOT",
+      "expectedSequence": 0,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-EOT-addr51-ctrl70",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 70 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "EOT",
+      "expectedSequence": 0,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlCA",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 CA FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 10,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-NAK-addr50-ctrl50",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 50 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "NAK",
+      "expectedSequence": 0,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlCB",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 CB FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 11,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC0",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C0 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 0,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlCC",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 CC FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 12,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC1",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C1 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 1,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlCD",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 CD FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 13,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC2",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C2 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 2,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlCE",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 CE FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 14,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC3",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C3 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 3,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlCF",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 CF FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 15,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC4",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C4 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 4,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC0",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C0 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 0,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC1",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C1 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 1,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC2",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C2 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 2,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC3",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C3 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 3,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC4",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C4 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 4,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC5",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C5 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 5,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC5",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C5 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 5,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC6",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C6 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 6,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC6",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C6 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 6,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC7",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C7 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 7,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC8",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C8 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 8,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlC9",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 C9 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 9,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC7",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C7 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 7,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC8",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C8 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 8,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlCA",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 CA FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 10,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlCB",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 CB FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 11,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlCC",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 CC FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 12,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlCD",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 CD FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 13,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr51-ctrlC9",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 C9 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "ACK",
+      "expectedSequence": 9,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlCE",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 CE FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 14,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-ACK-addr50-ctrlCF",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 CF FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "ACK",
+      "expectedSequence": 15,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-NAK-addr50-ctrl55",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 55 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "NAK",
+      "expectedSequence": 5,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-NAK-addr50-ctrl5C",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 5C FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "NAK",
+      "expectedSequence": 12,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    },
+    {
+      "name": "ctrl-NAK-addr51-ctrl5D",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 5D FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "NAK",
+      "expectedSequence": 13,
+      "expectedCrcValid": null,
+      "notes": "Complete control frame from MERGED_BUS capture; direction UNKNOWN (metadata does not separate master/slave)."
+    }
+  ],
+  "dataFrames": [
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr50-seqE-13",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 3E 02 08 00 00 00 00 00 00 00 00 03 04 00 99 07 07 01 01 05 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00 39 10 FA 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "DATA",
+      "expectedSequence": 14,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "50 3E 02 08 00 00 00 00 00 00 00 00 03 04 00 99 07 07 01 01 05 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00 39 FA 03",
+      "payloadHex": "02 08 00 00 00 00 00 00 00 00 03 04 00 99 07 07 01 01 05 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00",
+      "receivedCrcLow": 57,
+      "receivedCrcHigh": 250,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seq0-0",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 30 65 01 01 22 83 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 0,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 30 65 01 01 22 83 03",
+      "payloadHex": "65 01 01",
+      "receivedCrcLow": 34,
+      "receivedCrcHigh": 131,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seqA-1",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05 60 27 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 10,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05 60 27 03",
+      "payloadHex": "02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05",
+      "receivedCrcLow": 96,
+      "receivedCrcHigh": 39,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seqB-2",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 3B 02 08 00 00 00 00 00 00 00 00 21 2D 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 11,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 3B 02 08 00 00 00 00 00 00 00 00 21 2D 03",
+      "payloadHex": "02 08 00 00 00 00 00 00 00 00",
+      "receivedCrcLow": 33,
+      "receivedCrcHigh": 45,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seq0-3",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 30 01 01 00 A2 9C 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 0,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 30 01 01 00 A2 9C 03",
+      "payloadHex": "01 01 00",
+      "receivedCrcLow": 162,
+      "receivedCrcHigh": 156,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seqC-4",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 3C 01 01 05 03 04 00 11 75 01 1A C7 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 12,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 3C 01 01 05 03 04 00 11 75 01 1A C7 03",
+      "payloadHex": "01 01 05 03 04 00 11 75 01",
+      "receivedCrcLow": 26,
+      "receivedCrcHigh": 199,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seq1-5",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 31 65 01 01 23 7F 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 1,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 31 65 01 01 23 7F 03",
+      "payloadHex": "65 01 01",
+      "receivedCrcLow": 35,
+      "receivedCrcHigh": 127,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seqD-6",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 3D 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 58 F8 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 13,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 3D 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 58 F8 03",
+      "payloadHex": "65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00",
+      "receivedCrcLow": 88,
+      "receivedCrcHigh": 248,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seq2-7",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 32 65 01 01 23 3B 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 2,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 32 65 01 01 23 3B 03",
+      "payloadHex": "65 01 01",
+      "receivedCrcLow": 35,
+      "receivedCrcHigh": 59,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seqE-8",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 3E 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 1C BC 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 14,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 3E 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 1C BC 03",
+      "payloadHex": "65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00",
+      "receivedCrcLow": 28,
+      "receivedCrcHigh": 188,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seq3-9",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 33 65 01 01 22 C7 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 3,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 33 65 01 01 22 C7 03",
+      "payloadHex": "65 01 01",
+      "receivedCrcLow": 34,
+      "receivedCrcHigh": 199,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seqF-10",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 3F 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 21 40 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 15,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 3F 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 21 40 03",
+      "payloadHex": "65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00",
+      "receivedCrcLow": 33,
+      "receivedCrcHigh": 64,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr51-seq4-11",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "51 34 05 03 00 11 75 45 42 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 81,
+      "expectedControlType": "DATA",
+      "expectedSequence": 4,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "51 34 05 03 00 11 75 45 42 03",
+      "payloadHex": "05 03 00 11 75",
+      "receivedCrcLow": 69,
+      "receivedCrcHigh": 66,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr50-seq0-12",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 30 65 01 01 1F 43 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "DATA",
+      "expectedSequence": 0,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "50 30 65 01 01 1F 43 03",
+      "payloadHex": "65 01 01",
+      "receivedCrcLow": 31,
+      "receivedCrcHigh": 67,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr50-seq0-14",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 30 02 08 00 00 00 00 00 00 00 00 03 04 00 99 07 07 01 01 05 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00 D8 43 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "DATA",
+      "expectedSequence": 0,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "50 30 02 08 00 00 00 00 00 00 00 00 03 04 00 99 07 07 01 01 05 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00 D8 43 03",
+      "payloadHex": "02 08 00 00 00 00 00 00 00 00 03 04 00 99 07 07 01 01 05 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00",
+      "receivedCrcLow": 216,
+      "receivedCrcHigh": 67,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr50-seq1-15",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 31 01 01 00 9E A0 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "DATA",
+      "expectedSequence": 1,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "50 31 01 01 00 9E A0 03",
+      "payloadHex": "01 01 00",
+      "receivedCrcLow": 158,
+      "receivedCrcHigh": 160,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr50-seq1-16",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 31 01 01 05 03 04 00 99 07 07 AB 49 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "DATA",
+      "expectedSequence": 1,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "50 31 01 01 05 03 04 00 99 07 07 AB 49 03",
+      "payloadHex": "01 01 05 03 04 00 99 07 07",
+      "receivedCrcLow": 171,
+      "receivedCrcHigh": 73,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr50-seq2-17",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 32 65 01 01 1E FB 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "DATA",
+      "expectedSequence": 2,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "50 32 65 01 01 1E FB 03",
+      "payloadHex": "65 01 01",
+      "receivedCrcLow": 30,
+      "receivedCrcHigh": 251,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr50-seq2-18",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 32 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00 A3 C4 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "DATA",
+      "expectedSequence": 2,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "50 32 65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00 A3 C4 03",
+      "payloadHex": "65 10 01 13 36 38 49 66 13 36 38 49 66 00 00 00 00 00",
+      "receivedCrcLow": 163,
+      "receivedCrcHigh": 196,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    },
+    {
+      "name": "data-capture_2026-07-19_merged_a-addr50-seq3-19",
+      "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+      "rawHex": "50 33 65 01 01 1F 07 03 FA",
+      "direction": "UNKNOWN",
+      "expectedAddress": 80,
+      "expectedControlType": "DATA",
+      "expectedSequence": 3,
+      "expectedCrcValid": true,
+      "notes": "Merged-bus capture; direction UNKNOWN. CRC matches=['dart_ibm_ansi_init_0000']; research cross-check=['research_ibm_ansi_init_0000'].",
+      "unescapedHex": "50 33 65 01 01 1F 07 03",
+      "payloadHex": "65 01 01",
+      "receivedCrcLow": 31,
+      "receivedCrcHigh": 7,
+      "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+      "productionCrcMatches": [
+        "dart_ibm_ansi_init_0000"
+      ],
+      "researchCrcMatches": [
+        "research_ibm_ansi_init_0000"
+      ],
+      "quality": "confirmed_complete"
+    }
+  ]
+}

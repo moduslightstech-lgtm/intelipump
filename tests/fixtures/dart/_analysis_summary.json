@@ -1,0 +1,437 @@
+{
+  "summary": {
+    "captureFiles": [
+      "capture_2026-07-19_merged_a.jsonl",
+      "capture_2026-07-19_merged_b.jsonl",
+      "capture_2026-07-19_merged_c.jsonl"
+    ],
+    "records": 7599,
+    "assembledFrames": 7379,
+    "controlFrames": 5281,
+    "uniqueControlFixtures": 40,
+    "dataCandidates": 2098,
+    "uniqueDataFixtures": 20,
+    "parseErrors": 0,
+    "incompleteTrailingStreams": 0,
+    "controlTypeCounts": {
+      "DATA": 2098,
+      "POLL": 2067,
+      "ACK": 2068,
+      "EOT": 1103,
+      "NAK": 43
+    },
+    "productionCrcMatches": {
+      "dart_ibm_ansi_init_0000": 2098
+    },
+    "researchCrcMatches": {
+      "research_ibm_ansi_init_0000": 2098
+    },
+    "provenCrcCandidate": "dart_ibm_ansi_init_0000",
+    "canonicalCrcCandidate": "dart_ibm_ansi_init_0000",
+    "wrapFto0": 10,
+    "wrapFto1": 7,
+    "dle10FaCount": 44,
+    "literal10Count": 522,
+    "adrFaCount": 0,
+    "ctrlFaCount": 0,
+    "directionNote": "All JSONL DATA records use direction=MERGED_BUS; frame direction is UNKNOWN (do not infer from CTRL).",
+    "sequenceTransitionKinds": {
+      "GAP_OR_RESET": 1710,
+      "INCREMENT": 271,
+      "DUPLICATE": 98,
+      "F_TO_0": 10,
+      "F_TO_1": 7
+    },
+    "ackpollObserved": 0,
+    "iapObserved": 0
+  },
+  "sampleDetailedData": [
+    {
+      "rawHex": "51 30 65 01 01 22 83 03 FA",
+      "crcInputHex": "51 30 65 01 01",
+      "receivedCrc": 33570,
+      "productionValues": {
+        "dart_ibm_ansi_init_0000": 33570,
+        "ccitt_false_init_0000": 49153,
+        "ccitt_false_init_0000_xor_ffff": 16382,
+        "ccitt_true_init_0000": 1653,
+        "ccitt_true_init_0000_xor_ffff": 63882
+      },
+      "researchValues": {
+        "research_ibm_ansi_init_0000": 33570
+      },
+      "experiments": {
+        "excl_adr": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "payload_only": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "incl_etx": {
+          "matches_le": false,
+          "matches_be": false
+        }
+      }
+    },
+    {
+      "rawHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05 60 27 03 FA",
+      "crcInputHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05",
+      "receivedCrc": 10080,
+      "productionValues": {
+        "dart_ibm_ansi_init_0000": 10080,
+        "ccitt_false_init_0000": 6107,
+        "ccitt_false_init_0000_xor_ffff": 59428,
+        "ccitt_true_init_0000": 21700,
+        "ccitt_true_init_0000_xor_ffff": 43835
+      },
+      "researchValues": {
+        "research_ibm_ansi_init_0000": 10080
+      },
+      "experiments": {
+        "excl_adr": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "payload_only": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "incl_etx": {
+          "matches_le": false,
+          "matches_be": false
+        }
+      }
+    },
+    {
+      "rawHex": "51 3B 02 08 00 00 00 00 00 00 00 00 21 2D 03 FA",
+      "crcInputHex": "51 3B 02 08 00 00 00 00 00 00 00 00",
+      "receivedCrc": 11553,
+      "productionValues": {
+        "dart_ibm_ansi_init_0000": 11553,
+        "ccitt_false_init_0000": 15139,
+        "ccitt_false_init_0000_xor_ffff": 50396,
+        "ccitt_true_init_0000": 12735,
+        "ccitt_true_init_0000_xor_ffff": 52800
+      },
+      "researchValues": {
+        "research_ibm_ansi_init_0000": 11553
+      },
+      "experiments": {
+        "excl_adr": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "payload_only": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "incl_etx": {
+          "matches_le": false,
+          "matches_be": false
+        }
+      }
+    },
+    {
+      "rawHex": "51 30 01 01 00 A2 9C 03 FA",
+      "crcInputHex": "51 30 01 01 00",
+      "receivedCrc": 40098,
+      "productionValues": {
+        "dart_ibm_ansi_init_0000": 40098,
+        "ccitt_false_init_0000": 38795,
+        "ccitt_false_init_0000_xor_ffff": 26740,
+        "ccitt_true_init_0000": 29136,
+        "ccitt_true_init_0000_xor_ffff": 36399
+      },
+      "researchValues": {
+        "research_ibm_ansi_init_0000": 40098
+      },
+      "experiments": {
+        "excl_adr": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "payload_only": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "incl_etx": {
+          "matches_le": false,
+          "matches_be": false
+        }
+      }
+    },
+    {
+      "rawHex": "51 3C 01 01 05 03 04 00 11 75 01 1A C7 03 FA",
+      "crcInputHex": "51 3C 01 01 05 03 04 00 11 75 01",
+      "receivedCrc": 50970,
+      "productionValues": {
+        "dart_ibm_ansi_init_0000": 50970,
+        "ccitt_false_init_0000": 33323,
+        "ccitt_false_init_0000_xor_ffff": 32212,
+        "ccitt_true_init_0000": 5043,
+        "ccitt_true_init_0000_xor_ffff": 60492
+      },
+      "researchValues": {
+        "research_ibm_ansi_init_0000": 50970
+      },
+      "experiments": {
+        "excl_adr": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "payload_only": {
+          "matches_le": false,
+          "matches_be": false
+        },
+        "incl_etx": {
+          "matches_le": false,
+          "matches_be": false
+        }
+      }
+    }
+  ],
+  "sampleTransitions": [
+    {
+      "address": 81,
+      "from": 0,
+      "to": 10,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 10,
+      "to": 11,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 81,
+      "from": 11,
+      "to": 0,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 0,
+      "to": 12,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 12,
+      "to": 1,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 1,
+      "to": 13,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 13,
+      "to": 2,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 2,
+      "to": 14,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 14,
+      "to": 3,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 3,
+      "to": 15,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 15,
+      "to": 4,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 0,
+      "to": 14,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 14,
+      "to": 0,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 0,
+      "to": 1,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 80,
+      "from": 1,
+      "to": 1,
+      "kind": "DUPLICATE"
+    },
+    {
+      "address": 80,
+      "from": 1,
+      "to": 2,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 80,
+      "from": 2,
+      "to": 2,
+      "kind": "DUPLICATE"
+    },
+    {
+      "address": 80,
+      "from": 2,
+      "to": 3,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 80,
+      "from": 3,
+      "to": 3,
+      "kind": "DUPLICATE"
+    },
+    {
+      "address": 80,
+      "from": 3,
+      "to": 4,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 80,
+      "from": 4,
+      "to": 4,
+      "kind": "DUPLICATE"
+    },
+    {
+      "address": 80,
+      "from": 4,
+      "to": 5,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 81,
+      "from": 4,
+      "to": 5,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 81,
+      "from": 5,
+      "to": 1,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 1,
+      "to": 6,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 6,
+      "to": 2,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 5,
+      "to": 6,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 80,
+      "from": 6,
+      "to": 5,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 5,
+      "to": 7,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 7,
+      "to": 6,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 6,
+      "to": 8,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 8,
+      "to": 7,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 7,
+      "to": 9,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 2,
+      "to": 7,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 7,
+      "to": 3,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 3,
+      "to": 8,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 81,
+      "from": 8,
+      "to": 4,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 9,
+      "to": 10,
+      "kind": "INCREMENT"
+    },
+    {
+      "address": 80,
+      "from": 10,
+      "to": 8,
+      "kind": "GAP_OR_RESET"
+    },
+    {
+      "address": 80,
+      "from": 8,
+      "to": 11,
+      "kind": "GAP_OR_RESET"
+    }
+  ]
+}

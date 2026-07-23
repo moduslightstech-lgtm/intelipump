@@ -1,0 +1,90 @@
+[
+  {
+    "name": "data-capture_2026-07-19_merged_a-addr51-seq0-0",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "rawHex": "51 30 65 01 01 22 83 03 FA",
+    "direction": "UNKNOWN",
+    "crcInputHex": "51 30 65 01 01",
+    "receivedCrcLow": 34,
+    "receivedCrcHigh": 131,
+    "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+    "notes": "Independent DATA frame matching dart_ibm_ansi_init_0000. Merged-bus capture; direction UNKNOWN."
+  },
+  {
+    "name": "data-capture_2026-07-19_merged_a-addr51-seqA-1",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "rawHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05 60 27 03 FA",
+    "direction": "UNKNOWN",
+    "crcInputHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05",
+    "receivedCrcLow": 96,
+    "receivedCrcHigh": 39,
+    "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+    "notes": "Independent DATA frame matching dart_ibm_ansi_init_0000. Merged-bus capture; direction UNKNOWN."
+  },
+  {
+    "name": "data-capture_2026-07-19_merged_a-addr51-seqB-2",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "rawHex": "51 3B 02 08 00 00 00 00 00 00 00 00 21 2D 03 FA",
+    "direction": "UNKNOWN",
+    "crcInputHex": "51 3B 02 08 00 00 00 00 00 00 00 00",
+    "receivedCrcLow": 33,
+    "receivedCrcHigh": 45,
+    "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+    "notes": "Independent DATA frame matching dart_ibm_ansi_init_0000. Merged-bus capture; direction UNKNOWN."
+  },
+  {
+    "name": "data-capture_2026-07-19_merged_a-addr51-seq0-3",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "rawHex": "51 30 01 01 00 A2 9C 03 FA",
+    "direction": "UNKNOWN",
+    "crcInputHex": "51 30 01 01 00",
+    "receivedCrcLow": 162,
+    "receivedCrcHigh": 156,
+    "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+    "notes": "Independent DATA frame matching dart_ibm_ansi_init_0000. Merged-bus capture; direction UNKNOWN."
+  },
+  {
+    "name": "data-capture_2026-07-19_merged_a-addr51-seqC-4",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "rawHex": "51 3C 01 01 05 03 04 00 11 75 01 1A C7 03 FA",
+    "direction": "UNKNOWN",
+    "crcInputHex": "51 3C 01 01 05 03 04 00 11 75 01",
+    "receivedCrcLow": 26,
+    "receivedCrcHigh": 199,
+    "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+    "notes": "Independent DATA frame matching dart_ibm_ansi_init_0000. Merged-bus capture; direction UNKNOWN."
+  },
+  {
+    "name": "data-capture_2026-07-19_merged_a-addr51-seq1-5",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "rawHex": "51 31 65 01 01 23 7F 03 FA",
+    "direction": "UNKNOWN",
+    "crcInputHex": "51 31 65 01 01",
+    "receivedCrcLow": 35,
+    "receivedCrcHigh": 127,
+    "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+    "notes": "Independent DATA frame matching dart_ibm_ansi_init_0000. Merged-bus capture; direction UNKNOWN."
+  },
+  {
+    "name": "data-capture_2026-07-19_merged_a-addr51-seqD-6",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "rawHex": "51 3D 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00 58 F8 03 FA",
+    "direction": "UNKNOWN",
+    "crcInputHex": "51 3D 65 10 01 00 00 00 00 02 00 00 00 00 02 00 00 00 00 00",
+    "receivedCrcLow": 88,
+    "receivedCrcHigh": 248,
+    "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+    "notes": "Independent DATA frame matching dart_ibm_ansi_init_0000. Merged-bus capture; direction UNKNOWN."
+  },
+  {
+    "name": "data-capture_2026-07-19_merged_a-addr51-seq2-7",
+    "sourceFile": "capture_2026-07-19_merged_a.jsonl",
+    "rawHex": "51 32 65 01 01 23 3B 03 FA",
+    "direction": "UNKNOWN",
+    "crcInputHex": "51 32 65 01 01",
+    "receivedCrcLow": 35,
+    "receivedCrcHigh": 59,
+    "matchingCrcCandidate": "dart_ibm_ansi_init_0000",
+    "notes": "Independent DATA frame matching dart_ibm_ansi_init_0000. Merged-bus capture; direction UNKNOWN."
+  }
+]

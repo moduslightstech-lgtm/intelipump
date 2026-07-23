@@ -1,0 +1,75 @@
+"""Convert sync_queue records into MQTT topic + envelope."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from intelipump_fdc.cloud.messages import CloudMessageEnvelope, build_envelope
+from intelipump_fdc.cloud.qos import qos_for_event
+from intelipump_fdc.cloud.topics import TopicBuilder
+from intelipump_fdc.persistence.dto import SyncQueueRecord
+
+
+class DeliveryMapper:
+    def __init__(
+        self,
+        *,
+        topics: TopicBuilder,
+        device_id: str,
+        station_id: str,
+        environment: str,
+        simulated: bool,
+    ) -> None:
+        self._topics = topics
+        self._device_id = device_id
+        self._station_id = station_id
+        self._environment = environment
+        self._simulated = simulated
+        self._seq = 0
+
+    def next_sequence(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def map_record(
+        self, record: SyncQueueRecord
+    ) -> tuple[str, CloudMessageEnvelope, int]:
+        payload = dict(record.payload)
+        event_type = record.event_type
+        pump_id = _as_str(payload.get("pump_id") or payload.get("logical_pump_id"))
+        transaction_id = _as_str(
+            payload.get("transaction_uuid") or payload.get("transaction_id")
+        )
+        topic = self._topic_for(event_type, pump_id=pump_id)
+        envelope = build_envelope(
+            event_type=event_type,
+            environment=self._environment,
+            device_id=self._device_id,
+            station_id=self._station_id,
+            sequence=self.next_sequence(),
+            simulated=bool(payload.get("simulated", self._simulated)),
+            deduplication_key=record.deduplication_key,
+            payload=payload,
+            pump_id=pump_id,
+            transaction_id=transaction_id,
+            correlation_id=_as_str(payload.get("correlation_id")),
+            occurred_at=_as_str(payload.get("occurred_at")),
+        )
+        return topic, envelope, qos_for_event(event_type)
+
+    def _topic_for(self, event_type: str, *, pump_id: str | None) -> str:
+        if event_type.startswith("TRANSACTION"):
+            return self._topics.transactions(self._station_id)
+        if event_type.startswith("ALARM"):
+            return self._topics.alarms(self._station_id)
+        if event_type.startswith("AUDIT"):
+            return self._topics.audit(self._station_id)
+        if pump_id:
+            return self._topics.pump_events(self._station_id, pump_id)
+        return self._topics.transactions(self._station_id)
+
+
+def _as_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
