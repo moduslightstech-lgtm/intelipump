@@ -1,7 +1,8 @@
 # Phase 11C — Passive Wayne lab-pump preparation (documentation only)
 
-**Status:** Preparation checklist for the first real-hardware *passive* observation.  
-**Not started:** Electrical connection to the Wayne dispenser, active authorization, or Mode change.
+**Status:** Preparation checklist (superseded for execution by
+`docs/wayne-passive-lab-runbook.md` and `intelipump-capture-passive`).  
+**Not started here:** Active authorization or Mode change.
 
 This document does **not** authorize connecting to any production station or customer dispenser. It applies only to a privately owned Wayne dispenser in a controlled development lab.
 

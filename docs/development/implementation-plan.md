@@ -39,6 +39,11 @@ communication health (implemented). Later 11D–11H: backup, host monitoring,
 health CLI, hardware watchdog prep. See `docs/phase-11-deployment-hardening.md`
 and `docs/phase-11c-wayne-passive-lab-test.md`.
 
+## Passive Wayne lab capture (between Phase 11C and Phase 12)
+Receive-only observation tooling and runbook for the privately owned lab
+dispenser. See `docs/wayne-passive-lab-runbook.md`. No authorization.
+Does not start Phase 11D–11H.
+
 ## Phase 12 - Disabled Wayne electronic-head bench
 Receive-only first, then controlled commands.
 
