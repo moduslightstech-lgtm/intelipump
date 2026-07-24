@@ -1,0 +1,33 @@
+[Unit]
+Description=InteliPump LAB DART controller (LISTEN_ONLY)
+Documentation=file:///opt/intelipump-fdc/docs/testing/virtual-serial-lab.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=intelipump
+Group=dialout
+WorkingDirectory=/opt/intelipump-fdc
+EnvironmentFile=-/etc/intelipump/lab-controller.env
+Environment=INTELIPUMP_ENVIRONMENT=LAB
+Environment=INTELIPUMP_CONTROLLER__MODE=LISTEN_ONLY
+Environment=INTELIPUMP_SAFETY__ACTIVE_COMMANDS_ENABLED=false
+Environment=INTELIPUMP_SAFETY__REMOTE_AUTHORIZATION_ENABLED=false
+# Omit --duration so the process runs continuously until systemd stop (SIGTERM).
+ExecStart=/opt/intelipump-fdc/.venv/bin/intelipump-controller \
+  --port ${INTELIPUMP_CONTROLLER__PORT:-/tmp/dart-controller} \
+  --addresses ${INTELIPUMP_CONTROLLER__ADDRESSES:-1,2} \
+  --baud 9600 \
+  --no-persistence
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=intelipump-controller
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

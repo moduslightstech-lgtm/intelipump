@@ -31,7 +31,7 @@ from intelipump_fdc.services.lab_persistence import (
 from intelipump_fdc.services.recovery_service import format_recovery_report
 
 
-def run(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     settings = get_settings()
     parser = argparse.ArgumentParser(
         prog="intelipump-controller",
@@ -40,7 +40,12 @@ def run(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", default="/tmp/dart-controller")
     parser.add_argument("--addresses", default="1,2")
     parser.add_argument("--baud", type=int, default=9600)
-    parser.add_argument("--duration", type=float, default=30.0)
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Optional run duration in seconds. Omit to run continuously.",
+    )
     parser.add_argument("--log-frames", action="store_true")
     parser.add_argument(
         "--mode",
@@ -74,11 +79,39 @@ def run(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Disable SQLite persistence (Phase 6-compatible)",
     )
+    return parser
+
+
+def resolve_duration(duration: float | None) -> float | None:
+    """Map CLI ``--duration`` to controller loop seconds.
+
+    ``None`` means run continuously until SIGTERM/SIGINT / ``request_stop``.
+    Positive values are finite run times. ``0`` and negatives are rejected.
+    """
+    if duration is None:
+        return None
+    if duration < 0:
+        raise ValueError("--duration must not be negative")
+    if duration == 0:
+        raise ValueError(
+            "--duration 0 is not allowed; omit --duration to run continuously"
+        )
+    return duration
+
+
+def run(argv: list[str] | None = None) -> None:
+    settings = get_settings()
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     addresses = tuple(int(x.strip()) for x in args.addresses.split(",") if x.strip())
     if not addresses:
         raise SystemExit("at least one address required")
+
+    try:
+        duration_s = resolve_duration(args.duration)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     mode = ControllerMode(args.mode)
     if mode is ControllerMode.FIELD_CONTROL:
@@ -101,8 +134,6 @@ def run(argv: list[str] | None = None) -> None:
 
         asyncio.run(_reset())
         print(f"LAB database reset: {args.database_url}")
-        if args.duration <= 0:
-            return
 
     async def _main() -> None:
         safety = ControllerSafetyContext(
@@ -155,14 +186,17 @@ def run(argv: list[str] | None = None) -> None:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, loop_ctrl.request_stop)
 
+        duration_label = "continuous" if duration_s is None else f"{duration_s}s"
         print(
             f"controller port={args.port} addresses={addresses} "
-            f"mode={mode.value} duration={args.duration}s "
+            f"mode={mode.value} duration={duration_label} "
             f"db={args.database_url if not args.no_persistence else 'disabled'}"
         )
         try:
-            await loop_ctrl.run(duration_s=args.duration)
+            await loop_ctrl.run(duration_s=duration_s)
         finally:
+            # Graceful shutdown: flush persistence, then transport is closed by
+            # ControllerLoop.run()'s finally (also on SIGTERM via request_stop).
             if persistence is not None:
                 await persistence.shutdown()
 

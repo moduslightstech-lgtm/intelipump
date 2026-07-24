@@ -25,9 +25,11 @@ Terminal 3:
 uv run intelipump-controller \
   --port /tmp/dart-controller \
   --addresses 1,2 \
-  --duration 30 \
   --log-frames
 ```
+
+Omit `--duration` to run continuously until Ctrl+C / SIGTERM. For timed lab
+tests use `--duration 30`. Do not pass `--duration 0` (rejected; omit instead).
 
 ## Pytest marker
 

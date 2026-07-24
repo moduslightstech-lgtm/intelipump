@@ -78,6 +78,19 @@ class ControllerLoop:
         self._stop.set()
 
     async def run(self, *, duration_s: float | None = None) -> None:
+        """Run the poll loop until stop, optional deadline, or transport close.
+
+        ``duration_s=None`` runs continuously until ``request_stop()`` (SIGINT /
+        SIGTERM from the CLI). Positive ``duration_s`` stops after that many
+        seconds. Zero and negative values are rejected.
+        """
+        if duration_s is not None:
+            if duration_s < 0:
+                raise ValueError("duration_s must not be negative")
+            if duration_s == 0:
+                raise ValueError(
+                    "duration_s must be > 0, or None to run continuously"
+                )
         decision = evaluate_polling_allowed(self.runtime.safety)
         if not decision.allowed:
             raise RuntimeError(f"polling not allowed: {decision.reasons}")
