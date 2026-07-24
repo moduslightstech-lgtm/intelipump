@@ -1,5 +1,5 @@
 [Unit]
-Description=InteliPump LAB DART controller (LISTEN_ONLY)
+Description=InteliPump FDC controller (LISTEN_ONLY)
 Documentation=file:///opt/intelipump-fdc/docs/phase-11-deployment-hardening.md
 After=network-online.target
 Wants=network-online.target
@@ -12,18 +12,19 @@ NotifyAccess=main
 User=intelipump
 Group=dialout
 WorkingDirectory=/opt/intelipump-fdc
-EnvironmentFile=-/etc/intelipump/lab-controller.env
+EnvironmentFile=-/etc/intelipump/intelipump.env
 Environment=INTELIPUMP_ENVIRONMENT=LAB
 Environment=INTELIPUMP_CONTROLLER__MODE=LISTEN_ONLY
 Environment=INTELIPUMP_SAFETY__ACTIVE_COMMANDS_ENABLED=false
 Environment=INTELIPUMP_SAFETY__REMOTE_AUTHORIZATION_ENABLED=false
 Environment=INTELIPUMP_MQTT__ENABLED=false
 Environment=INTELIPUMP_WATCHDOG__ENABLED=true
-ExecStart=/opt/intelipump-fdc/.venv/bin/intelipump-controller \
-  --port ${INTELIPUMP_CONTROLLER__PORT:-/tmp/dart-controller} \
-  --addresses ${INTELIPUMP_CONTROLLER__ADDRESSES:-1,2} \
+# Continuous run (omit --duration). SIGTERM triggers STOPPING=1 + flush.
+ExecStart=/opt/intelipump-fdc/venv/bin/intelipump-controller \
+  --port ${INTELIPUMP_DART__SERIAL_PORT:-/dev/intelipump-controller} \
+  --addresses ${INTELIPUMP_API__CONTROLLER_ADDRESSES:-1,2} \
   --baud 9600 \
-  --no-persistence
+  --database-url ${INTELIPUMP_DATABASE__URL:-sqlite+aiosqlite:////var/lib/intelipump/intelipump.db}
 WatchdogSec=30s
 Restart=on-failure
 RestartSec=5s
@@ -31,8 +32,9 @@ TimeoutStopSec=30s
 KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=intelipump-controller
+SyslogIdentifier=intelipump
 NoNewPrivileges=true
+# Do not enable active control or field mode from this unit.
 
 [Install]
 WantedBy=multi-user.target

@@ -16,6 +16,8 @@ from intelipump_fdc.controller.controller_loop import (
 from intelipump_fdc.controller.poll_scheduler import PollSchedulerConfig
 from intelipump_fdc.controller.safety import ControllerSafetyContext
 from intelipump_fdc.core.config import ControllerMode, get_settings
+from intelipump_fdc.core.liveness import LivenessTracker
+from intelipump_fdc.core.systemd_notify import SystemdNotifier
 from intelipump_fdc.persistence.database import create_engine, dispose_engine
 from intelipump_fdc.persistence.errors import SchemaError
 from intelipump_fdc.persistence.migrations import reset_lab_database
@@ -146,6 +148,14 @@ def run(argv: list[str] | None = None) -> None:
         )
         # Keep default LAB helper available for tests; CLI always overrides.
         _ = default_lab_safety
+        notifier = SystemdNotifier.from_env(enabled=settings.watchdog.enabled)
+        liveness = LivenessTracker(
+            controller_mode=mode.value,
+            watchdog_enabled=notifier.enabled,
+            notify_socket_present=notifier.notify_socket_present,
+            database_health="disabled" if args.no_persistence else "unknown",
+            serial_device_status="closed",
+        )
         transport = SerialTransport(
             SerialConfig(
                 device=args.port,
@@ -161,6 +171,9 @@ def run(argv: list[str] | None = None) -> None:
                 response_timeout_ms=args.response_timeout_ms,
             ),
             log_frames=args.log_frames,
+            liveness=liveness,
+            notifier=notifier,
+            status_interval_s=settings.watchdog.status_interval_s,
         )
         loop_ctrl = ControllerLoop(runtime)
         persistence = None
@@ -174,12 +187,23 @@ def run(argv: list[str] | None = None) -> None:
                 simulated=True,
             )
             apply_recovered_contexts(loop_ctrl, persistence.recovery.pump_contexts)
+            liveness.database_health = "ok"
             if args.show_recovery_report:
                 print("--- recovery report ---")
                 if args.json:
                     print(json.dumps(persistence.recovery.to_dict(), indent=2))
                 else:
                     print(format_recovery_report(persistence.recovery))
+        else:
+            liveness.database_health = "disabled"
+
+        # Serial runtime initialized before READY (open is idempotent in run()).
+        try:
+            await transport.open()
+            liveness.serial_device_status = "open"
+        except Exception as exc:
+            liveness.serial_device_status = "error"
+            print(f"serial open deferred: {type(exc).__name__}:{exc}")
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -190,13 +214,21 @@ def run(argv: list[str] | None = None) -> None:
         print(
             f"controller port={args.port} addresses={addresses} "
             f"mode={mode.value} duration={duration_label} "
-            f"db={args.database_url if not args.no_persistence else 'disabled'}"
+            f"db={args.database_url if not args.no_persistence else 'disabled'} "
+            f"watchdog={notifier.enabled}"
+        )
+        # READY only after config, safety, DB recovery, and serial runtime init.
+        notifier.ready(
+            status=(
+                f"mode={mode.value} serial={liveness.serial_device_status} "
+                f"db={liveness.database_health}"
+            )
         )
         try:
             await loop_ctrl.run(duration_s=duration_s)
         finally:
-            # Graceful shutdown: flush persistence, then transport is closed by
-            # ControllerLoop.run()'s finally (also on SIGTERM via request_stop).
+            notifier.stopping()
+            # Graceful shutdown: flush persistence; transport closed by run().
             if persistence is not None:
                 await persistence.shutdown()
 

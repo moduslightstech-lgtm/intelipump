@@ -33,8 +33,10 @@ LAB-only IDs and topics; simulated records clearly marked.
 ## Phase 10 - Physical RS-485 bench
 Two isolated USB-RS485 adapters.
 
-## Phase 11 - Watchdog MCU
-Heartbeat and TX-enable gating.
+## Phase 11 - Watchdog and deployment hardening
+11A internal liveness; 11B systemd sd_notify watchdog; later 11C–11H health,
+backup, host monitoring, and hardware watchdog prep. See
+`docs/phase-11-deployment-hardening.md`.
 
 ## Phase 12 - Disabled Wayne electronic-head bench
 Receive-only first, then controlled commands.

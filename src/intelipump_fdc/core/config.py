@@ -124,6 +124,14 @@ class BenchSettings(BaseModel):
     exclusive_open: bool = True
 
 
+class WatchdogSettings(BaseModel):
+    """Phase 11B systemd sd_notify / watchdog. Disabled by default (dev/tests)."""
+
+    enabled: bool = False
+    # Minimum seconds between STATUS= updates while the loop is healthy.
+    status_interval_s: float = Field(default=15.0, ge=1.0)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -140,6 +148,7 @@ class Settings(BaseSettings):
     mqtt: MqttSettings = MqttSettings()
     api: ApiSettings = ApiSettings()
     bench: BenchSettings = BenchSettings()
+    watchdog: WatchdogSettings = WatchdogSettings()
 
 
 @lru_cache
