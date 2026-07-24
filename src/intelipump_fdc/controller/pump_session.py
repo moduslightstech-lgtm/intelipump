@@ -28,6 +28,10 @@ from intelipump_fdc.state_machine.wayne_mapper import (
     map_wayne_observation,
 )
 
+# Cleared when a valid EOT/DATA proves the link is healthy again.
+# Historical counters (timeout_count, etc.) are never decremented.
+_TRANSIENT_COMMUNICATION_ERRORS = frozenset({"response_timeout"})
+
 
 class PumpSession:
     """Track one DART address: sequences, health, and normalized state."""
@@ -56,6 +60,15 @@ class PumpSession:
     @property
     def address(self) -> int:
         return self.state.address
+
+    def _clear_transient_communication_error(self) -> None:
+        """Clear stale transient link errors after a valid EOT/DATA recovery.
+
+        Does not clear persistent protocol/configuration faults (CRC, sequence,
+        address mismatch, unexpected control, NAK). Does not alter counters.
+        """
+        if self.state.last_error in _TRANSIENT_COMMUNICATION_ERRORS:
+            self.state.last_error = None
 
     def build_poll(self) -> bytes:
         self.state.stats.poll_count += 1
@@ -120,6 +133,7 @@ class PumpSession:
         self.state.consecutive_timeouts = 0
         self.state.last_valid_frame = self.state.last_raw_frame
         self._set_communication(CommunicationHealth.HEALTHY)
+        self._clear_transient_communication_error()
         if self.machine.context.current_state is PumpState.DISCONNECTED:
             self._apply_sm(PumpEvent.COMMUNICATION_STARTED)
         self.events.publish(
@@ -166,6 +180,9 @@ class PumpSession:
             and frame.sequence == self.state.last_accepted_rx_sequence
         ):
             self.state.stats.duplicate_count += 1
+            self.state.consecutive_timeouts = 0
+            self._set_communication(CommunicationHealth.HEALTHY)
+            self._clear_transient_communication_error()
             ack = build_ack(self.address, frame.sequence)
             self.state.stats.ack_sent_count += 1
             self.events.publish(
@@ -199,6 +216,7 @@ class PumpSession:
         self.state.consecutive_timeouts = 0
         self.state.last_valid_frame = frame.raw_frame
         self._set_communication(CommunicationHealth.HEALTHY)
+        self._clear_transient_communication_error()
         if self.machine.context.current_state is PumpState.DISCONNECTED:
             self._apply_sm(PumpEvent.COMMUNICATION_STARTED)
 

@@ -88,3 +88,47 @@ def test_nak_handling() -> None:
     assert s.state.stats.nak_count == 1
     parsed = _parse(build_nak(1, 1))
     assert parsed.control_type is ControlType.NAK
+
+
+def test_timeout_then_eot_clears_transient_last_error() -> None:
+    from intelipump_fdc.controller.session_models import CommunicationHealth
+
+    s = _session()
+    s.on_timeout(max_consecutive=5)
+    s.on_timeout(max_consecutive=5)
+    assert s.state.last_error == "response_timeout"
+    assert s.state.stats.timeout_count == 2
+    assert s.state.communication is CommunicationHealth.DEGRADED
+
+    s.handle_response_frame(_parse(build_eot(1, 0)))
+    assert s.state.communication is CommunicationHealth.HEALTHY
+    assert s.state.last_error is None
+    assert s.state.stats.timeout_count == 2  # historical count retained
+    assert s.state.consecutive_timeouts == 0
+
+
+def test_timeout_then_data_clears_transient_last_error() -> None:
+    from intelipump_fdc.controller.session_models import CommunicationHealth
+
+    s = _session()
+    s.on_timeout(max_consecutive=5)
+    assert s.state.last_error == "response_timeout"
+    assert s.state.stats.timeout_count == 1
+
+    frame = _parse(build_data_frame(1, 0, encode_dc1_status(1)))
+    ack = s.handle_response_frame(frame)
+    assert ack is not None
+    assert s.state.communication is CommunicationHealth.HEALTHY
+    assert s.state.last_error is None
+    assert s.state.stats.timeout_count == 1
+    assert s.state.stats.data_count == 1
+
+
+def test_successful_eot_does_not_clear_persistent_protocol_fault() -> None:
+    from intelipump_fdc.controller.session_models import CommunicationHealth
+
+    s = _session()
+    s.state.last_error = "invalid_crc"
+    s.handle_response_frame(_parse(build_eot(1, 0)))
+    assert s.state.communication is CommunicationHealth.HEALTHY
+    assert s.state.last_error == "invalid_crc"
