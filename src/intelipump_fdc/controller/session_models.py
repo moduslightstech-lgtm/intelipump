@@ -16,6 +16,7 @@ class CommunicationHealth(StrEnum):
     HEALTHY = "HEALTHY"
     DEGRADED = "DEGRADED"
     DISCONNECTED = "DISCONNECTED"
+    FAULTED = "FAULTED"
 
 
 class IdempotencyClass(StrEnum):
@@ -79,6 +80,7 @@ class PumpSessionStats:
     crc_error_count: int = 0
     duplicate_count: int = 0
     sequence_error_count: int = 0
+    address_mismatch_count: int = 0
     retry_count: int = 0
 
 
@@ -91,11 +93,18 @@ class PumpSessionState:
     last_accepted_rx_sequence: int | None = None
     last_poll_at: datetime | None = None
     last_response_at: datetime | None = None
+    last_poll_mono: float | None = None
+    last_valid_response_mono: float | None = None
+    last_valid_eot_mono: float | None = None
+    last_valid_data_mono: float | None = None
     communication: CommunicationHealth = CommunicationHealth.UNKNOWN
     consecutive_timeouts: int = 0
+    consecutive_protocol_faults: int = 0
     last_valid_frame: bytes | None = None
     last_raw_frame: bytes | None = None
     last_error: str | None = None
+    last_transient_error: str | None = None
+    last_persistent_fault: str | None = None
     pending_ack_for_seq: int | None = None
     last_state: PumpState = PumpState.DISCONNECTED
     stats: PumpSessionStats = field(default_factory=PumpSessionStats)

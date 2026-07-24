@@ -1,6 +1,6 @@
-# Phase 11 — Deployment Hardening (11A / 11B)
+# Phase 11 — Deployment Hardening (11A / 11B / 11C)
 
-Status: **11A and 11B implemented**. 11C–11H are not started.
+Status: **11A, 11B, and 11C implemented**. 11D–11H are not started.
 
 ## Scope completed
 
@@ -21,6 +21,23 @@ Status: **11A and 11B implemented**. 11C–11H are not started.
 - `STATUS=` throttled (`INTELIPUMP_WATCHDOG__STATUS_INTERVAL_S`, default 15s)
 - `STOPPING=1` on graceful shutdown (SIGTERM / finally)
 - Missing `NOTIFY_SOCKET` → safe no-op
+
+### 11C — Serial and communication health
+
+- `src/intelipump_fdc/controller/comm_health.py` — serial monitor + backoff
+- Per-pump states: HEALTHY / DEGRADED / DISCONNECTED / FAULTED
+- Defaults: DEGRADED after 3 consecutive timeouts; DISCONNECTED after 10;
+  FAULTED after 3 consecutive persistent protocol faults
+- Reconnect backoff: 0.5s → 1 → 2 → 4 → 8 → max 15s (jitter default 0)
+- Temporary serial loss does not terminate the process
+- Transition logs only (no per-timeout spam)
+- Serial health: `OPEN` / `DEGRADED` / `DISCONNECTED` / `FAULTED`
+  (STATUS token: `open|missing|disconnected|degraded|faulted`)
+- STATUS example:
+  `mode=LISTEN_ONLY serial=open pumps=2/2 healthy reconnects=0 timeouts=0 crc=0 loop_age=0.0s`
+- Read-only `ControllerLoop.health_diagnostic_snapshot()` for a future health CLI
+- Persistent faults retained after valid EOT/DATA; transient `response_timeout` clears
+- Passive Wayne lab checklist: `docs/phase-11c-wayne-passive-lab-test.md`
 
 ## Unit file
 
@@ -51,24 +68,36 @@ Confirm watchdog:
 systemctl show intelipump -p WatchdogUSec,WatchdogTimestamp,StatusText
 ```
 
-## Rollback
+## Pi validation (11C)
 
 ```bash
-sudo systemctl stop intelipump.service
-sudo systemctl disable intelipump.service
-# Restore previous unit if any, or remove:
-sudo rm -f /etc/systemd/system/intelipump.service
-sudo systemctl daemon-reload
-# Optional: set INTELIPUMP_WATCHDOG__ENABLED=false and run Type=simple unit
+sudo systemctl restart intelipump.service
+systemctl show intelipump -p StatusText,NRestarts,ActiveState
+# Unplug USB-RS485 (controller side) briefly; confirm process stays up,
+# StatusText shows serial=missing|disconnected and reconnects increases, then recovers.
+journalctl -u intelipump -e | grep -E 'serial_|pump_communication_|persistent_protocol'
+# Confirm LISTEN_ONLY and no authorize / command replay lines.
 ```
 
 ## Safety impact
 
 - LISTEN_ONLY default unchanged; active commands remain disabled
-- No protocol, retry, state-machine, or command-path changes
+- No protocol framing/CRC/ACK/timing/retry changes
+- Serial loss uses reconnect backoff; does not authorize or replay commands
 - Watchdog disable keeps all existing tests socket-free
+
+## Rollback
+
+```bash
+sudo systemctl stop intelipump.service
+# Redeploy previous package/unit, or:
+sudo systemctl disable intelipump.service
+sudo rm -f /etc/systemd/system/intelipump.service
+sudo systemctl daemon-reload
+# Optional: INTELIPUMP_WATCHDOG__ENABLED=false with Type=simple unit
+```
 
 ## Not in this delivery
 
-11C serial health classification, 11D SQLite backup, 11E host health,
-11F recovery limits, 11G hardware watchdog docs enablement, 11H health CLI.
+11D SQLite backup, 11E host health, 11F recovery limits, 11G hardware watchdog
+docs enablement, 11H health CLI.

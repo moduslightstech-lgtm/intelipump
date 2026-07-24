@@ -7,6 +7,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from intelipump_fdc.controller.comm_health import (
+    HealthThresholds,
+    HealthTransitionLog,
+    SerialHealthMonitor,
+    pump_health_counts,
+    pump_health_summary,
+)
 from intelipump_fdc.controller.outbound import OutboundQueue
 from intelipump_fdc.controller.poll_scheduler import PollSchedulerConfig
 from intelipump_fdc.controller.pump_session import PumpSession
@@ -59,6 +66,8 @@ class ControllerRuntime:
     liveness: LivenessTracker = field(default_factory=LivenessTracker)
     notifier: Notifier = field(default_factory=NullNotifier)
     status_interval_s: float = 15.0
+    serial_health: SerialHealthMonitor | None = None
+    health_transitions: HealthTransitionLog = field(default_factory=HealthTransitionLog)
 
 
 class ControllerLoop:
@@ -66,12 +75,34 @@ class ControllerLoop:
 
     def __init__(self, runtime: ControllerRuntime) -> None:
         self.runtime = runtime
+        thresholds = HealthThresholds(
+            degraded_after_timeouts=runtime.config.degraded_after_timeouts,
+            disconnected_after_timeouts=runtime.config.max_consecutive_timeouts,
+            faulted_after_protocol_errors=runtime.config.faulted_after_protocol_errors,
+            reconnect_min_delay_s=runtime.config.reconnect_min_delay_s,
+            reconnect_max_delay_s=runtime.config.reconnect_max_delay_s,
+            reconnect_jitter=runtime.config.reconnect_jitter,
+        )
+        self.thresholds = thresholds
+        meta = runtime.transport.metadata
+        path = meta.device or ""
+        virtual = meta.is_virtual_or_memory
+        if runtime.serial_health is None:
+            runtime.serial_health = SerialHealthMonitor(
+                configured_path=path,
+                thresholds=thresholds,
+                transitions=runtime.health_transitions,
+                virtual=virtual,
+            )
+        self.serial_health = runtime.serial_health
         self.sessions: dict[int, PumpSession] = {
             addr: PumpSession(
                 address=addr,
                 pump_id=f"pump-{addr}",
                 events=runtime.events,
                 sequence_policy=runtime.config.sequence_policy,
+                thresholds=thresholds,
+                transitions=runtime.health_transitions,
             )
             for addr in runtime.config.addresses
         }
@@ -79,6 +110,7 @@ class ControllerLoop:
         self.totals = ControllerTotals()
         self._stop = asyncio.Event()
         self._last_status_mono: float | None = None
+        self._ever_opened = False
         # Align liveness metadata with safety context.
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
@@ -92,18 +124,92 @@ class ControllerLoop:
     def liveness_snapshot(self) -> LivenessSnapshot:
         self._refresh_totals()
         self._sync_serial_status()
+        states = {a: s.state.communication for a, s in self.sessions.items()}
+        counts = pump_health_counts(states)
+        self.runtime.liveness.reconnect_attempts = (
+            self.serial_health.state.reconnect_attempt_count
+        )
+        self.runtime.liveness.pump_health_summary = pump_health_summary(states)
+        self.runtime.liveness.crc_errors = self.totals.crc_errors
+        self.runtime.liveness.disconnected_pump_count = counts["disconnected"]
+        self.runtime.liveness.faulted_pump_count = counts["faulted"]
+        open_mono = self.serial_health.state.last_open_ok_mono
+        if open_mono is None:
+            self.runtime.liveness.last_serial_open_age_s = None
+        else:
+            self.runtime.liveness.last_serial_open_age_s = max(
+                0.0, time.monotonic() - open_mono
+            )
         return self.runtime.liveness.snapshot(
             total_polls=self.totals.poll_count,
             total_valid_responses=self.totals.eot_count + self.totals.data_count,
             total_timeouts=self.totals.timeouts,
         )
 
+    def health_diagnostic_snapshot(self) -> dict[str, object]:
+        """Read-only in-process health view for a future health CLI.
+
+        Does not write to the database, send protocol frames, or mutate state
+        beyond refreshing aggregate counters already used for STATUS=.
+        """
+        snap = self.liveness_snapshot()
+        return {
+            "overall": {
+                "mode": self.runtime.safety.mode.value,
+                "active_commands_enabled": (
+                    self.runtime.safety.active_commands_enabled
+                ),
+                "listen_only": (
+                    self.runtime.safety.mode.value == ControllerMode.LISTEN_ONLY.value
+                ),
+                "environment": self.runtime.safety.environment,
+            },
+            "liveness": snap.to_dict(),
+            "serial": self.serial_health.state.to_dict(),
+            "pumps": {
+                str(addr): {
+                    "communication": s.state.communication.value,
+                    "last_poll_mono": s.state.last_poll_mono,
+                    "last_valid_eot_mono": s.state.last_valid_eot_mono,
+                    "last_valid_data_mono": s.state.last_valid_data_mono,
+                    "last_valid_response_at": (
+                        s.state.last_response_at.isoformat()
+                        if s.state.last_response_at
+                        else None
+                    ),
+                    "consecutive_timeouts": s.state.consecutive_timeouts,
+                    "cumulative_timeouts": s.state.stats.timeout_count,
+                    "crc_errors": s.state.stats.crc_error_count,
+                    "nak_count": s.state.stats.nak_count,
+                    "duplicate_count": s.state.stats.duplicate_count,
+                    "address_mismatch_count": s.state.stats.address_mismatch_count,
+                    "sequence_mismatch_count": s.state.stats.sequence_error_count,
+                    "transient_error": s.state.last_transient_error,
+                    "persistent_fault": s.state.last_persistent_fault,
+                }
+                for addr, s in self.sessions.items()
+            },
+            "thresholds": {
+                "degraded_after_timeouts": self.thresholds.degraded_after_timeouts,
+                "disconnected_after_timeouts": (
+                    self.thresholds.disconnected_after_timeouts
+                ),
+                "faulted_after_protocol_errors": (
+                    self.thresholds.faulted_after_protocol_errors
+                ),
+                "reconnect_min_delay_s": self.thresholds.reconnect_min_delay_s,
+                "reconnect_max_delay_s": self.thresholds.reconnect_max_delay_s,
+            },
+        }
+
     def _sync_serial_status(self) -> None:
         transport = self.runtime.transport
-        if transport.is_open:
-            self.runtime.liveness.serial_device_status = "open"
-        else:
-            self.runtime.liveness.serial_device_status = "closed"
+        self.serial_health.sync_from_transport(is_open=transport.is_open)
+        self.runtime.liveness.serial_device_status = self.serial_health.state.status
+
+    def _mark_all_pumps_disconnected(self) -> None:
+        for session in self.sessions.values():
+            session.mark_serial_lost()
 
     def _on_loop_progress(self) -> None:
         """Mark iteration complete and feed systemd watchdog from real progress."""
@@ -138,7 +244,14 @@ class ControllerLoop:
         if not decision.allowed:
             raise RuntimeError(f"polling not allowed: {decision.reasons}")
 
-        await self.runtime.transport.open()
+        try:
+            await self.runtime.transport.open()
+            self.serial_health.observe_open_success(is_reconnect=False)
+            self._ever_opened = True
+        except Exception as exc:
+            self.serial_health.observe_open_failure(f"{type(exc).__name__}:{exc}")
+            self._mark_all_pumps_disconnected()
+            # Backoff sleep is performed in _reconnect (no busy-loop, no crash).
         self._sync_serial_status()
         deadline = (
             None
@@ -155,8 +268,7 @@ class ControllerLoop:
                 if not self.runtime.transport.is_open:
                     self._sync_serial_status()
                     await self._reconnect()
-                    # Still mark progress so a reconnect wait does not look hung
-                    # to systemd while we are actively recovering.
+                    # Feed watchdog only from bounded reconnect-recovery progress.
                     self._on_loop_progress()
                     continue
                 for address in self.runtime.config.addresses:
@@ -167,6 +279,13 @@ class ControllerLoop:
                     except Exception as exc:
                         session = self.sessions[address]
                         session.state.last_error = f"poll_error:{type(exc).__name__}:{exc}"
+                        # Transport errors may close the port mid-cycle.
+                        if not self.runtime.transport.is_open:
+                            self.serial_health.observe_closed(
+                                reason=f"{type(exc).__name__}:{exc}"
+                            )
+                            self._mark_all_pumps_disconnected()
+                            break
                         if self.runtime.log_frames:
                             print(f"pump {address} error: {exc}")
                     await asyncio.sleep(self.runtime.config.inter_poll_delay_ms / 1000)
@@ -175,14 +294,26 @@ class ControllerLoop:
                 await asyncio.sleep(self.runtime.config.idle_sleep_ms / 1000)
         finally:
             await self.runtime.transport.close()
+            self.serial_health.observe_closed(reason="shutdown")
             self._sync_serial_status()
 
     async def _reconnect(self) -> None:
-        await asyncio.sleep(self.runtime.config.reconnect_delay_s)
+        """Bounded exponential reconnect; never issues dispenser commands."""
+        assert self.runtime.safety.active_commands_enabled is False
+        delay = self.serial_health.state.current_reconnect_delay_s
+        if delay <= 0:
+            delay = self.serial_health.observe_open_failure("port_not_open")
+        await asyncio.sleep(delay)
         try:
             await self.runtime.transport.open()
-        except Exception:
+        except Exception as exc:
+            self.serial_health.observe_open_failure(f"{type(exc).__name__}:{exc}")
+            self._mark_all_pumps_disconnected()
             return
+        self.serial_health.observe_open_success(is_reconnect=self._ever_opened)
+        self._ever_opened = True
+        # Assembler may hold partial bytes from a previous connection.
+        self.assembler = FrameStreamAssembler()
 
     async def _poll_one(self, address: int) -> None:
         session = self.sessions[address]
@@ -199,7 +330,7 @@ class ControllerLoop:
             return
 
         if frame.address != address:
-            session.state.last_error = f"response_address_{frame.address}"
+            session.handle_response_frame(frame)  # records address_mismatch/FAULTED
             self._refresh_totals()
             return
 
@@ -210,9 +341,7 @@ class ControllerLoop:
         self._refresh_totals()
 
     async def _handle_timeout_with_retries(self, session: PumpSession) -> None:
-        session.on_timeout(
-            max_consecutive=self.runtime.config.max_consecutive_timeouts
-        )
+        session.on_timeout()
         for _ in range(self.runtime.config.max_retries):
             if self._stop.is_set():
                 return
@@ -230,9 +359,7 @@ class ControllerLoop:
                     )
                 self.runtime.liveness.mark_successful_poll()
                 return
-            session.on_timeout(
-                max_consecutive=self.runtime.config.max_consecutive_timeouts
-            )
+            session.on_timeout()
 
     async def _maybe_send_outbound(self, session: PumpSession) -> None:
         item = self.runtime.outbound.pop_for_address(session.address)

@@ -1,4 +1,4 @@
-"""Internal controller liveness tracking (Phase 11A).
+"""Internal controller liveness tracking (Phase 11A / 11C STATUS).
 
 Uses monotonic clocks for hang detection. Wall-clock timestamps are only for
 reporting (process start). No database I/O.
@@ -28,6 +28,12 @@ class LivenessSnapshot:
     serial_device_status: str
     watchdog_enabled: bool = False
     notify_socket_present: bool = False
+    reconnect_attempts: int = 0
+    pump_health_summary: str = ""
+    crc_errors: int = 0
+    disconnected_pump_count: int = 0
+    faulted_pump_count: int = 0
+    last_serial_open_age_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +49,12 @@ class LivenessSnapshot:
             "serial_device_status": self.serial_device_status,
             "watchdog_enabled": self.watchdog_enabled,
             "notify_socket_present": self.notify_socket_present,
+            "reconnect_attempts": self.reconnect_attempts,
+            "pump_health_summary": self.pump_health_summary,
+            "crc_errors": self.crc_errors,
+            "disconnected_pump_count": self.disconnected_pump_count,
+            "faulted_pump_count": self.faulted_pump_count,
+            "last_serial_open_age_s": self.last_serial_open_age_s,
         }
 
     def status_line(self) -> str:
@@ -52,19 +64,15 @@ class LivenessSnapshot:
             if self.last_loop_progress_age_s is None
             else f"{self.last_loop_progress_age_s:.1f}s"
         )
-        poll_age = (
-            "n/a"
-            if self.last_successful_poll_age_s is None
-            else f"{self.last_successful_poll_age_s:.1f}s"
-        )
+        pumps = self.pump_health_summary or "0/0 healthy"
         return (
             f"mode={self.controller_mode} "
             f"serial={self.serial_device_status} "
-            f"db={self.database_health} "
-            f"loop_age={loop_age} "
-            f"poll_age={poll_age} "
-            f"polls={self.total_polls} "
-            f"timeouts={self.total_timeouts}"
+            f"pumps={pumps} "
+            f"reconnects={self.reconnect_attempts} "
+            f"timeouts={self.total_timeouts} "
+            f"crc={self.crc_errors} "
+            f"loop_age={loop_age}"
         )
 
 
@@ -81,6 +89,12 @@ class LivenessTracker:
     controller_mode: str = "LISTEN_ONLY"
     watchdog_enabled: bool = False
     notify_socket_present: bool = False
+    reconnect_attempts: int = 0
+    pump_health_summary: str = ""
+    crc_errors: int = 0
+    disconnected_pump_count: int = 0
+    faulted_pump_count: int = 0
+    last_serial_open_age_s: float | None = None
 
     def mark_loop_progress(self) -> None:
         """Call once per completed controller-loop iteration (non-blocking)."""
@@ -118,4 +132,10 @@ class LivenessTracker:
             serial_device_status=self.serial_device_status,
             watchdog_enabled=self.watchdog_enabled,
             notify_socket_present=self.notify_socket_present,
+            reconnect_attempts=self.reconnect_attempts,
+            pump_health_summary=self.pump_health_summary,
+            crc_errors=self.crc_errors,
+            disconnected_pump_count=self.disconnected_pump_count,
+            faulted_pump_count=self.faulted_pump_count,
+            last_serial_open_age_s=self.last_serial_open_age_s,
         )

@@ -34,9 +34,10 @@ LAB-only IDs and topics; simulated records clearly marked.
 Two isolated USB-RS485 adapters.
 
 ## Phase 11 - Watchdog and deployment hardening
-11A internal liveness; 11B systemd sd_notify watchdog; later 11C–11H health,
-backup, host monitoring, and hardware watchdog prep. See
-`docs/phase-11-deployment-hardening.md`.
+11A internal liveness; 11B systemd sd_notify watchdog; 11C serial/pump
+communication health (implemented). Later 11D–11H: backup, host monitoring,
+health CLI, hardware watchdog prep. See `docs/phase-11-deployment-hardening.md`
+and `docs/phase-11c-wayne-passive-lab-test.md`.
 
 ## Phase 12 - Disabled Wayne electronic-head bench
 Receive-only first, then controlled commands.

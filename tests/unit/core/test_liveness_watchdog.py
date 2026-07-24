@@ -67,6 +67,10 @@ class RecordingNotifier:
 
 def test_liveness_uses_monotonic_ages() -> None:
     tracker = LivenessTracker(controller_mode="LISTEN_ONLY")
+    tracker.serial_device_status = "open"
+    tracker.pump_health_summary = "2/2 healthy"
+    tracker.reconnect_attempts = 0
+    tracker.crc_errors = 0
     assert tracker.snapshot().last_loop_progress_age_s is None
     tracker.mark_loop_progress()
     tracker.mark_successful_poll()
@@ -78,7 +82,14 @@ def test_liveness_uses_monotonic_ages() -> None:
     assert snap.total_polls == 3
     assert snap.total_timeouts == 1
     assert snap.controller_mode == "LISTEN_ONLY"
-    assert "mode=LISTEN_ONLY" in snap.status_line()
+    line = snap.status_line()
+    assert "mode=LISTEN_ONLY" in line
+    assert "serial=open" in line
+    assert "pumps=2/2 healthy" in line
+    assert "reconnects=0" in line
+    assert "timeouts=1" in line
+    assert "crc=0" in line
+    assert "loop_age=" in line
 
 
 def test_watchdog_usec_from_env() -> None:
@@ -195,7 +206,7 @@ async def test_loop_progress_feeds_watchdog_and_liveness() -> None:
     assert snap.total_polls > 0
     assert snap.controller_mode == "LISTEN_ONLY"
     assert runtime.safety.active_commands_enabled is False
-    assert snap.serial_device_status == "closed"  # closed after run() finally
+    assert snap.serial_device_status == "disconnected"  # closed after run() finally
 
 
 @pytest.mark.asyncio

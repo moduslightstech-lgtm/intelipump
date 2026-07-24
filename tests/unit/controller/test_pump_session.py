@@ -94,16 +94,17 @@ def test_timeout_then_eot_clears_transient_last_error() -> None:
     from intelipump_fdc.controller.session_models import CommunicationHealth
 
     s = _session()
-    s.on_timeout(max_consecutive=5)
-    s.on_timeout(max_consecutive=5)
+    s.on_timeout()
+    s.on_timeout()
+    s.on_timeout()
     assert s.state.last_error == "response_timeout"
-    assert s.state.stats.timeout_count == 2
+    assert s.state.stats.timeout_count == 3
     assert s.state.communication is CommunicationHealth.DEGRADED
 
     s.handle_response_frame(_parse(build_eot(1, 0)))
     assert s.state.communication is CommunicationHealth.HEALTHY
     assert s.state.last_error is None
-    assert s.state.stats.timeout_count == 2  # historical count retained
+    assert s.state.stats.timeout_count == 3  # historical count retained
     assert s.state.consecutive_timeouts == 0
 
 
@@ -111,7 +112,7 @@ def test_timeout_then_data_clears_transient_last_error() -> None:
     from intelipump_fdc.controller.session_models import CommunicationHealth
 
     s = _session()
-    s.on_timeout(max_consecutive=5)
+    s.on_timeout()
     assert s.state.last_error == "response_timeout"
     assert s.state.stats.timeout_count == 1
 
@@ -129,6 +130,7 @@ def test_successful_eot_does_not_clear_persistent_protocol_fault() -> None:
 
     s = _session()
     s.state.last_error = "invalid_crc"
+    s.state.last_persistent_fault = "invalid_crc"
     s.handle_response_frame(_parse(build_eot(1, 0)))
     assert s.state.communication is CommunicationHealth.HEALTHY
-    assert s.state.last_error == "invalid_crc"
+    assert s.state.last_persistent_fault == "invalid_crc"

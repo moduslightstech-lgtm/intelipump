@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 
+from intelipump_fdc.controller.comm_health import HealthThresholds, HealthTransitionLog
 from intelipump_fdc.controller.session_events import (
     ControllerEvent,
     ControllerEventType,
@@ -43,10 +45,14 @@ class PumpSession:
         pump_id: str,
         events: EventBus,
         sequence_policy: SequencePolicy = SequencePolicy.SPEC_F_TO_1,
+        thresholds: HealthThresholds | None = None,
+        transitions: HealthTransitionLog | None = None,
     ) -> None:
         self.state = PumpSessionState(address=address, pump_id=pump_id)
         self.events = events
         self.sequence_policy = sequence_policy
+        self.thresholds = thresholds or HealthThresholds()
+        self.transitions = transitions
         self.machine = PumpStateMachine(
             PumpContext(
                 pump_id=pump_id,
@@ -69,10 +75,33 @@ class PumpSession:
         """
         if self.state.last_error in _TRANSIENT_COMMUNICATION_ERRORS:
             self.state.last_error = None
+        self.state.last_transient_error = None
+
+    def _mark_valid_response(self, *, kind: str) -> None:
+        now_mono = time.monotonic()
+        self.state.last_valid_response_mono = now_mono
+        self.state.last_response_at = datetime.now(UTC)
+        self.state.consecutive_timeouts = 0
+        self.state.consecutive_protocol_faults = 0
+        if kind == "EOT":
+            self.state.last_valid_eot_mono = now_mono
+        elif kind == "DATA":
+            self.state.last_valid_data_mono = now_mono
+
+    def _record_persistent_fault(self, code: str) -> None:
+        self.state.last_persistent_fault = code
+        self.state.last_error = code
+        self.state.consecutive_protocol_faults += 1
+        if (
+            self.state.consecutive_protocol_faults
+            >= self.thresholds.faulted_after_protocol_errors
+        ):
+            self._set_communication(CommunicationHealth.FAULTED)
 
     def build_poll(self) -> bytes:
         self.state.stats.poll_count += 1
         self.state.last_poll_at = datetime.now(UTC)
+        self.state.last_poll_mono = time.monotonic()
         self.events.publish(
             ControllerEvent(
                 type=ControllerEventType.POLL_SENT,
@@ -82,10 +111,31 @@ class PumpSession:
         )
         return build_poll(self.address)
 
-    def on_timeout(self, *, max_consecutive: int) -> None:
+    def on_timeout(
+        self,
+        *,
+        max_consecutive: int | None = None,
+        degraded_after: int | None = None,
+        disconnected_after: int | None = None,
+    ) -> None:
+        degraded = (
+            degraded_after
+            if degraded_after is not None
+            else self.thresholds.degraded_after_timeouts
+        )
+        disconnected = (
+            disconnected_after
+            if disconnected_after is not None
+            else (
+                max_consecutive
+                if max_consecutive is not None
+                else self.thresholds.disconnected_after_timeouts
+            )
+        )
         self.state.stats.timeout_count += 1
         self.state.consecutive_timeouts += 1
         self.state.last_error = "response_timeout"
+        self.state.last_transient_error = "response_timeout"
         self.events.publish(
             ControllerEvent(
                 type=ControllerEventType.RESPONSE_TIMEOUT,
@@ -94,11 +144,15 @@ class PumpSession:
                 detail=f"consecutive={self.state.consecutive_timeouts}",
             )
         )
-        if self.state.consecutive_timeouts >= max_consecutive:
+        if self.state.consecutive_timeouts >= disconnected:
             self._set_communication(CommunicationHealth.DISCONNECTED)
             self._apply_sm(PumpEvent.COMMUNICATION_LOST)
-        elif self.state.consecutive_timeouts >= 2:
+        elif self.state.consecutive_timeouts >= degraded:
             self._set_communication(CommunicationHealth.DEGRADED)
+
+    def mark_serial_lost(self) -> None:
+        """Mark pump DISCONNECTED due to serial port loss (not a protocol timeout)."""
+        self._set_communication(CommunicationHealth.DISCONNECTED)
 
     def handle_response_frame(self, frame: DartLineFrame) -> bytes | None:
         """Process a pump response. Return optional ACK frame bytes to send."""
@@ -115,7 +169,8 @@ class PumpSession:
         )
 
         if frame.address != self.address:
-            self.state.last_error = "address_mismatch"
+            self.state.stats.address_mismatch_count += 1
+            self._record_persistent_fault("address_mismatch")
             return None
 
         if frame.control_type is ControlType.EOT:
@@ -124,14 +179,14 @@ class PumpSession:
             return self._on_data(frame)
         if frame.control_type is ControlType.NAK:
             return self._on_nak(frame)
-        self.state.last_error = f"unexpected_control_{frame.control_type.value}"
+        self._record_persistent_fault(f"unexpected_control_{frame.control_type.value}")
         return None
 
     def _on_eot(self, frame: DartLineFrame) -> bytes | None:
         del frame
         self.state.stats.eot_count += 1
-        self.state.consecutive_timeouts = 0
         self.state.last_valid_frame = self.state.last_raw_frame
+        self._mark_valid_response(kind="EOT")
         self._set_communication(CommunicationHealth.HEALTHY)
         self._clear_transient_communication_error()
         if self.machine.context.current_state is PumpState.DISCONNECTED:
@@ -148,7 +203,7 @@ class PumpSession:
     def _on_nak(self, frame: DartLineFrame) -> bytes | None:
         self.state.stats.nak_count += 1
         self.state.stats.retry_count += 1
-        self.state.last_error = f"nak_seq_{frame.sequence}"
+        self._record_persistent_fault(f"nak_seq_{frame.sequence}")
         self.events.publish(
             ControllerEvent(
                 type=ControllerEventType.NAK_RECEIVED,
@@ -162,7 +217,7 @@ class PumpSession:
     def _on_data(self, frame: DartLineFrame) -> bytes | None:
         if frame.crc_valid is False:
             self.state.stats.crc_error_count += 1
-            self.state.last_error = "invalid_crc"
+            self._record_persistent_fault("invalid_crc")
             self.events.publish(
                 ControllerEvent(
                     type=ControllerEventType.FRAME_REJECTED,
@@ -180,7 +235,7 @@ class PumpSession:
             and frame.sequence == self.state.last_accepted_rx_sequence
         ):
             self.state.stats.duplicate_count += 1
-            self.state.consecutive_timeouts = 0
+            self._mark_valid_response(kind="DATA")
             self._set_communication(CommunicationHealth.HEALTHY)
             self._clear_transient_communication_error()
             ack = build_ack(self.address, frame.sequence)
@@ -197,24 +252,25 @@ class PumpSession:
 
         if frame.sequence != self.state.expected_rx_sequence:
             self.state.stats.sequence_error_count += 1
-            self.state.last_error = (
+            detail = (
                 f"seq_mismatch expected={self.state.expected_rx_sequence} "
                 f"got={frame.sequence}"
             )
+            self._record_persistent_fault(detail)
             self.events.publish(
                 ControllerEvent(
                     type=ControllerEventType.FRAME_REJECTED,
                     address=self.address,
                     timestamp=datetime.now(UTC),
-                    detail=self.state.last_error,
+                    detail=detail,
                 )
             )
             # Documented response: do not apply; no ACK for unexpected seq from pump.
             return None
 
         self.state.stats.data_count += 1
-        self.state.consecutive_timeouts = 0
         self.state.last_valid_frame = frame.raw_frame
+        self._mark_valid_response(kind="DATA")
         self._set_communication(CommunicationHealth.HEALTHY)
         self._clear_transient_communication_error()
         if self.machine.context.current_state is PumpState.DISCONNECTED:
@@ -390,10 +446,54 @@ class PumpSession:
         self.state.communication = health
         if prev is health:
             return
+        if self.transitions is not None:
+            if health is CommunicationHealth.DEGRADED:
+                self.transitions.emit(
+                    "pump_communication_degraded",
+                    pump_address=self.address,
+                    previous_state=prev.value,
+                    new_state=health.value,
+                    consecutive_timeouts=self.state.consecutive_timeouts,
+                    cumulative_timeouts=self.state.stats.timeout_count,
+                )
+            elif health is CommunicationHealth.DISCONNECTED:
+                self.transitions.emit(
+                    "pump_disconnected",
+                    pump_address=self.address,
+                    previous_state=prev.value,
+                    new_state=health.value,
+                    consecutive_timeouts=self.state.consecutive_timeouts,
+                    cumulative_timeouts=self.state.stats.timeout_count,
+                )
+            elif health is CommunicationHealth.HEALTHY and prev in {
+                CommunicationHealth.DEGRADED,
+                CommunicationHealth.DISCONNECTED,
+                CommunicationHealth.FAULTED,
+                CommunicationHealth.UNKNOWN,
+            }:
+                self.transitions.emit(
+                    "pump_communication_recovered",
+                    pump_address=self.address,
+                    previous_state=prev.value,
+                    new_state=health.value,
+                    consecutive_timeouts=self.state.consecutive_timeouts,
+                    cumulative_timeouts=self.state.stats.timeout_count,
+                )
+            elif health is CommunicationHealth.FAULTED:
+                self.transitions.emit(
+                    "persistent_protocol_fault",
+                    pump_address=self.address,
+                    previous_state=prev.value,
+                    new_state=health.value,
+                    error=self.state.last_persistent_fault,
+                    consecutive_timeouts=self.state.consecutive_timeouts,
+                    cumulative_timeouts=self.state.stats.timeout_count,
+                )
         if health is CommunicationHealth.HEALTHY and prev in {
             CommunicationHealth.UNKNOWN,
             CommunicationHealth.DISCONNECTED,
             CommunicationHealth.DEGRADED,
+            CommunicationHealth.FAULTED,
         }:
             self.events.publish(
                 ControllerEvent(

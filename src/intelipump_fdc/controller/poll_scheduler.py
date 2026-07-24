@@ -14,7 +14,13 @@ class PollSchedulerConfig:
     inter_poll_delay_ms: int = 5
     idle_sleep_ms: int = 20
     max_retries: int = 2
-    max_consecutive_timeouts: int = 5
+    # Phase 11C defaults: DEGRADED@3, DISCONNECTED@10 consecutive timeouts.
+    degraded_after_timeouts: int = 3
+    max_consecutive_timeouts: int = 10
     read_chunk_size: int = 256
     sequence_policy: SequencePolicy = SequencePolicy.SPEC_F_TO_1
-    reconnect_delay_s: float = 1.0
+    reconnect_delay_s: float = 1.0  # legacy floor; SerialHealthMonitor owns backoff
+    reconnect_min_delay_s: float = 0.5
+    reconnect_max_delay_s: float = 15.0
+    reconnect_jitter: float = 0.0
+    faulted_after_protocol_errors: int = 3
