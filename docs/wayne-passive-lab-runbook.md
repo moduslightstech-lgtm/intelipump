@@ -169,6 +169,80 @@ Clean stop during capture: Ctrl+C or `kill -TERM <pid>` — both flush JSONL and
 
 ---
 
+## Port ownership guards (release blocker fix)
+
+Capture refuses to start unless **all** of the following succeed **before**
+any capture file or `capture_started` record is written:
+
+1. `--confirm-tx-physically-inhibited`
+2. `--confirm-controller-stopped` (physical ports)
+3. `systemctl is-active --quiet <service>` reports **inactive** (flag alone is not trusted)
+4. Port resolved with `os.path.realpath` (alias and `/dev/ttyUSBx` are one device)
+5. Application flock at `/run/lock/intelipump-<canonical-basename>.lock`
+6. Kernel exclusive open (`pyserial exclusive=True`) — **no shared-open fallback**
+7. `TIOCEXCL` applied after open; failure fails closed
+8. Optional `/proc`/`fuser` holder probe on the canonical device
+
+Refusal message prefix: `PASSIVE_CAPTURE_REFUSED:` (nonzero exit).
+
+### Pi validation A — controller active (must refuse)
+
+```bash
+# Controller healthy baseline
+systemctl show intelipump -p ActiveState,StatusText,NRestarts
+# Note timeouts= from StatusText
+readlink -f /dev/intelipump-controller   # expect /dev/ttyUSB0 (or similar)
+sudo lsof /dev/ttyUSB0                   # expect intelipump / controller PID
+
+# Capture through the udev alias MUST refuse
+intelipump-capture-passive \
+  --port /dev/intelipump-controller \
+  --baud 9600 \
+  --duration 30 \
+  --output /tmp/should-not-exist.jsonl \
+  --confirm-tx-physically-inhibited \
+  --confirm-controller-stopped
+echo "exit=$?"   # expect nonzero (2)
+test ! -e /tmp/should-not-exist.jsonl && echo "no capture file: OK"
+
+# Controller still healthy; timeouts must not jump materially
+systemctl show intelipump -p StatusText
+# expect pumps=2/2 healthy (or prior healthy ratio)
+```
+
+### Pi validation B — controller stopped (capture allowed)
+
+```bash
+sudo systemctl stop intelipump.service
+systemctl is-active intelipump.service   # inactive
+sudo lsof /dev/ttyUSB0 || true           # expect empty
+
+intelipump-capture-passive \
+  --port /dev/intelipump-controller \
+  --baud 9600 \
+  --duration 60 \
+  --output data/captures/guard-test.jsonl \
+  --confirm-tx-physically-inhibited \
+  --confirm-controller-stopped
+# Ctrl+C during run → capture_stopped; summary writeAttempts=0
+
+sudo systemctl start intelipump.service
+systemctl show intelipump -p StatusText  # pumps=2/2 healthy
+```
+
+### Pi validation C — two capture processes
+
+```bash
+sudo systemctl stop intelipump.service
+# Terminal 1: start capture (holds exclusive + flock)
+intelipump-capture-passive ... --duration 120 --output data/captures/first.jsonl \
+  --confirm-tx-physically-inhibited --confirm-controller-stopped
+# Terminal 2: must refuse
+intelipump-capture-passive ... --duration 30 --output data/captures/second.jsonl \
+  --confirm-tx-physically-inhibited --confirm-controller-stopped
+# expect PASSIVE_CAPTURE_REFUSED (lock and/or exclusive busy); no second.jsonl
+```
+
 ## Rollback
 
 ```bash

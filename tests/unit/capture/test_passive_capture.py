@@ -11,7 +11,6 @@ import pytest
 
 from intelipump_fdc.capture.cli_capture import build_parser
 from intelipump_fdc.capture.receive_only import (
-    PortInUseError,
     TxInhibitNotConfirmedError,
     check_port_available,
     require_tx_physically_inhibited,
@@ -64,7 +63,6 @@ class FakeReceiveOnlySource:
             return b""
         data = self.chunks.pop(0)
         return data[:max_bytes]
-
 
 def test_tx_inhibit_fail_closed() -> None:
     with pytest.raises(TxInhibitNotConfirmedError):
@@ -153,7 +151,10 @@ async def test_capture_records_rx_only_and_preserves_bytes(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_missing_serial_handled_safely(tmp_path: Path) -> None:
+async def test_missing_serial_initial_open_refuses_without_file(
+    tmp_path: Path,
+) -> None:
+    """Initial open failure must not create a capture artifact."""
     source = FakeReceiveOnlySource(fail_opens=100)
     out = tmp_path / "missing.jsonl"
     session = PassiveCaptureSession(
@@ -166,11 +167,9 @@ async def test_missing_serial_handled_safely(tmp_path: Path) -> None:
             reconnect_delay_s=0.05,
         ),
     )
-    summary = await session.run()
-    assert summary["totalBytes"] == 0
-    records = [json.loads(line) for line in out.read_text().splitlines() if line]
-    assert any(r.get("event") == "serial_disconnected" for r in records)
-    assert any(r.get("event") == "capture_stopped" for r in records)
+    with pytest.raises(OSError):
+        await session.run()
+    assert not out.exists()
 
 
 @pytest.mark.asyncio
@@ -251,20 +250,23 @@ async def test_ctrl_c_path_via_sigint_handler_style(tmp_path: Path) -> None:
     assert "capture_stopped" in out.read_text()
 
 
-def test_port_in_use_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_port_in_use_guard(tmp_path: Path) -> None:
     # Memory/virtual paths are skipped.
-    check_port_available("memory")
-    check_port_available("pty:test")
+    assert check_port_available("memory") == "memory"
+    assert check_port_available("pty:test") == "pty:test"
 
     port = tmp_path / "ttyFAKE"
     port.touch()
 
-    def _busy(**_kwargs: object) -> object:
-        raise OSError(16, "Device or resource busy")  # EBUSY on Linux; ok on macOS msg
+    from intelipump_fdc.capture.port_guards import assert_no_foreign_holders
 
-    monkeypatch.setattr("serial.Serial", _busy)
-    with pytest.raises(PortInUseError):
-        check_port_available(str(port))
+    with pytest.raises(Exception) as excinfo:
+        assert_no_foreign_holders(
+            str(port),
+            requested_path=str(port),
+            holder_finder=lambda _p: [99],
+        )
+    assert "99" in str(excinfo.value)
 
 
 def test_listen_only_settings_unchanged_by_capture_import() -> None:

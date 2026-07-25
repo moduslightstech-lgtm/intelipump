@@ -3,16 +3,25 @@
 Architectural guarantee: this module never exposes a write/drain API.
 Physical TX inhibit cannot be proven in software; the CLI fails closed unless
 the operator confirms TX is physically inhibited.
+
+Kernel exclusive ownership is mandatory for physical ports: pyserial
+``exclusive=True`` with no shared-open fallback, plus ``TIOCEXCL``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import errno
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from intelipump_fdc.capture.port_guards import (
+    PassiveCaptureRefusedError,
+    PassiveCaptureRefuseReason,
+    classify_open_failure,
+    is_virtual_or_test_port,
+    resolve_canonical_device,
+    tiocexcl_request,
+)
 from intelipump_fdc.protocol.dart.transport.errors import (
     TransportConfigError,
     TransportNotOpenError,
@@ -24,8 +33,22 @@ from intelipump_fdc.protocol.dart.transport.serial import (
 )
 
 
-class PortInUseError(OSError):
+class PortInUseError(PassiveCaptureRefusedError):
     """Serial device is already open by another process."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        requested_path: str | None = None,
+        canonical_path: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            reason=PassiveCaptureRefuseReason.DEVICE_BUSY,
+            requested_path=requested_path,
+            canonical_path=canonical_path,
+        )
 
 
 class TxInhibitNotConfirmedError(RuntimeError):
@@ -62,7 +85,10 @@ class ReceiveOnlySerialConfig:
     read_chunk_size: int = 256
     open_timeout_s: float = 2.0
     read_timeout_s: float = 0.05
+    # Physical ports always require exclusive; never silently share.
     exclusive_open: bool = True
+    apply_tiocexcl: bool = True
+    requested_path: str | None = None
 
     def validate(self) -> None:
         if not self.device:
@@ -79,6 +105,10 @@ class ReceiveOnlySerialConfig:
             raise TransportConfigError("stop_bits must be 1 (DART)")
         if self.read_chunk_size < 1:
             raise TransportConfigError("read_chunk_size must be >= 1")
+        if not self.exclusive_open and not is_virtual_or_test_port(self.device):
+            raise TransportConfigError(
+                "exclusive_open is required for physical passive capture ports"
+            )
 
 
 def require_tx_physically_inhibited(*, confirmed: bool) -> None:
@@ -91,62 +121,24 @@ def require_tx_physically_inhibited(*, confirmed: bool) -> None:
         )
 
 
-def check_port_available(device: str) -> None:
-    """Best-effort guard: refuse when the device path is already busy.
+def check_port_available(
+    device: str,
+    *,
+    holder_finder: object | None = None,
+) -> str:
+    """Resolve canonical path and refuse if foreign holders are visible.
 
-    Opens the port briefly with exclusive=True where supported, then closes.
-    Virtual/memory paths used in tests may skip filesystem checks.
+    Returns the canonical device path. Does not open the port (opening is
+    performed once by ``ReceiveOnlySerialSource.open`` with exclusive locks).
     """
-    if device in {"memory", "in-memory"} or device.startswith("pty:"):
-        return
-    path = Path(device)
-    if not path.exists():
-        # Missing device is handled by the capture reconnect loop, not here.
-        return
-    try:
-        import serial  # type: ignore[import-untyped]
-    except ImportError as exc:  # pragma: no cover
-        raise TransportConfigError("pyserial is required") from exc
+    del holder_finder  # reserved for call-site injection via port_guards
+    if is_virtual_or_test_port(device):
+        return device
+    from intelipump_fdc.capture.port_guards import assert_no_foreign_holders
 
-    serial_exc = getattr(serial, "SerialException", OSError)
-    try:
-        kwargs: dict[str, object] = {
-            "port": device,
-            "baudrate": 9600,
-            "bytesize": 8,
-            "parity": "O",
-            "stopbits": 1,
-            "timeout": 0.05,
-            "write_timeout": 0.05,
-            "xonxoff": False,
-            "rtscts": False,
-            "dsrdtr": False,
-            "exclusive": True,
-        }
-        try:
-            ser = serial.Serial(**kwargs)
-        except TypeError:
-            kwargs.pop("exclusive", None)
-            ser = serial.Serial(**kwargs)
-        try:
-            # Touch without writing: ensure we never TX during the probe.
-            _ = ser.in_waiting
-        finally:
-            ser.close()
-    except (OSError, serial_exc) as exc:
-        err = getattr(exc, "errno", None)
-        msg = str(exc).lower()
-        if err in {errno.EBUSY, errno.EACCES, errno.EPERM} or "busy" in msg or (
-            "could not exclusive" in msg
-        ):
-            raise PortInUseError(
-                f"serial port already in use: {device} ({exc})"
-            ) from exc
-        # Other open errors (permissions, missing mid-race) are deferred to capture open.
-        if "permission" in msg or err == errno.EACCES:
-            raise PortInUseError(
-                f"serial port not available exclusively: {device} ({exc})"
-            ) from exc
+    canonical = resolve_canonical_device(device)
+    assert_no_foreign_holders(canonical, requested_path=device)
+    return canonical
 
 
 class ReceiveOnlySerialSource:
@@ -154,7 +146,24 @@ class ReceiveOnlySerialSource:
 
     def __init__(self, config: ReceiveOnlySerialConfig) -> None:
         config.validate()
-        self._config = config
+        self._requested = config.requested_path or config.device
+        if is_virtual_or_test_port(config.device):
+            canonical = config.device
+        else:
+            canonical = resolve_canonical_device(config.device)
+        self._config = ReceiveOnlySerialConfig(
+            device=canonical,
+            baud_rate=config.baud_rate,
+            data_bits=config.data_bits,
+            parity=config.parity,
+            stop_bits=config.stop_bits,
+            read_chunk_size=config.read_chunk_size,
+            open_timeout_s=config.open_timeout_s,
+            read_timeout_s=config.read_timeout_s,
+            exclusive_open=config.exclusive_open,
+            apply_tiocexcl=config.apply_tiocexcl,
+            requested_path=self._requested,
+        )
         self._ser: object | None = None
         self._open = False
 
@@ -167,6 +176,10 @@ class ReceiveOnlySerialSource:
         return self._config.device
 
     @property
+    def requested_path(self) -> str:
+        return self._requested
+
+    @property
     def baud_rate(self) -> int:
         return self._config.baud_rate
 
@@ -175,7 +188,7 @@ class ReceiveOnlySerialSource:
             return
 
         def _open() -> object:
-            import serial
+            import serial  # type: ignore[import-untyped]
 
             serial_exc = getattr(serial, "SerialException", OSError)
             kwargs: dict[str, object] = {
@@ -185,7 +198,6 @@ class ReceiveOnlySerialSource:
                 "parity": _parity_constant(self._config.parity),
                 "stopbits": self._config.stop_bits,
                 "timeout": self._config.read_timeout_s,
-                # write_timeout set but write is never invoked by this class.
                 "write_timeout": 0.05,
                 "xonxoff": False,
                 "rtscts": False,
@@ -194,34 +206,53 @@ class ReceiveOnlySerialSource:
             if self._config.exclusive_open:
                 kwargs["exclusive"] = True
             try:
-                return serial.Serial(**kwargs)
-            except TypeError:
-                kwargs.pop("exclusive", None)
-                return serial.Serial(**kwargs)
+                ser = serial.Serial(**kwargs)
+            except TypeError as exc:
+                # Never fall back to a shared open.
+                raise PassiveCaptureRefusedError(
+                    "pyserial exclusive=True unsupported; refusing shared open "
+                    f"(requested={self._requested} canonical={self._config.device})",
+                    reason=PassiveCaptureRefuseReason.EXCLUSIVE_UNSUPPORTED,
+                    requested_path=self._requested,
+                    canonical_path=self._config.device,
+                ) from exc
             except (OSError, serial_exc) as exc:
-                err = getattr(exc, "errno", None)
-                msg = str(exc).lower()
-                if err == errno.EBUSY or "busy" in msg or "exclusive" in msg:
-                    raise PortInUseError(
-                        f"serial port already in use: {self._config.device}"
+                raise classify_open_failure(
+                    exc,
+                    requested_path=self._requested,
+                    canonical_path=self._config.device,
+                ) from exc
+
+            if self._config.apply_tiocexcl and self._config.exclusive_open:
+                try:
+                    fileno = ser.fileno()
+                    tiocexcl_request(int(fileno))
+                except PassiveCaptureRefusedError:
+                    ser.close()
+                    raise
+                except Exception as exc:
+                    ser.close()
+                    raise PassiveCaptureRefusedError(
+                        f"TIOCEXCL failed; exclusive serial ownership unavailable: {exc}",
+                        reason=PassiveCaptureRefuseReason.TIOCEXCL_FAILED,
+                        requested_path=self._requested,
+                        canonical_path=self._config.device,
                     ) from exc
-                raise
+            return ser
 
         try:
             self._ser = await asyncio.wait_for(
                 asyncio.to_thread(_open),
                 timeout=self._config.open_timeout_s,
             )
-        except PortInUseError:
+        except PassiveCaptureRefusedError:
             raise
         except Exception as exc:
-            err = getattr(exc, "errno", None)
-            msg = str(exc).lower()
-            if err == errno.EBUSY or "busy" in msg:
-                raise PortInUseError(
-                    f"serial port already in use: {self._config.device}"
-                ) from exc
-            raise
+            raise classify_open_failure(
+                exc,
+                requested_path=self._requested,
+                canonical_path=self._config.device,
+            ) from exc
         self._open = True
 
     async def close(self) -> None:

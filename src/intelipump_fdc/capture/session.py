@@ -119,6 +119,11 @@ class PassiveCaptureSession:
             self.config.output,
             self.config.duration_s,
         )
+        # Exclusive open must succeed before any capture file / capture_started.
+        if not self.source.is_open:
+            await self.source.open()
+        self._serial_state = SerialCaptureState.OPEN
+
         if self._fp is None:
             self.config.output.parent.mkdir(parents=True, exist_ok=True)
             self._fp = self.config.output.open("w", encoding="utf-8")
@@ -128,9 +133,8 @@ class PassiveCaptureSession:
             self._emit_event(
                 CaptureEvent.CAPTURE_STARTED,
                 notes=PASSIVE_BANNER,
-                state=SerialCaptureState.CLOSED,
+                state=SerialCaptureState.OPEN,
             )
-            await self._ensure_open()
             while not self._stop.is_set() and time.monotonic() < deadline:
                 if not self.source.is_open:
                     await self._reconnect_once()
@@ -177,21 +181,6 @@ class PassiveCaptureSession:
             "output": str(self.config.output),
             "mode": PASSIVE_BANNER,
         }
-
-    async def _ensure_open(self) -> None:
-        try:
-            await self.source.open()
-            self._serial_state = SerialCaptureState.OPEN
-        except Exception as exc:
-            self._serial_state = SerialCaptureState.DISCONNECTED
-            self._emit_event(
-                CaptureEvent.ERROR,
-                notes=f"open_failed:{type(exc).__name__}:{exc}",
-            )
-            self._emit_event(
-                CaptureEvent.SERIAL_DISCONNECTED,
-                notes=f"{type(exc).__name__}:{exc}",
-            )
 
     async def _safe_close(self) -> None:
         try:
