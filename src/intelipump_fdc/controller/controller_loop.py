@@ -32,13 +32,14 @@ from intelipump_fdc.core.liveness import LivenessSnapshot, LivenessTracker
 from intelipump_fdc.core.systemd_notify import Notifier, NullNotifier
 from intelipump_fdc.domain.pump_command import PumpCommand
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import build_data_frame
-from intelipump_fdc.protocol.dart.line.models import DartLineFrame
-from intelipump_fdc.protocol.dart.line.stream import (
+from intelipump_fdc.protocol.dart.line.legacy_stream import (
     AssemblerEventKind,
-    FrameStreamAssembler,
+    LegacyIgemStreamAssembler,
 )
+from intelipump_fdc.protocol.dart.line.models import DartLineFrame
 from intelipump_fdc.protocol.dart.transport.base import ByteTransport
 from intelipump_fdc.simulator.config import next_sequence
 from intelipump_fdc.simulator.encoding import encode_cd1_command
@@ -106,7 +107,7 @@ class ControllerLoop:
             )
             for addr in runtime.config.addresses
         }
-        self.assembler = FrameStreamAssembler()
+        self.assembler = LegacyIgemStreamAssembler()
         self.totals = ControllerTotals()
         self._stop = asyncio.Event()
         self._last_status_mono: float | None = None
@@ -313,7 +314,7 @@ class ControllerLoop:
         self.serial_health.observe_open_success(is_reconnect=self._ever_opened)
         self._ever_opened = True
         # Assembler may hold partial bytes from a previous connection.
-        self.assembler = FrameStreamAssembler()
+        self.assembler = LegacyIgemStreamAssembler()
 
     async def _poll_one(self, address: int) -> None:
         session = self.sessions[address]
@@ -329,7 +330,7 @@ class ControllerLoop:
             self._refresh_totals()
             return
 
-        if frame.address != address:
+        if frame.address != encode_wire_address(address):
             session.handle_response_frame(frame)  # records address_mismatch/FAULTED
             self._refresh_totals()
             return
@@ -351,7 +352,7 @@ class ControllerLoop:
             frame = await self._read_one_frame(
                 self.runtime.config.response_timeout_ms, address=session.address
             )
-            if frame is not None and frame.address == session.address:
+            if frame is not None and frame.address == session.wire_address:
                 ack = session.handle_response_frame(frame)
                 if ack is not None:
                     await self._write_frame(
@@ -366,7 +367,9 @@ class ControllerLoop:
         if item is None:
             return
         seq = session.state.tx_sequence
-        wire = build_data_frame(session.address, seq, item.application_payload)
+        wire = build_data_frame(
+            session.wire_address, seq, item.application_payload
+        )
         await self._write_frame(wire, address=session.address, note="DATA_OUT")
         resp = await self._read_one_frame(
             self.runtime.config.response_timeout_ms, address=session.address

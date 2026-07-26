@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import (
     build_ack,
@@ -37,7 +38,7 @@ def test_poll_data_then_ack_advances_tx() -> None:
     assert isinstance(parsed, DartLineFrame)
     assert parsed.control_type is ControlType.DATA
     assert pump.awaiting_ack_sequence == 0
-    session.receive(build_ack(1, 0))
+    session.receive(build_ack(encode_wire_address(1), 0))
     assert pump.tx_sequence == 1
     assert pump.awaiting_ack_sequence is None
 
@@ -49,7 +50,9 @@ def test_invalid_crc_records_fault_no_ack() -> None:
     session = SimulatorSession(SimulatorConfig(pumps=SimulatorConfig().pumps[:1]))
     pump = session.get_pump(1)
     pump.enable_communication()
-    good = build_data_frame(1, 0, encode_cd1_command(PumpControlCommand.RETURN_STATUS))
+    good = build_data_frame(
+        encode_wire_address(1), 0, encode_cd1_command(PumpControlCommand.RETURN_STATUS)
+    )
     body = bytearray(unescape_dle(good[:-1]))
     body[-3] ^= 0xFF  # corrupt CRC low byte
     bad = escape_dle(bytes(body)) + bytes((SF,))
@@ -62,7 +65,9 @@ def test_unexpected_sequence_returns_nak() -> None:
     session = SimulatorSession(SimulatorConfig(pumps=SimulatorConfig().pumps[:1]))
     pump = session.get_pump(1)
     pump.enable_communication()
-    wire = build_data_frame(1, 5, encode_cd1_command(PumpControlCommand.RETURN_STATUS))
+    wire = build_data_frame(
+        encode_wire_address(1), 5, encode_cd1_command(PumpControlCommand.RETURN_STATUS)
+    )
     result = session.receive(wire)
     parsed = parse_frame(result.responses[0])
     assert isinstance(parsed, DartLineFrame)
@@ -75,7 +80,7 @@ def test_duplicate_data_acked_without_reprocess() -> None:
     pump = session.get_pump(1)
     pump.cold_start_to_ready()
     payload = encode_cd1_command(PumpControlCommand.RETURN_STATUS)
-    wire = build_data_frame(1, 0, payload)
+    wire = build_data_frame(encode_wire_address(1), 0, payload)
     session.receive(wire)
     pending_before = len(pump.pending_outbound)
     result = session.receive(wire)

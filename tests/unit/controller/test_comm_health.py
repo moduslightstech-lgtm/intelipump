@@ -26,6 +26,7 @@ from intelipump_fdc.controller.pump_session import PumpSession
 from intelipump_fdc.controller.session_events import EventBus
 from intelipump_fdc.controller.session_models import CommunicationHealth
 from intelipump_fdc.core.systemd_notify import NullNotifier
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.constants import SF
 from intelipump_fdc.protocol.dart.line.escaping import escape_dle, unescape_dle
 from intelipump_fdc.protocol.dart.line.frame_builder import build_data_frame, build_eot
@@ -162,14 +163,14 @@ def test_eot_and_data_restore_healthy_preserve_timeout_count() -> None:
     for _ in range(3):
         s.on_timeout()
     assert s.state.communication is CommunicationHealth.DEGRADED
-    s.handle_response_frame(_parse(build_eot(1, 0)))
+    s.handle_response_frame(_parse(build_eot(encode_wire_address(1), 0)))
     assert s.state.communication is CommunicationHealth.HEALTHY
     assert s.state.last_transient_error is None
     assert s.state.stats.timeout_count == 3
 
     for _ in range(3):
         s.on_timeout()
-    frame = _parse(build_data_frame(1, 0, encode_dc1_status(1)))
+    frame = _parse(build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1)))
     assert s.handle_response_frame(frame) is not None
     assert s.state.communication is CommunicationHealth.HEALTHY
     assert s.state.stats.timeout_count == 6
@@ -182,14 +183,14 @@ def test_persistent_fault_remains_after_valid_response() -> None:
         events=EventBus(),
         thresholds=HealthThresholds(faulted_after_protocol_errors=1),
     )
-    good = build_data_frame(1, 0, encode_dc1_status(1))
+    good = build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1))
     body = bytearray(unescape_dle(good[:-1]))
     body[-3] ^= 0xFF
     bad = escape_dle(bytes(body)) + bytes((SF,))
     assert s.handle_response_frame(_parse(bad)) is None
     assert s.state.last_persistent_fault == "invalid_crc"
     assert s.state.communication is CommunicationHealth.FAULTED
-    s.handle_response_frame(_parse(build_eot(1, 0)))
+    s.handle_response_frame(_parse(build_eot(encode_wire_address(1), 0)))
     assert s.state.communication is CommunicationHealth.HEALTHY
     assert s.state.last_persistent_fault == "invalid_crc"
 
@@ -207,7 +208,7 @@ def test_transition_logs_once_per_state_change() -> None:
         s.on_timeout()
     disconnected = [e for e in log.events if e["event"] == "pump_disconnected"]
     assert len(disconnected) == 1
-    s.handle_response_frame(_parse(build_eot(1, 0)))
+    s.handle_response_frame(_parse(build_eot(encode_wire_address(1), 0)))
     recovered = [e for e in log.events if e["event"] == "pump_communication_recovered"]
     assert len(recovered) == 1
 
@@ -229,7 +230,7 @@ def test_duplicate_data_restores_health_without_double_apply() -> None:
         s.on_timeout()
     assert s.state.communication is CommunicationHealth.DEGRADED
     payload = encode_dc1_status(1)
-    frame = _parse(build_data_frame(1, 0, payload))
+    frame = _parse(build_data_frame(encode_wire_address(1), 0, payload))
     assert s.handle_response_frame(frame) is not None
     assert s.state.communication is CommunicationHealth.HEALTHY
     version = s.machine.context.state_version

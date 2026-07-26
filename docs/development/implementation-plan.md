@@ -55,6 +55,11 @@ Short bounded status-only polling via `intelipump-continuous-poll-bench`
 `docs/continuous-poll-bench.md`. No authorization. Not production polling.
 Does not start Phase 11D–11H.
 
+## Captured ePump / Wayne iGEM wire-address profile
+Logical sides 1/2 map to wire ADR `0x50`/`0x51`; status polls are
+`50 20 FA` / `51 20 FA`. See `docs/protocol-notes/dart-line-summary.md`.
+No authorization or non-poll replay.
+
 ## Phase 12 - Disabled Wayne electronic-head bench
 Receive-only first, then controlled commands.
 

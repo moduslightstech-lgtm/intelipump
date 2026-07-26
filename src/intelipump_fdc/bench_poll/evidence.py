@@ -52,11 +52,13 @@ class EvidenceRecord:
     rawHex: str | None
     byteCount: int | None
     pumpAddress: int | None
-    pollSequence: int | None
-    timeoutMs: int | None
-    responseClassification: str | None
-    crcValid: bool | None
-    notes: str | None
+    logicalAddress: int | None = None
+    wireAddress: int | None = None
+    pollSequence: int | None = None
+    timeoutMs: int | None = None
+    responseClassification: str | None = None
+    crcValid: bool | None = None
+    notes: str | None = None
     event: str | None = None
     targetType: str | None = None
     simulatorValidation: bool | None = None
@@ -114,12 +116,15 @@ class EvidenceWriter:
         *,
         monotonic_ns: int,
         pump_address: int | None = None,
+        logical_address: int | None = None,
+        wire_address: int | None = None,
         poll_sequence: int | None = None,
         timeout_ms: int | None = None,
         notes: str | None = None,
         classification: str | None = None,
         crc_valid: bool | None = None,
     ) -> None:
+        logical = logical_address if logical_address is not None else pump_address
         self.write(
             EvidenceRecord(
                 schemaVersion=SCHEMA_VERSION,
@@ -130,7 +135,9 @@ class EvidenceWriter:
                 direction=None,
                 rawHex=None,
                 byteCount=None,
-                pumpAddress=pump_address,
+                pumpAddress=logical,
+                logicalAddress=logical,
+                wireAddress=wire_address,
                 pollSequence=poll_sequence,
                 timeoutMs=timeout_ms,
                 responseClassification=classification,
@@ -155,7 +162,10 @@ class EvidenceWriter:
         crc_valid: bool | None,
         notes: str | None = None,
         event: BenchEvent | None = None,
+        logical_address: int | None = None,
+        wire_address: int | None = None,
     ) -> None:
+        logical = logical_address if logical_address is not None else pump_address
         self.write(
             EvidenceRecord(
                 schemaVersion=SCHEMA_VERSION,
@@ -166,7 +176,9 @@ class EvidenceWriter:
                 direction=direction,
                 rawHex=bytes_to_raw_hex(raw),
                 byteCount=len(raw),
-                pumpAddress=pump_address,
+                pumpAddress=logical,
+                logicalAddress=logical,
+                wireAddress=wire_address,
                 pollSequence=poll_sequence,
                 timeoutMs=timeout_ms,
                 responseClassification=classification,

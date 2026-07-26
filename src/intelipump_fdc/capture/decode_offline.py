@@ -8,8 +8,16 @@ from pathlib import Path
 from typing import Any
 
 from intelipump_fdc.protocol.dart.application.decoder import decode_data_payload
+from intelipump_fdc.protocol.dart.line.addressing import (
+    AddressMappingError,
+    decode_wire_address,
+)
+from intelipump_fdc.protocol.dart.line.captured_classify import CapturedFrameClass
 from intelipump_fdc.protocol.dart.line.control import ControlType
-from intelipump_fdc.protocol.dart.line.stream import AssemblerEventKind, FrameStreamAssembler
+from intelipump_fdc.protocol.dart.line.legacy_stream import (
+    AssemblerEventKind,
+    LegacyIgemStreamAssembler,
+)
 
 
 @dataclass
@@ -120,7 +128,7 @@ def load_capture_rx_bytes(path: Path) -> tuple[str | None, bytes, list[dict[str,
 def decode_capture_file(path: Path) -> OfflineDecodeResult:
     """Run existing framing/CRC decoder over captured bytes (offline only)."""
     capture_id, blob, serial_events = load_capture_rx_bytes(path)
-    assembler = FrameStreamAssembler()
+    assembler = LegacyIgemStreamAssembler()
     candidates: list[CandidateFrame] = []
     noise: list[str] = []
     warnings: list[str] = [
@@ -217,14 +225,44 @@ def decode_capture_file(path: Path) -> OfflineDecodeResult:
         else:
             control_n += 1
 
-        addresses.add(frame.address)
+        try:
+            logical = decode_wire_address(frame.address)
+        except AddressMappingError:
+            logical = None
+        if logical is not None:
+            addresses.add(logical)
+            notes.append(
+                f"logicalAddress={logical}; wireAddress=0x{frame.address:02X}"
+            )
+        else:
+            addresses.add(frame.address)
+            notes.append(f"wireAddress=0x{frame.address:02X}")
+
+        if event.captured is not None:
+            notes.append(f"capturedClass={event.captured.classification.value}")
+            if (
+                event.captured.classification
+                is CapturedFrameClass.SEQUENCE_CONTROL_OR_ACK
+            ):
+                notes.append(
+                    f"sequenceNibble={event.captured.sequence_nibble}; "
+                    "possibleAcknowledgement=true; not a nozzle-lift event"
+                )
+            notes.append(
+                f"payloadSemantics={event.captured.payload_semantics.value}"
+            )
+
         candidates.append(
             CandidateFrame(
                 offset=offset,
                 byte_count=len(raw),
                 raw_hex=raw.hex(" "),
-                control_type=frame.control_type.value,
-                address=frame.address,
+                control_type=(
+                    event.captured.classification.value
+                    if event.captured is not None
+                    else frame.control_type.value
+                ),
+                address=logical if logical is not None else frame.address,
                 sequence=frame.sequence,
                 crc_valid=frame.crc_valid,
                 certainty=certainty,

@@ -37,6 +37,7 @@ from intelipump_fdc.controller.session_models import (
 )
 from intelipump_fdc.core.config import ControllerMode, Settings
 from intelipump_fdc.domain.pump_command import PumpCommand
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.constants import SF
 from intelipump_fdc.protocol.dart.line.escaping import escape_dle, unescape_dle
 from intelipump_fdc.protocol.dart.line.frame_builder import build_data_frame, build_eot, build_poll
@@ -455,7 +456,7 @@ def test_poll_only_bench_blocks_controller_queue() -> None:
 
 @pytest.mark.asyncio
 async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
-    eot = build_eot(1, 0)
+    eot = build_eot(encode_wire_address(1), 0)
     transport = FakeBenchTransport(chunks=[eot])
     session = PollBenchSession(
         transport,
@@ -495,7 +496,7 @@ async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_simulator_validation_one_poll_and_evidence(tmp_path: Path) -> None:
-    eot = build_eot(1, 0)
+    eot = build_eot(encode_wire_address(1), 0)
     transport = FakeBenchTransport(chunks=[eot])
     session = PollBenchSession(
         transport,
@@ -556,7 +557,7 @@ async def test_timeout_exits_cleanly(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_crc_invalid_reported_and_stops(tmp_path: Path) -> None:
-    good = build_data_frame(1, 0, encode_dc1_status(1))
+    good = build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1))
     body = bytearray(unescape_dle(good[:-1]))
     body[-3] ^= 0xFF
     bad = escape_dle(bytes(body)) + bytes((SF,))
@@ -607,7 +608,7 @@ async def test_sigterm_closes_and_writes_bench_stopped(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_ctrl_c_path_writes_bench_stopped(tmp_path: Path) -> None:
-    transport = FakeBenchTransport(chunks=[build_eot(1, 0)])
+    transport = FakeBenchTransport(chunks=[build_eot(encode_wire_address(1), 0)])
     session = PollBenchSession(
         transport,
         PollBenchSessionConfig(

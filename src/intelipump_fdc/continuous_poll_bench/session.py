@@ -25,18 +25,24 @@ from intelipump_fdc.continuous_poll_bench.guards import (
     REAL_WAYNE_MAX_WRITES,
     software_commit,
 )
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
+from intelipump_fdc.protocol.dart.line.captured_classify import CapturedFrameClass
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
-from intelipump_fdc.protocol.dart.line.stream import (
+from intelipump_fdc.protocol.dart.line.legacy_stream import (
     AssemblerEventKind,
-    FrameStreamAssembler,
+    LegacyIgemStreamAssembler,
 )
 from intelipump_fdc.protocol.dart.transport.errors import TransportNotOpenError
 
 logger = logging.getLogger(__name__)
 
-# Status-poll responses we accept as valid for this bench.
-_VALID_RESPONSE_TYPES = frozenset({ControlType.EOT, ControlType.DATA})
+_VALID_RESPONSE_CLASSES = frozenset(
+    {
+        CapturedFrameClass.SHORT_CONTROL_70,
+        CapturedFrameClass.DATA_FRAME,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,12 +80,14 @@ class ContinuousPollSession:
             raise ValueError("max_writes must be >= 1")
         self.transport = transport
         self.config = config
+        self.logical_address = config.address
+        self.wire_address = encode_wire_address(config.address)
         self.session_id = new_session_id()
         self.stats = ContinuousSessionStats(
             requested_duration_s=config.duration_seconds
         )
         self._stop = asyncio.Event()
-        self._assembler = FrameStreamAssembler()
+        self._assembler = LegacyIgemStreamAssembler()
         self.command_queue_created = False
         self.authorization_objects_created = 0
         self.result: ContinuousBenchResult | None = None
@@ -210,6 +218,8 @@ class ContinuousPollSession:
                 self.transport, "write_count", self.stats.polls_sent
             ),
             "softwareCommit": self._commit,
+            "logicalAddress": self.logical_address,
+            "wireAddress": self.wire_address,
         }
 
     async def _run_scheduler(
@@ -329,7 +339,9 @@ class ContinuousPollSession:
             direction="TX",
             raw=poll,
             monotonic_ns=mono_tx,
-            pump_address=self.config.address,
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
             poll_sequence=seq,
             timeout_ms=self.config.response_timeout_ms,
             classification="POLL",
@@ -341,14 +353,15 @@ class ContinuousPollSession:
         writer.emit_event(
             ContinuousBenchEvent.POLL_SENT,
             monotonic_ns=mono_tx,
-            pump_address=self.config.address,
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
             poll_sequence=seq,
             timeout_ms=self.config.response_timeout_ms,
             schedule_lag_ms=lag_ms if lag_ms > 0.5 else None,
         )
 
         deadline = t0 + (self.config.response_timeout_ms / 1000.0)
-        self._assembler.reset()
         rx_bytes = bytearray()
         while time.monotonic() < deadline and not self._stop.is_set():
             remaining = deadline - time.monotonic()
@@ -442,13 +455,24 @@ class ContinuousPollSession:
 
                 frame = event.frame
                 assert frame is not None
+                captured = event.captured
                 latency_ms = (time.monotonic() - t0) * 1000.0
                 self.stats.latencies_ms.append(latency_ms)
                 self.stats.last_rx_hex = frame.raw_frame.hex(" ")
-                classification = frame.control_type.value
+                classification = (
+                    captured.classification.value
+                    if captured is not None
+                    else frame.control_type.value
+                )
                 crc_valid = frame.crc_valid
 
-                if frame.control_type is ControlType.DATA and crc_valid is False:
+                if (
+                    (
+                        captured is not None
+                        and captured.classification is CapturedFrameClass.DATA_FRAME
+                    )
+                    or frame.control_type is ControlType.DATA
+                ) and crc_valid is False:
                     self._fault = True
                     self.stats.crc_errors += 1
                     self.stats.stop_reason = StopReason.CRC_ERROR
@@ -456,7 +480,9 @@ class ContinuousPollSession:
                         direction="RX",
                         raw=frame.raw_frame,
                         monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.config.address,
+                        pump_address=self.logical_address,
+                        logical_address=self.logical_address,
+                        wire_address=self.wire_address,
                         poll_sequence=seq,
                         timeout_ms=self.config.response_timeout_ms,
                         classification=classification,
@@ -465,68 +491,57 @@ class ContinuousPollSession:
                         latency_ms=latency_ms,
                         notes="crc_invalid_stop",
                     )
-                    writer.emit_event(
-                        ContinuousBenchEvent.PROTOCOL_ERROR,
-                        monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.config.address,
-                        poll_sequence=seq,
-                        classification="CRC_INVALID",
-                        crc_valid=False,
-                        latency_ms=latency_ms,
-                        notes="CRC-invalid response; bench stops",
-                        stop_reason=StopReason.CRC_ERROR.value,
-                    )
                     return True
 
-                if frame.address != self.config.address:
+                if frame.address != self.wire_address:
                     self._fault = True
                     self.stats.protocol_errors += 1
                     self.stats.stop_reason = StopReason.ADDRESS_MISMATCH
                     writer.emit_event(
                         ContinuousBenchEvent.PROTOCOL_ERROR,
                         monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.config.address,
+                        pump_address=self.logical_address,
+                        logical_address=self.logical_address,
+                        wire_address=self.wire_address,
                         poll_sequence=seq,
-                        notes=f"address_mismatch got={frame.address}",
+                        notes=(
+                            f"address_mismatch got_wire=0x{frame.address:02X} "
+                            f"expected_wire=0x{self.wire_address:02X}"
+                        ),
                         classification="ADDRESS_MISMATCH",
                         latency_ms=latency_ms,
                         stop_reason=StopReason.ADDRESS_MISMATCH.value,
                     )
                     return True
 
-                if frame.control_type not in _VALID_RESPONSE_TYPES:
+                captured_class = (
+                    captured.classification if captured is not None else None
+                )
+                if captured_class is not None and captured_class not in _VALID_RESPONSE_CLASSES:
                     self._fault = True
                     self.stats.unexpected_frames += 1
                     self.stats.protocol_errors += 1
                     self.stats.stop_reason = StopReason.UNEXPECTED_FRAME
-                    writer.emit_frame(
-                        direction="RX",
-                        raw=frame.raw_frame,
-                        monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.config.address,
-                        poll_sequence=seq,
-                        timeout_ms=self.config.response_timeout_ms,
-                        classification=classification,
-                        crc_valid=crc_valid,
-                        event=ContinuousBenchEvent.PROTOCOL_ERROR,
-                        latency_ms=latency_ms,
-                        notes="unexpected_frame_class",
-                    )
+                    note = "unsupported_or_unexpected_frame"
+                    if (
+                        captured is not None
+                        and captured_class is CapturedFrameClass.SEQUENCE_CONTROL_OR_ACK
+                    ):
+                        note = (
+                            f"{note}; sequenceNibble={captured.sequence_nibble}; "
+                            "possibleAcknowledgement=true; not nozzle_lift"
+                        )
                     writer.emit_event(
                         ContinuousBenchEvent.PROTOCOL_ERROR,
                         monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.config.address,
+                        pump_address=self.logical_address,
+                        logical_address=self.logical_address,
+                        wire_address=self.wire_address,
                         poll_sequence=seq,
                         classification=classification,
-                        notes="unsupported_or_unexpected_frame",
+                        notes=note,
                         stop_reason=StopReason.UNEXPECTED_FRAME.value,
                     )
-                    return True
-
-                if frame.control_type is ControlType.UNKNOWN:
-                    self._fault = True
-                    self.stats.unexpected_frames += 1
-                    self.stats.stop_reason = StopReason.UNEXPECTED_FRAME
                     return True
 
                 self.stats.valid_responses += 1
@@ -534,7 +549,9 @@ class ContinuousPollSession:
                     direction="RX",
                     raw=frame.raw_frame,
                     monotonic_ns=time.monotonic_ns(),
-                    pump_address=self.config.address,
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
                     poll_sequence=seq,
                     timeout_ms=self.config.response_timeout_ms,
                     classification=classification,
@@ -546,7 +563,9 @@ class ContinuousPollSession:
                 writer.emit_event(
                     ContinuousBenchEvent.RESPONSE_RECEIVED,
                     monotonic_ns=time.monotonic_ns(),
-                    pump_address=self.config.address,
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
                     poll_sequence=seq,
                     classification=classification,
                     crc_valid=crc_valid,

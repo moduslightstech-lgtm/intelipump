@@ -6,6 +6,9 @@ Short, bounded **status-only** DART polls against **exactly one** confirmed pump
 address. Intended to help determine whether regular status polling prevents
 Wayne iGEM POS Communication Lost / Error 30.
 
+Logical `--address 1` transmits captured `50 20 FA`; `--address 2` transmits
+`51 20 FA`. Evidence includes `logicalAddress` and `wireAddress`.
+
 This is **not** production polling. No authorization, transactions, presets,
 price changes, resets, MQTT commands, or daemon mode.
 

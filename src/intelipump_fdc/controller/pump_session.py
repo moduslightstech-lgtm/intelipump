@@ -18,6 +18,7 @@ from intelipump_fdc.controller.session_models import (
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
 from intelipump_fdc.protocol.dart.application.decoder import decode_data_payload
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import build_ack, build_poll
 from intelipump_fdc.protocol.dart.line.models import DartLineFrame
@@ -98,6 +99,11 @@ class PumpSession:
         ):
             self._set_communication(CommunicationHealth.FAULTED)
 
+    @property
+    def wire_address(self) -> int:
+        """Captured-profile on-wire ADR for this logical pump side."""
+        return encode_wire_address(self.address)
+
     def build_poll(self) -> bytes:
         self.state.stats.poll_count += 1
         self.state.last_poll_at = datetime.now(UTC)
@@ -168,7 +174,7 @@ class PumpSession:
             )
         )
 
-        if frame.address != self.address:
+        if frame.address != self.wire_address:
             self.state.stats.address_mismatch_count += 1
             self._record_persistent_fault("address_mismatch")
             return None
@@ -238,7 +244,7 @@ class PumpSession:
             self._mark_valid_response(kind="DATA")
             self._set_communication(CommunicationHealth.HEALTHY)
             self._clear_transient_communication_error()
-            ack = build_ack(self.address, frame.sequence)
+            ack = build_ack(self.wire_address, frame.sequence)
             self.state.stats.ack_sent_count += 1
             self.events.publish(
                 ControllerEvent(
@@ -283,7 +289,7 @@ class PumpSession:
             frame.sequence, self.sequence_policy
         )
 
-        ack = build_ack(self.address, frame.sequence)
+        ack = build_ack(self.wire_address, frame.sequence)
         self.state.stats.ack_sent_count += 1
         self.events.publish(
             ControllerEvent(

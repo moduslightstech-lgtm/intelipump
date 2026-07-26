@@ -58,7 +58,7 @@ def test_noise_before_valid_frame() -> None:
     assert AssemblerEventKind.FRAME in kinds
     frame_events = [e for e in events if e.kind is AssemblerEventKind.FRAME]
     assert frame_events[0].frame is not None
-    assert frame_events[0].frame.address == 2
+    assert frame_events[0].frame.address == 0x51
 
 
 def test_buffer_overflow_preserves_bytes() -> None:

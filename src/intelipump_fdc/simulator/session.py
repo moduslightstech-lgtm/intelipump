@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from intelipump_fdc.protocol.dart.line.addressing import (
+    AddressMappingError,
+    decode_wire_address,
+    encode_wire_address,
+)
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import (
     build_ack,
@@ -79,11 +84,14 @@ class SimulatorSession:
             self.faults.append(fault)
             return FrameExchangeResult(responses=(), faults=(fault,))
 
-        pump = self.pumps.get(parsed.address)
-        if pump is None:
+        try:
+            logical = decode_wire_address(parsed.address)
+        except AddressMappingError:
             fault = ProtocolFault(
                 ProtocolFaultKind.UNKNOWN_ADDRESS,
-                f"no simulated pump at address {parsed.address}",
+                f"wire address 0x{parsed.address:02X} is not a captured "
+                "legacy iGEM ADR (expected 0x50/0x51); "
+                "01 20 FA is invalid for this profile",
                 address=parsed.address,
                 raw_frame_hex=frame_bytes.hex(" "),
                 at_ms=self.clock.now(),
@@ -91,8 +99,24 @@ class SimulatorSession:
             self.faults.append(fault)
             return FrameExchangeResult(responses=(), faults=(fault,))
 
+        pump = self.pumps.get(logical)
+        if pump is None:
+            fault = ProtocolFault(
+                ProtocolFaultKind.UNKNOWN_ADDRESS,
+                f"no simulated pump at logical address {logical} "
+                f"(wire 0x{parsed.address:02X})",
+                address=logical,
+                raw_frame_hex=frame_bytes.hex(" "),
+                at_ms=self.clock.now(),
+            )
+            self.faults.append(fault)
+            return FrameExchangeResult(responses=(), faults=(fault,))
+
         if not pump.communication_enabled:
-            note = f"address {parsed.address} communication disabled; no response"
+            note = (
+                f"logical address {logical} (wire 0x{parsed.address:02X}) "
+                "communication disabled; no response"
+            )
             self.notes.append(note)
             return FrameExchangeResult(responses=(), notes=(note,))
 
@@ -114,23 +138,35 @@ class SimulatorSession:
         self.notes.append(note)
         return FrameExchangeResult(responses=(), notes=(note,))
 
+    def _wire_adr(self, pump: SimulatedPump) -> int:
+        return encode_wire_address(pump.config.dart_address)
+
     def _on_poll(self, pump: SimulatedPump) -> FrameExchangeResult:
+        wire_adr = self._wire_adr(pump)
         if pump.awaiting_ack_sequence is not None and pump.last_outbound_wire is not None:
             return FrameExchangeResult(
                 responses=(pump.last_outbound_wire,),
                 notes=("POLL→DATA retransmit awaiting ACK",),
             )
         if not pump.has_pending():
-            eot = build_eot(pump.config.dart_address, sequence=pump.tx_sequence)
-            return FrameExchangeResult(responses=(eot,), notes=("POLL→EOT",))
+            # Simulator fixture response (SHORT_CONTROL_70 / EOT-style), not a
+            # definitive field-semantic definition of pump state.
+            eot = build_eot(wire_adr, sequence=pump.tx_sequence)
+            return FrameExchangeResult(
+                responses=(eot,),
+                notes=("POLL→EOT simulator_fixture",),
+            )
         payload = pump.pop_pending_payload()
         assert payload is not None
         seq = pump.tx_sequence
-        wire = build_data_frame(pump.config.dart_address, seq, payload)
+        wire = build_data_frame(wire_adr, seq, payload)
         pump.awaiting_ack_sequence = seq
         pump.data_pending_since_ms = self.clock.now()
         pump.last_outbound_wire = wire
-        return FrameExchangeResult(responses=(wire,), notes=(f"POLL→DATA seq={seq}",))
+        return FrameExchangeResult(
+            responses=(wire,),
+            notes=(f"POLL→DATA seq={seq} simulator_fixture",),
+        )
 
     def _on_data(self, pump: SimulatedPump, frame: DartLineFrame) -> FrameExchangeResult:
         faults: list[ProtocolFault] = []
@@ -158,7 +194,7 @@ class SimulatorSession:
                 at_ms=self.clock.now(),
             )
             self.faults.append(fault)
-            ack = build_ack(pump.config.dart_address, frame.sequence)
+            ack = build_ack(self._wire_adr(pump), frame.sequence)
             return FrameExchangeResult(
                 responses=(ack,), faults=(fault,), notes=("dup DATA",)
             )
@@ -172,7 +208,7 @@ class SimulatorSession:
                 at_ms=self.clock.now(),
             )
             self.faults.append(fault)
-            nak = build_nak(pump.config.dart_address, frame.sequence)
+            nak = build_nak(self._wire_adr(pump), frame.sequence)
             return FrameExchangeResult(
                 responses=(nak,), faults=(fault,), notes=("DATA→NAK",)
             )
@@ -186,7 +222,7 @@ class SimulatorSession:
         pump.expected_controller_sequence = next_sequence(
             frame.sequence, self.config.sequence_policy
         )
-        ack = build_ack(pump.config.dart_address, frame.sequence)
+        ack = build_ack(self._wire_adr(pump), frame.sequence)
         notes = ["DATA→ACK"]
         if app_faults:
             notes.append("application faults recorded; ACK still sent for valid CRC/seq")

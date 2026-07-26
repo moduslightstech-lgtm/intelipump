@@ -85,8 +85,14 @@ class ScenarioRunner:
     def send_poll_drain(
         self, session: SimulatorSession, address: int, *, max_frames: int = 32
     ) -> list[DartLineFrame]:
-        """POLL until EOT, ACKing any DATA frames."""
+        """POLL until EOT, ACKing any DATA frames.
+
+        ``address`` is the logical pump side (1 or 2).
+        """
+        from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
+
         frames: list[DartLineFrame] = []
+        wire_adr = encode_wire_address(address)
         for _ in range(max_frames):
             result = session.receive(build_poll(address))
             if not result.responses:
@@ -96,7 +102,7 @@ class ScenarioRunner:
             if isinstance(parsed, DartLineFrame):
                 frames.append(parsed)
                 if parsed.control_type is ControlType.DATA:
-                    session.receive(build_ack(address, parsed.sequence))
+                    session.receive(build_ack(wire_adr, parsed.sequence))
                 if parsed.control_type is ControlType.EOT:
                     break
         return frames
@@ -104,8 +110,10 @@ class ScenarioRunner:
     def send_app(
         self, session: SimulatorSession, address: int, payload: bytes
     ) -> None:
+        from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
+
         seq = self.controller_seq.get(address, 0)
-        wire = build_data_frame(address, seq, payload)
+        wire = build_data_frame(encode_wire_address(address), seq, payload)
         result = session.receive(wire)
         if not result.responses:
             raise AssertionError(f"no ACK/NAK for DATA to address {address}")

@@ -5,6 +5,7 @@ from __future__ import annotations
 from intelipump_fdc.controller.pump_session import PumpSession
 from intelipump_fdc.controller.session_events import EventBus
 from intelipump_fdc.domain.pump_state import PumpState
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.constants import SF
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.escaping import escape_dle, unescape_dle
@@ -31,7 +32,7 @@ def _parse(raw: bytes) -> DartLineFrame:
 def test_poll_eot_marks_healthy() -> None:
     s = _session()
     s.build_poll()
-    s.handle_response_frame(_parse(build_eot(1, 0)))
+    s.handle_response_frame(_parse(build_eot(encode_wire_address(1), 0)))
     assert s.state.stats.eot_count == 1
     assert s.machine.context.current_state is not PumpState.DISCONNECTED
 
@@ -39,7 +40,7 @@ def test_poll_eot_marks_healthy() -> None:
 def test_poll_data_ack_and_state() -> None:
     s = _session()
     payload = encode_dc1_status(1)  # RESET
-    frame = _parse(build_data_frame(1, 0, payload))
+    frame = _parse(build_data_frame(encode_wire_address(1), 0, payload))
     ack = s.handle_response_frame(frame)
     assert ack is not None
     assert s.state.stats.data_count == 1
@@ -50,7 +51,7 @@ def test_poll_data_ack_and_state() -> None:
 def test_crc_error_does_not_mutate_state() -> None:
     s = _session()
     before = s.machine.context.state_version
-    good = build_data_frame(1, 0, encode_dc1_status(1))
+    good = build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1))
     body = bytearray(unescape_dle(good[:-1]))
     body[-3] ^= 0xFF
     bad = escape_dle(bytes(body)) + bytes((SF,))
@@ -64,7 +65,7 @@ def test_crc_error_does_not_mutate_state() -> None:
 def test_duplicate_data_not_applied_twice() -> None:
     s = _session()
     payload = encode_dc1_status(1)
-    raw = build_data_frame(1, 0, payload)
+    raw = build_data_frame(encode_wire_address(1), 0, payload)
     frame = _parse(raw)
     s.handle_response_frame(frame)
     version = s.machine.context.state_version
@@ -77,16 +78,16 @@ def test_duplicate_data_not_applied_twice() -> None:
 
 def test_sequence_mismatch() -> None:
     s = _session()
-    frame = _parse(build_data_frame(1, 5, encode_dc1_status(1)))
+    frame = _parse(build_data_frame(encode_wire_address(1), 5, encode_dc1_status(1)))
     assert s.handle_response_frame(frame) is None
     assert s.state.stats.sequence_error_count == 1
 
 
 def test_nak_handling() -> None:
     s = _session()
-    s.handle_response_frame(_parse(build_nak(1, 1)))
+    s.handle_response_frame(_parse(build_nak(encode_wire_address(1), 1)))
     assert s.state.stats.nak_count == 1
-    parsed = _parse(build_nak(1, 1))
+    parsed = _parse(build_nak(encode_wire_address(1), 1))
     assert parsed.control_type is ControlType.NAK
 
 
@@ -101,7 +102,7 @@ def test_timeout_then_eot_clears_transient_last_error() -> None:
     assert s.state.stats.timeout_count == 3
     assert s.state.communication is CommunicationHealth.DEGRADED
 
-    s.handle_response_frame(_parse(build_eot(1, 0)))
+    s.handle_response_frame(_parse(build_eot(encode_wire_address(1), 0)))
     assert s.state.communication is CommunicationHealth.HEALTHY
     assert s.state.last_error is None
     assert s.state.stats.timeout_count == 3  # historical count retained
@@ -116,7 +117,7 @@ def test_timeout_then_data_clears_transient_last_error() -> None:
     assert s.state.last_error == "response_timeout"
     assert s.state.stats.timeout_count == 1
 
-    frame = _parse(build_data_frame(1, 0, encode_dc1_status(1)))
+    frame = _parse(build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1)))
     ack = s.handle_response_frame(frame)
     assert ack is not None
     assert s.state.communication is CommunicationHealth.HEALTHY
@@ -131,6 +132,6 @@ def test_successful_eot_does_not_clear_persistent_protocol_fault() -> None:
     s = _session()
     s.state.last_error = "invalid_crc"
     s.state.last_persistent_fault = "invalid_crc"
-    s.handle_response_frame(_parse(build_eot(1, 0)))
+    s.handle_response_frame(_parse(build_eot(encode_wire_address(1), 0)))
     assert s.state.communication is CommunicationHealth.HEALTHY
     assert s.state.last_persistent_fault == "invalid_crc"

@@ -41,6 +41,7 @@ from intelipump_fdc.controller.session_models import (
 )
 from intelipump_fdc.core.config import ControllerMode, Settings
 from intelipump_fdc.domain.pump_command import PumpCommand
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.constants import SF
 from intelipump_fdc.protocol.dart.line.escaping import escape_dle, unescape_dle
 from intelipump_fdc.protocol.dart.line.frame_builder import (
@@ -141,7 +142,7 @@ class FakeBenchTransport:
         self.write_count += 1
         self.written.append(data)
         if self.auto_eot_address is not None:
-            self.chunks.append(build_eot(self.auto_eot_address, 0))
+            self.chunks.append(build_eot(encode_wire_address(self.auto_eot_address), 0))
         return len(data)
 
 
@@ -574,7 +575,7 @@ async def test_unsupported_response_immediate_stop(tmp_path: Path) -> None:
     async def write(data: bytes) -> int:
         transport.write_count += 1
         transport.written.append(data)
-        transport.chunks.append(build_ack(1, 0))
+        transport.chunks.append(build_ack(encode_wire_address(1), 0))
         return len(data)
 
     transport.write = write  # type: ignore[method-assign]
@@ -588,7 +589,7 @@ async def test_unsupported_response_immediate_stop(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_crc_error_handling(tmp_path: Path) -> None:
-    good = build_data_frame(1, 0, encode_dc1_status(1))
+    good = build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1))
     body = bytearray(unescape_dle(good[:-1]))
     body[-3] ^= 0xFF
     bad = escape_dle(bytes(body)) + bytes((SF,))
@@ -682,12 +683,11 @@ async def test_poll_runner_sends_only_build_poll(tmp_path: Path) -> None:
         duration_seconds=1.0,
         poll_interval_ms=100,
         response_timeout_ms=40,
-        address=7,
+        address=2,
     )
-    # Override auto EOT address
-    transport.auto_eot_address = 7
+    transport.auto_eot_address = 2
     await session.run()
-    expected = build_poll(7)
+    expected = build_poll(2)
     assert transport.written
     assert all(frame == expected for frame in transport.written)
 

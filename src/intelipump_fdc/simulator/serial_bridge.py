@@ -6,9 +6,9 @@ import asyncio
 from dataclasses import dataclass
 
 from intelipump_fdc.hardware.bench_faults import SimulatorFaultInjector
-from intelipump_fdc.protocol.dart.line.stream import (
+from intelipump_fdc.protocol.dart.line.legacy_stream import (
     AssemblerEventKind,
-    FrameStreamAssembler,
+    LegacyIgemStreamAssembler,
 )
 from intelipump_fdc.protocol.dart.transport.base import ByteTransport
 from intelipump_fdc.simulator.config import SimulatorConfig
@@ -40,7 +40,7 @@ class SimulatorSerialBridge:
         self.transport = transport
         self.simulator = simulator or SimulatorSession(SimulatorConfig())
         self.config = config or SerialBridgeConfig()
-        self.assembler = FrameStreamAssembler()
+        self.assembler = LegacyIgemStreamAssembler()
         self.fault_injector = fault_injector
         self._stop = asyncio.Event()
 
@@ -49,7 +49,7 @@ class SimulatorSerialBridge:
 
     def soft_restart(self) -> None:
         """Simulator-side restart without electrical unplug (LAB fault)."""
-        self.assembler = FrameStreamAssembler()
+        self.assembler = LegacyIgemStreamAssembler()
         for pump in self.simulator.pumps.values():
             pump.communication_enabled = False
             pump.cold_start_to_ready()

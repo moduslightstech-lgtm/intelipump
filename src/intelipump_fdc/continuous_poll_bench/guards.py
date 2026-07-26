@@ -163,9 +163,11 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
             "missing confirmation flags: " + ", ".join(missing),
             reason="missing_confirmations",
         )
-    if not (1 <= params.address <= 0xFF):
+    if params.address not in {1, 2}:
         raise ContinuousPollRefusedError(
-            f"address must be 1-255, got {params.address}", reason="bad_address"
+            f"logical address must be 1 or 2 for captured legacy iGEM profile; "
+            f"got {params.address}",
+            reason="bad_address",
         )
     if params.duration_seconds < 1:
         raise ContinuousPollRefusedError(

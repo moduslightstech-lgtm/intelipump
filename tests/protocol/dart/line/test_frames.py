@@ -35,7 +35,7 @@ def _assert_error(result: DartLineFrame | ParseError) -> ParseError:
 @pytest.mark.parametrize(
     ("builder", "control_type", "sequence"),
     [
-        (lambda: build_poll(0x51), ControlType.POLL, 0),
+        (lambda: build_poll(2), ControlType.POLL, 0),
         (lambda: build_ack(0x51, 0xA), ControlType.ACK, 0xA),
         (lambda: build_nak(0x50, 0x0), ControlType.NAK, 0),
         (lambda: build_eot(0x51, 0x0), ControlType.EOT, 0),

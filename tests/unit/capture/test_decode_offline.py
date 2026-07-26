@@ -21,6 +21,7 @@ from intelipump_fdc.capture.schema import (
     make_event_record,
     make_rx_record,
 )
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.frame_builder import (
     build_data_frame,
     build_eot,
@@ -71,7 +72,7 @@ def _write_capture(path: Path, chunks: list[bytes]) -> str:
 
 def test_offline_decoder_never_opens_serial(tmp_path: Path) -> None:
     path = tmp_path / "c.jsonl"
-    _write_capture(path, [build_eot(1, 0)])
+    _write_capture(path, [build_eot(encode_wire_address(1), 0)])
 
     with (
         patch(
@@ -92,15 +93,15 @@ def test_offline_decoder_never_opens_serial(tmp_path: Path) -> None:
 def test_undecoded_bytes_retained(tmp_path: Path) -> None:
     path = tmp_path / "noise.jsonl"
     # Trailing incomplete frame bytes after a valid EOT.
-    _write_capture(path, [build_eot(2, 1), b"\x01\x10"])
+    _write_capture(path, [build_eot(encode_wire_address(2), 1), b"\x01\x10"])
     result = decode_capture_file(path)
     assert result.undecoded_trailing_hex == "01 10"
-    assert result.total_rx_bytes == len(build_eot(2, 1)) + 2
+    assert result.total_rx_bytes == len(build_eot(encode_wire_address(2), 1)) + 2
 
 
 def test_crc_valid_and_invalid_reported(tmp_path: Path) -> None:
     path = tmp_path / "crc.jsonl"
-    good = build_data_frame(1, 0, encode_dc1_status(1))
+    good = build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1))
     bad = bytearray(good)
     # Flip a payload/crc byte while keeping SF terminator.
     bad[-3] ^= 0xFF
@@ -115,7 +116,14 @@ def test_crc_valid_and_invalid_reported(tmp_path: Path) -> None:
 
 def test_possible_addresses_and_uncertain_labels(tmp_path: Path) -> None:
     path = tmp_path / "addr.jsonl"
-    _write_capture(path, [build_poll(1), build_eot(1, 0), build_eot(2, 0)])
+    _write_capture(
+        path,
+        [
+            build_poll(1),
+            build_eot(encode_wire_address(1), 0),
+            build_eot(encode_wire_address(2), 0),
+        ],
+    )
     result = decode_capture_file(path)
     assert 1 in result.possible_addresses
     assert 2 in result.possible_addresses
@@ -153,7 +161,7 @@ def test_load_rejects_non_rx_direction(tmp_path: Path) -> None:
 
 def test_validation_report_defaults_inconclusive(tmp_path: Path) -> None:
     path = tmp_path / "rep.jsonl"
-    _write_capture(path, [build_eot(1, 0)])
+    _write_capture(path, [build_eot(encode_wire_address(1), 0)])
     report = tmp_path / "test-capture-001" / "validation-report.md"
     result = write_validation_report(path, report, duration_s=300.0)
     text = report.read_text(encoding="utf-8")
@@ -168,7 +176,7 @@ def test_validation_report_defaults_inconclusive(tmp_path: Path) -> None:
 
 def test_no_authorization_objects_in_decode(tmp_path: Path) -> None:
     path = tmp_path / "auth.jsonl"
-    _write_capture(path, [build_data_frame(1, 0, encode_dc1_status(1))])
+    _write_capture(path, [build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1))])
     result = decode_capture_file(path)
     blob = json.dumps(result.to_dict())
     assert "PumpCommand" not in blob

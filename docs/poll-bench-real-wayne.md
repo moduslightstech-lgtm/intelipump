@@ -1,6 +1,11 @@
 # Real-pump poll bench (POLL_ONLY_BENCH)
 
-**Tool:** `intelipump-poll-bench`  
+**Tool:** `intelipump-poll-bench`
+
+Captured Wayne iGEM status polls (source of truth): logical `--address 1` sends
+`50 20 FA`; logical `--address 2` sends `51 20 FA`. Evidence records both
+`logicalAddress` and `wireAddress`. Synthetic `01 20 FA` is invalid for this
+profile.  
 **Scope:** One privately owned Wayne lab dispenser — bounded verified status poll only.  
 **Not in scope:** Authorization, preset, price, reset, fuel dispense, continuous polling, Phase 11D–11H.
 

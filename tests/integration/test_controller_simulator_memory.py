@@ -70,7 +70,7 @@ async def test_full_lifecycle_memory_transport() -> None:
 @pytest.mark.asyncio
 async def test_offline_pump_does_not_block_other() -> None:
     ctrl_t, sim_t = create_memory_transport_pair()
-    # Simulator only has address 1; controller polls 1 and 9.
+    # Simulator only has logical side 1; controller also polls side 2 (offline).
     from intelipump_fdc.simulator.config import PumpConfig
 
     sim = SimulatorSession(
@@ -85,7 +85,7 @@ async def test_offline_pump_does_not_block_other() -> None:
         transport=ctrl_t,
         safety=default_lab_safety(),
         config=PollSchedulerConfig(
-            addresses=(1, 9),
+            addresses=(1, 2),
             response_timeout_ms=50,
             inter_poll_delay_ms=1,
             idle_sleep_ms=2,
@@ -104,7 +104,7 @@ async def test_offline_pump_does_not_block_other() -> None:
         loop.sessions[1].state.stats.eot_count + loop.sessions[1].state.stats.data_count
         > 0
     )
-    assert loop.sessions[9].state.stats.timeout_count > 0
+    assert loop.sessions[2].state.stats.timeout_count > 0
 
 
 @pytest.mark.asyncio
