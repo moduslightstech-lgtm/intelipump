@@ -12,6 +12,8 @@ class ControllerMode(StrEnum):
     BENCH_CONTROL = "BENCH_CONTROL"
     # Bounded one-address status poll against owned lab pump (intelipump-poll-bench).
     POLL_ONLY_BENCH = "POLL_ONLY_BENCH"
+    # Bounded short continuous status polling (intelipump-continuous-poll-bench).
+    CONTINUOUS_POLL_BENCH = "CONTINUOUS_POLL_BENCH"
     FIELD_CONTROL = "FIELD_CONTROL"
     LOCKED_OUT = "LOCKED_OUT"
 
@@ -163,19 +165,23 @@ def get_settings() -> Settings:
         and settings.safety.active_commands_enabled
     ):
         raise ValueError("Active commands must be disabled in LISTEN_ONLY mode")
-    if settings.controller.mode == ControllerMode.POLL_ONLY_BENCH:
+    if settings.controller.mode in {
+        ControllerMode.POLL_ONLY_BENCH,
+        ControllerMode.CONTINUOUS_POLL_BENCH,
+    }:
+        mode_name = settings.controller.mode.value
         if settings.safety.active_commands_enabled:
-            raise ValueError("Active commands must be disabled in POLL_ONLY_BENCH")
+            raise ValueError(f"Active commands must be disabled in {mode_name}")
         if settings.safety.remote_authorization_enabled:
-            raise ValueError("Remote authorization must be disabled in POLL_ONLY_BENCH")
+            raise ValueError(f"Remote authorization must be disabled in {mode_name}")
         if settings.safety.automatic_authorization_enabled:
             raise ValueError(
-                "Automatic authorization must be disabled in POLL_ONLY_BENCH"
+                f"Automatic authorization must be disabled in {mode_name}"
             )
         if settings.safety.command_replay_enabled:
-            raise ValueError("Command replay must be disabled in POLL_ONLY_BENCH")
+            raise ValueError(f"Command replay must be disabled in {mode_name}")
         if settings.mqtt.enabled:
-            raise ValueError("MQTT must be disabled in POLL_ONLY_BENCH")
+            raise ValueError(f"MQTT must be disabled in {mode_name}")
     if (
         settings.environment.upper() == "LAB"
         and not settings.controller.station_id.endswith("-Lab")

@@ -47,7 +47,13 @@ Does not start Phase 11D–11H.
 ## Real-pump poll bench (POLL_ONLY_BENCH)
 Bounded verified status poll via `intelipump-poll-bench` against the owned
 lab dispenser. See `docs/poll-bench-real-wayne.md`. No authorization.
-Does not start continuous real-pump polling or Phase 11D–11H.
+Does not start Phase 11D–11H.
+
+## Continuous poll bench (CONTINUOUS_POLL_BENCH)
+Short bounded status-only polling via `intelipump-continuous-poll-bench`
+(one address; real-Wayne max 5s / 50 writes). See
+`docs/continuous-poll-bench.md`. No authorization. Not production polling.
+Does not start Phase 11D–11H.
 
 ## Phase 12 - Disabled Wayne electronic-head bench
 Receive-only first, then controlled commands.

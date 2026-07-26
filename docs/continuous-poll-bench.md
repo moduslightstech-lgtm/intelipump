@@ -1,0 +1,90 @@
+# Continuous poll bench (CONTINUOUS_POLL_BENCH)
+
+**Tool:** `intelipump-continuous-poll-bench`
+
+Short, bounded **status-only** DART polls against **exactly one** confirmed pump
+address. Intended to help determine whether regular status polling prevents
+Wayne iGEM POS Communication Lost / Error 30.
+
+This is **not** production polling. No authorization, transactions, presets,
+price changes, resets, MQTT commands, or daemon mode.
+
+## Environment
+
+```bash
+export INTELIPUMP_ENVIRONMENT=LAB
+export INTELIPUMP_CONTROLLER__MODE=CONTINUOUS_POLL_BENCH
+export INTELIPUMP_MQTT__ENABLED=false
+# active commands / remote auth / automatic auth / command replay must stay off
+```
+
+Stop the controller service before any serial bench:
+
+```bash
+sudo systemctl stop intelipump.service
+```
+
+## Simulator validation (LAB)
+
+Use this path first. Do **not** point this at the real Wayne until a later
+approved lab run.
+
+1. Start the serial simulator on `/dev/intelipump-simulator` only.
+2. Confirm `/dev/intelipump-controller` is free.
+3. Run:
+
+```bash
+intelipump-continuous-poll-bench \
+  --port /dev/intelipump-controller \
+  --address 1 \
+  --duration-seconds 3 \
+  --poll-interval-ms 100 \
+  --response-timeout-ms 50 \
+  --evidence-dir data/bench/continuous-poll \
+  --simulator-validation \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-emergency-isolation-ready \
+  --confirm-no-fuel-test \
+  --confirm-authorization-disabled \
+  --confirm-status-poll-only \
+  --confirm-bounded-duration
+```
+
+Evidence: `continuous-poll-bench-*.jsonl` and `.md` under `--evidence-dir`.
+
+Results:
+
+- `CONTINUOUS_POLL_BENCH_PASS` — ≥1 valid response, no safety/protocol faults
+- `CONTINUOUS_POLL_BENCH_INCONCLUSIVE` — only timeouts, no unsafe condition
+- `CONTINUOUS_POLL_BENCH_FAIL` — CRC/protocol/unexpected/serial/ownership/safety
+
+## Hard limits
+
+| Limit | Real Wayne | Simulator (`--simulator-validation`) |
+| --- | --- | --- |
+| Duration | 1–5 s (default 3) | 1–30 s |
+| Poll interval | 50–1000 ms (default 100) | same |
+| Response timeout | &lt; poll interval | same |
+| Max writes | 50 | derived from duration/interval |
+| Addresses | exactly one | exactly one |
+
+Scheduler is monotonic: missed deadlines skip forward (`schedule_lag_ms`);
+never catch up with back-to-back polls. Timeouts do not extend duration.
+
+## Real Wayne (later approved lab only)
+
+Without `--simulator-validation`:
+
+- refuses any running simulator process
+- refuses simulator ownership of adapters
+- `targetType=OWNED_LAB_WAYNE`
+- max duration 5 s / max 50 writes
+
+Do not run against the real dispenser until explicitly approved.
+
+## Safety
+
+Normal `intelipump.service` / controller loop refuses to start polling or the
+command queue in `CONTINUOUS_POLL_BENCH`. This mode is usable only by
+`intelipump-continuous-poll-bench`.

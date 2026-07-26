@@ -51,6 +51,14 @@ def evaluate_outbound_safety(
         return SafetyDecision(
             False, ("POLL_ONLY_BENCH_blocks_command_queue_use_intelipump_poll_bench",)
         )
+    if ctx.mode is ControllerMode.CONTINUOUS_POLL_BENCH:
+        return SafetyDecision(
+            False,
+            (
+                "CONTINUOUS_POLL_BENCH_blocks_command_queue_"
+                "use_intelipump_continuous_poll_bench",
+            ),
+        )
 
     if item.command_type in _READ_COMMANDS:
         if not item.simulator_only:
@@ -94,6 +102,11 @@ def evaluate_polling_allowed(ctx: ControllerSafetyContext) -> SafetyDecision:
         # Continuous controller polling is not permitted; use intelipump-poll-bench.
         return SafetyDecision(
             False, ("POLL_ONLY_BENCH_requires_intelipump_poll_bench",)
+        )
+    if ctx.mode is ControllerMode.CONTINUOUS_POLL_BENCH:
+        return SafetyDecision(
+            False,
+            ("CONTINUOUS_POLL_BENCH_requires_intelipump_continuous_poll_bench",),
         )
     if ctx.environment.upper() != "LAB" and not ctx.allow_virtual_polling:
         return SafetyDecision(False, ("polling_requires_LAB_or_explicit_virtual_config",))
