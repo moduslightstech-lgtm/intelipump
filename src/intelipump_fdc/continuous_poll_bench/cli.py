@@ -55,14 +55,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--poll-interval-ms",
         type=int,
-        default=100,
-        help="Monotonic poll interval (50-1000, default 100)",
+        default=300,
+        help=(
+            "Monotonic poll interval (50-1000, default 300; "
+            "real-Wayne minimum 300)"
+        ),
     )
     parser.add_argument(
         "--response-timeout-ms",
         type=int,
-        required=True,
-        help="Must be < poll-interval-ms",
+        default=250,
+        help="Must be < poll-interval-ms (default 250)",
     )
     parser.add_argument(
         "--evidence-dir",

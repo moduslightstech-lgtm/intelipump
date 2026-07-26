@@ -44,6 +44,16 @@ _VALID_RESPONSE_CLASSES = frozenset(
     }
 )
 
+# Bounded quiet window for optional stale-input drain (startup / post-timeout only).
+_DRAIN_QUIET_MS = 25
+_TRANSIENT_EMPTY_GRACE_MS = 50
+_MAX_CONSECUTIVE_TRANSIENT_EMPTY = 3
+_TRANSIENT_EMPTY_MARKER = "device reports readiness to read but returned no data"
+
+
+def _is_transient_empty_read(exc: BaseException) -> bool:
+    return _TRANSIENT_EMPTY_MARKER in str(exc).lower()
+
 
 @dataclass(frozen=True, slots=True)
 class ContinuousPollSessionConfig:
@@ -93,77 +103,110 @@ class ContinuousPollSession:
         self.result: ContinuousBenchResult | None = None
         self._fault = False
         self._commit = software_commit()
+        self._consecutive_transient_empty = 0
+        self._drain_before_next_poll = True  # session startup quiet drain
 
     def request_stop(self) -> None:
         self._stop.set()
 
-    async def _clear_stale_before_poll(
+    def _device_still_usable(self) -> bool:
+        if not self.transport.is_open:
+            return False
+        checker = getattr(self.transport, "device_path_exists", None)
+        if callable(checker):
+            return bool(checker())
+        device = getattr(self.transport, "device", None) or self.config.port
+        if str(device).startswith(("/tmp", "memory", "pty:")):
+            return True
+        return Path(str(device)).exists()
+
+    async def _quiet_drain_stale(
+        self,
+        writer: EvidenceWriter,
+        *,
+        poll_sequence: int,
+        reason: str,
+    ) -> None:
+        """Drain only at startup or after timeout — never immediately before every TX.
+
+        Uses ``drain_available`` (in_waiting only) so a blocking read cannot
+        consume the leading byte of a soon-to-arrive valid response.
+        """
+        drain_available = getattr(self.transport, "drain_available", None)
+        if not callable(drain_available):
+            return
+
+        deadline = time.monotonic() + (_DRAIN_QUIET_MS / 1000.0)
+        drained = bytearray()
+        while time.monotonic() < deadline and not self._stop.is_set():
+            try:
+                chunk = await drain_available()
+            except (OSError, TransportNotOpenError) as exc:
+                if _is_transient_empty_read(exc) and self._device_still_usable():
+                    writer.emit_event(
+                        ContinuousBenchEvent.TRANSIENT_EMPTY_READ,
+                        monotonic_ns=time.monotonic_ns(),
+                        pump_address=self.logical_address,
+                        logical_address=self.logical_address,
+                        wire_address=self.wire_address,
+                        poll_sequence=poll_sequence,
+                        notes=str(exc),
+                    )
+                    await asyncio.sleep(0.005)
+                    continue
+                raise
+            if chunk:
+                drained.extend(chunk)
+            else:
+                await asyncio.sleep(0.002)
+
+        if not drained:
+            return
+        writer.emit_frame(
+            direction="RX",
+            raw=bytes(drained),
+            monotonic_ns=time.monotonic_ns(),
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=poll_sequence,
+            timeout_ms=self.config.response_timeout_ms,
+            classification="PARTIAL_OR_NOISE",
+            crc_valid=None,
+            event=ContinuousBenchEvent.STALE_INPUT_DRAINED,
+            notes=reason,
+            source="stale_input_drained",
+        )
+        logger.info(
+            "drained %d stale serial byte(s) (%s) poll=%s",
+            len(drained),
+            reason,
+            poll_sequence,
+        )
+
+    def _ensure_assembler_clean(
         self, writer: EvidenceWriter, *, poll_sequence: int
     ) -> None:
-        """Drop incomplete parser state and optionally drain stale serial input.
-
-        Incomplete bytes must not span independent poll cycles. Within one
-        response window, :meth:`LegacyIgemStreamAssembler.feed` still buffers
-        across serial read chunks.
-        """
-        pending = self._assembler.pending_raw
-        discarded = self._assembler.reset()
-        stale = pending or discarded
-        if stale:
-            writer.emit_frame(
-                direction="RX",
-                raw=stale,
-                monotonic_ns=time.monotonic_ns(),
-                pump_address=self.logical_address,
-                logical_address=self.logical_address,
-                wire_address=self.wire_address,
-                poll_sequence=poll_sequence,
-                timeout_ms=self.config.response_timeout_ms,
-                classification="PARTIAL_OR_NOISE",
-                crc_valid=None,
-                event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
-                notes="stale_assembler_bytes_cleared_before_poll",
-            )
-            logger.info(
-                "cleared %d stale assembler byte(s) before poll %s",
-                len(stale),
-                poll_sequence,
-            )
-
-        # Best-effort drain of already-buffered serial input (non-blocking).
-        drained = bytearray()
-        if self.transport.is_open:
-            for _ in range(8):
-                try:
-                    chunk = await asyncio.wait_for(
-                        self.transport.read(self.config.read_size),
-                        timeout=0.001,
-                    )
-                except (TimeoutError, TransportNotOpenError, OSError):
-                    break
-                if not chunk:
-                    break
-                drained.extend(chunk)
-        if drained:
-            writer.emit_frame(
-                direction="RX",
-                raw=bytes(drained),
-                monotonic_ns=time.monotonic_ns(),
-                pump_address=self.logical_address,
-                logical_address=self.logical_address,
-                wire_address=self.wire_address,
-                poll_sequence=poll_sequence,
-                timeout_ms=self.config.response_timeout_ms,
-                classification="PARTIAL_OR_NOISE",
-                crc_valid=None,
-                event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
-                notes="stale_serial_input_drained_before_poll",
-            )
-            logger.info(
-                "drained %d stale serial byte(s) before poll %s",
-                len(drained),
-                poll_sequence,
-            )
+        """Clear leftover assembler state without serial drain (poll-cycle ownership)."""
+        if self._assembler.pending_size <= 0:
+            return
+        stale = self._assembler.reset()
+        if not stale:
+            return
+        writer.emit_frame(
+            direction="RX",
+            raw=stale,
+            monotonic_ns=time.monotonic_ns(),
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=poll_sequence,
+            timeout_ms=self.config.response_timeout_ms,
+            classification="PARTIAL_OR_NOISE",
+            crc_valid=None,
+            event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
+            notes="stale_assembler_bytes_cleared_before_poll",
+        )
 
     def _record_timeout_partial(
         self,
@@ -173,7 +216,6 @@ class ContinuousPollSession:
         rx_bytes: bytes,
     ) -> None:
         """Record timed-out partial bytes and clear the response assembler."""
-        # Prefer the assembler's incomplete frame; otherwise all window RX bytes.
         partial = self._assembler.pending_raw or rx_bytes
         emitted = False
         for event in self._assembler.expire_partial():
@@ -193,7 +235,6 @@ class ContinuousPollSession:
             )
             emitted = True
 
-        # Guarantee a clean assembler for the next independent poll cycle.
         self._assembler.reset()
 
         if not emitted and partial:
@@ -211,6 +252,112 @@ class ContinuousPollSession:
                 event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
                 notes="bytes_before_timeout",
             )
+
+    async def _read_response_chunk(
+        self,
+        writer: EvidenceWriter,
+        *,
+        seq: int,
+        remaining_s: float,
+    ) -> bytes | None:
+        """Read one chunk; ``None`` means fail-closed serial disconnect."""
+        if remaining_s <= 0:
+            return b""
+        grace_deadline = time.monotonic() + min(
+            remaining_s, _TRANSIENT_EMPTY_GRACE_MS / 1000.0
+        )
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    self.transport.read(self.config.read_size),
+                    timeout=min(remaining_s, 0.05),
+                )
+                self._consecutive_transient_empty = 0
+                return chunk
+            except TimeoutError:
+                return b""
+            except TransportNotOpenError as exc:
+                self._fault = True
+                self.stats.stop_reason = StopReason.SERIAL_DISCONNECT
+                writer.emit_event(
+                    ContinuousBenchEvent.SERIAL_DISCONNECT,
+                    monotonic_ns=time.monotonic_ns(),
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
+                    poll_sequence=seq,
+                    notes=str(exc),
+                    stop_reason=StopReason.SERIAL_DISCONNECT.value,
+                )
+                return None
+            except OSError as exc:
+                if _is_transient_empty_read(exc):
+                    if not self._device_still_usable():
+                        self._fault = True
+                        self.stats.stop_reason = StopReason.SERIAL_DISCONNECT
+                        writer.emit_event(
+                            ContinuousBenchEvent.SERIAL_DISCONNECT,
+                            monotonic_ns=time.monotonic_ns(),
+                            pump_address=self.logical_address,
+                            logical_address=self.logical_address,
+                            wire_address=self.wire_address,
+                            poll_sequence=seq,
+                            notes=f"device_missing_after_transient_empty: {exc}",
+                            stop_reason=StopReason.SERIAL_DISCONNECT.value,
+                        )
+                        return None
+                    self._consecutive_transient_empty += 1
+                    writer.emit_event(
+                        ContinuousBenchEvent.TRANSIENT_EMPTY_READ,
+                        monotonic_ns=time.monotonic_ns(),
+                        pump_address=self.logical_address,
+                        logical_address=self.logical_address,
+                        wire_address=self.wire_address,
+                        poll_sequence=seq,
+                        notes=(
+                            f"transient_empty_read count="
+                            f"{self._consecutive_transient_empty}: {exc}"
+                        ),
+                    )
+                    if (
+                        self._consecutive_transient_empty
+                        >= _MAX_CONSECUTIVE_TRANSIENT_EMPTY
+                    ):
+                        self._fault = True
+                        self.stats.stop_reason = StopReason.SERIAL_DISCONNECT
+                        writer.emit_event(
+                            ContinuousBenchEvent.SERIAL_DISCONNECT,
+                            monotonic_ns=time.monotonic_ns(),
+                            pump_address=self.logical_address,
+                            logical_address=self.logical_address,
+                            wire_address=self.wire_address,
+                            poll_sequence=seq,
+                            notes=(
+                                "repeated_transient_empty_read: "
+                                f"{self._consecutive_transient_empty}"
+                            ),
+                            stop_reason=StopReason.SERIAL_DISCONNECT.value,
+                        )
+                        return None
+                    if time.monotonic() >= grace_deadline:
+                        # Grace expired: treat as empty read, keep polling.
+                        return b""
+                    await asyncio.sleep(0.005)
+                    remaining_s = max(0.0, grace_deadline - time.monotonic())
+                    continue
+                self._fault = True
+                self.stats.stop_reason = StopReason.SERIAL_DISCONNECT
+                writer.emit_event(
+                    ContinuousBenchEvent.SERIAL_DISCONNECT,
+                    monotonic_ns=time.monotonic_ns(),
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
+                    poll_sequence=seq,
+                    notes=str(exc),
+                    stop_reason=StopReason.SERIAL_DISCONNECT.value,
+                )
+                return None
 
     async def run(self) -> dict[str, object]:
         jsonl_path = self.config.evidence_jsonl
@@ -430,8 +577,19 @@ class ContinuousPollSession:
         lag_ms: float,
     ) -> bool:
         """Return True to stop the bench early."""
-        # Never carry incomplete response bytes into the next poll cycle.
-        await self._clear_stale_before_poll(writer, poll_sequence=seq)
+        # Drain only at session startup or after a timed-out poll (never every TX).
+        if self._drain_before_next_poll:
+            self._drain_before_next_poll = False
+            await self._quiet_drain_stale(
+                writer,
+                poll_sequence=seq,
+                reason=(
+                    "session_startup_drain"
+                    if seq == 1
+                    else "post_timeout_quiet_drain"
+                ),
+            )
+        self._ensure_assembler_clean(writer, poll_sequence=seq)
 
         poll = build_poll(self.config.address)
         t0 = time.monotonic()
@@ -485,29 +643,31 @@ class ContinuousPollSession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            try:
-                chunk = await asyncio.wait_for(
-                    self.transport.read(self.config.read_size),
-                    timeout=min(remaining, 0.05),
-                )
-            except TimeoutError:
-                chunk = b""
-            except (OSError, TransportNotOpenError) as exc:
-                self._fault = True
-                self.stats.stop_reason = StopReason.SERIAL_DISCONNECT
-                writer.emit_event(
-                    ContinuousBenchEvent.SERIAL_DISCONNECT,
-                    monotonic_ns=time.monotonic_ns(),
-                    pump_address=self.config.address,
-                    poll_sequence=seq,
-                    notes=str(exc),
-                    stop_reason=StopReason.SERIAL_DISCONNECT.value,
-                )
+            chunk = await self._read_response_chunk(
+                writer, seq=seq, remaining_s=remaining
+            )
+            if chunk is None:
                 return True
             if not chunk:
                 await asyncio.sleep(0.001)
                 continue
             rx_bytes.extend(chunk)
+            # Raw chunk evidence before assembler/parser processing.
+            writer.emit_frame(
+                direction="RX",
+                raw=chunk,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                timeout_ms=self.config.response_timeout_ms,
+                classification=None,
+                crc_valid=None,
+                event=ContinuousBenchEvent.SERIAL_READ_CHUNK,
+                source="serial_read_chunk",
+                notes="raw_serial_read_chunk",
+            )
             for event in self._assembler.feed(chunk):
                 if event.kind is AssemblerEventKind.NOISE:
                     self.stats.malformed_count += 1
@@ -701,6 +861,8 @@ class ContinuousPollSession:
         # Timeout: evidence the incomplete response, then clear assembler so
         # the next poll cannot concatenate a stale prefix with a new frame.
         self._record_timeout_partial(writer, seq=seq, rx_bytes=bytes(rx_bytes))
+        # Bounded quiet drain only after timeout (assembler already reset).
+        self._drain_before_next_poll = True
 
         self.stats.timeouts += 1
         writer.emit_event(

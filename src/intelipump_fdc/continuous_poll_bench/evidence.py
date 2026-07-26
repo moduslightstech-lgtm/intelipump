@@ -29,6 +29,9 @@ class ContinuousBenchEvent(StrEnum):
     SCHEDULE_LAG = "schedule_lag"
     PROTOCOL_ERROR = "protocol_error"
     SERIAL_DISCONNECT = "serial_disconnect"
+    SERIAL_READ_CHUNK = "serial_read_chunk"
+    STALE_INPUT_DRAINED = "stale_input_drained"
+    TRANSIENT_EMPTY_READ = "transient_empty_read"
     BENCH_STOPPED = "bench_stopped"
     SAFETY_REFUSED = "safety_refused"
 
@@ -81,6 +84,7 @@ class EvidenceRecord:
     latencyMs: float | None = None
     stopReason: str | None = None
     softwareCommit: str | None = None
+    source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -154,6 +158,8 @@ class EvidenceWriter:
         schedule_lag_ms: float | None = None,
         latency_ms: float | None = None,
         stop_reason: str | None = None,
+        source: str | None = None,
+        raw: bytes | None = None,
     ) -> None:
         logical = logical_address if logical_address is not None else pump_address
         self.write(
@@ -164,8 +170,8 @@ class EvidenceWriter:
                 monotonicNs=monotonic_ns,
                 recordType=RecordType.EVENT.value,
                 direction=None,
-                rawHex=None,
-                byteCount=None,
+                rawHex=bytes_to_raw_hex(raw) if raw is not None else None,
+                byteCount=len(raw) if raw is not None else None,
                 pumpAddress=logical,
                 logicalAddress=logical,
                 wireAddress=wire_address,
@@ -181,6 +187,7 @@ class EvidenceWriter:
                 latencyMs=latency_ms,
                 stopReason=stop_reason,
                 softwareCommit=self.commit,
+                source=source,
             )
         )
 
@@ -201,6 +208,7 @@ class EvidenceWriter:
         latency_ms: float | None = None,
         logical_address: int | None = None,
         wire_address: int | None = None,
+        source: str | None = None,
     ) -> None:
         logical = logical_address if logical_address is not None else pump_address
         self.write(
@@ -228,6 +236,7 @@ class EvidenceWriter:
                 latencyMs=latency_ms,
                 stopReason=None,
                 softwareCommit=self.commit,
+                source=source,
             )
         )
 

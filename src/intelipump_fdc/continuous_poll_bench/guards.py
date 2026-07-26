@@ -32,8 +32,10 @@ from intelipump_fdc.core.config import ControllerMode, Settings
 
 # Re-export for callers/tests.
 __all__ = [
+    "REAL_WAYNE_DEFAULT_RESPONSE_TIMEOUT_MS",
     "REAL_WAYNE_MAX_DURATION_S",
     "REAL_WAYNE_MAX_WRITES",
+    "REAL_WAYNE_MIN_POLL_INTERVAL_MS",
     "SIMULATOR_MAX_DURATION_S",
     "ContinuousPollBenchParams",
     "ContinuousPollConfirmations",
@@ -45,6 +47,8 @@ __all__ = [
 REAL_WAYNE_MAX_DURATION_S = 5
 SIMULATOR_MAX_DURATION_S = 30
 REAL_WAYNE_MAX_WRITES = 50
+REAL_WAYNE_MIN_POLL_INTERVAL_MS = 300
+REAL_WAYNE_DEFAULT_RESPONSE_TIMEOUT_MS = 250
 MALFORMED_THRESHOLD = 3
 
 
@@ -199,6 +203,12 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
             f"baud must be 9600 or 19200, got {params.baud}", reason="bad_baud"
         )
     if not params.simulator_validation:
+        if params.poll_interval_ms < REAL_WAYNE_MIN_POLL_INTERVAL_MS:
+            raise ContinuousPollRefusedError(
+                f"real-Wayne poll-interval-ms must be >= "
+                f"{REAL_WAYNE_MIN_POLL_INTERVAL_MS} (got {params.poll_interval_ms})",
+                reason="real_wayne_poll_interval",
+            )
         # Real-Wayne: hard-cap computed writes (polls at t=0, interval, ... < duration).
         duration_ms = params.duration_seconds * 1000.0
         approx = int((duration_ms - 1e-9) // params.poll_interval_ms) + 1

@@ -160,6 +160,28 @@ class BenchPollSerialTransport:
         n = min(max_bytes, self._config.read_chunk_size)
         return await asyncio.to_thread(read_serial_chunk, self._ser, n)
 
+    async def drain_available(self) -> bytes:
+        """Read only bytes already buffered on the port (non-blocking)."""
+        if not self.is_open or self._ser is None:
+            return b""
+
+        def _drain() -> bytes:
+            ser = self._ser
+            assert ser is not None
+            waiting = int(getattr(ser, "in_waiting", 0) or 0)
+            if waiting <= 0:
+                return b""
+            return bytes(ser.read(waiting) or b"")  # type: ignore[attr-defined]
+
+        return await asyncio.to_thread(_drain)
+
+    def device_path_exists(self) -> bool:
+        if is_virtual_or_test_port(self._config.device):
+            return True
+        from pathlib import Path
+
+        return Path(self._config.device).exists()
+
     async def write(self, data: bytes) -> int:
         if not self.is_open or self._ser is None:
             raise TransportNotOpenError("bench poll serial not open")

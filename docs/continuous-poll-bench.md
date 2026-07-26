@@ -41,8 +41,8 @@ intelipump-continuous-poll-bench \
   --port /dev/intelipump-controller \
   --address 1 \
   --duration-seconds 3 \
-  --poll-interval-ms 100 \
-  --response-timeout-ms 50 \
+  --poll-interval-ms 300 \
+  --response-timeout-ms 250 \
   --evidence-dir data/bench/continuous-poll \
   --simulator-validation \
   --confirm-owned-lab-pump \
@@ -67,8 +67,8 @@ Results:
 | Limit | Real Wayne | Simulator (`--simulator-validation`) |
 | --- | --- | --- |
 | Duration | 1–5 s (default 3) | 1–30 s |
-| Poll interval | 50–1000 ms (default 100) | same |
-| Response timeout | &lt; poll interval | same |
+| Poll interval | 300–1000 ms (default 300) | 50–1000 ms (default 300) |
+| Response timeout | default 250 ms; must be &lt; interval | same |
 | Max writes | 50 | derived from duration/interval |
 | Addresses | exactly one | exactly one |
 

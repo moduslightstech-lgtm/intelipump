@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -52,6 +53,18 @@ from intelipump_fdc.protocol.dart.line.frame_builder import (
 )
 from intelipump_fdc.protocol.dart.transport.errors import TransportNotOpenError
 from intelipump_fdc.simulator.encoding import encode_dc1_status
+
+
+def _as_int(value: object) -> int:
+    return cast(int, value)
+
+
+def _as_float(value: object) -> float:
+    return cast(float, value)
+
+
+def _as_str(value: object) -> str:
+    return cast(str, value)
 
 
 def _confirms(**overrides: bool) -> ContinuousPollConfirmations:
@@ -130,6 +143,13 @@ class FakeBenchTransport:
             return b""
         data = self.chunks.pop(0)
         return data[:max_bytes]
+
+    async def drain_available(self) -> bytes:
+        """Non-blocking drain; fakes keep response bytes on the read queue only."""
+        return b""
+
+    def device_path_exists(self) -> bool:
+        return True
 
     async def write(self, data: bytes) -> int:
         if (
@@ -257,8 +277,8 @@ def test_real_wayne_max_5_seconds(tmp_path: Path) -> None:
         _params(
             tmp_path,
             duration_seconds=5,
-            poll_interval_ms=100,
-            response_timeout_ms=50,
+            poll_interval_ms=300,
+            response_timeout_ms=250,
             simulator_validation=False,
         )
     )
@@ -267,24 +287,50 @@ def test_real_wayne_max_5_seconds(tmp_path: Path) -> None:
             _params(
                 tmp_path,
                 duration_seconds=5.1,
+                poll_interval_ms=300,
+                response_timeout_ms=250,
                 simulator_validation=False,
             )
         )
 
 
-def test_max_50_writes_enforced_for_real_wayne(tmp_path: Path) -> None:
-    # 5s @ 50ms interval => ~100 polls > 50
-    with pytest.raises(ContinuousPollRefusedError, match="50"):
+def test_real_wayne_min_poll_interval_300ms(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="300"):
         validate_continuous_params(
             _params(
                 tmp_path,
-                duration_seconds=5,
-                poll_interval_ms=50,
-                response_timeout_ms=40,
+                duration_seconds=3,
+                poll_interval_ms=100,
+                response_timeout_ms=50,
                 simulator_validation=False,
             )
         )
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=3,
+            poll_interval_ms=300,
+            response_timeout_ms=250,
+            simulator_validation=False,
+        )
+    )
+
+
+def test_max_50_writes_enforced_for_real_wayne(tmp_path: Path) -> None:
+    # Real-Wayne min interval 300ms keeps 5s sessions under the 50-write cap.
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=5,
+            poll_interval_ms=300,
+            response_timeout_ms=250,
+            simulator_validation=False,
+        )
+    )
     assert REAL_WAYNE_MAX_WRITES == 50
+    duration_ms = 5.0 * 1000.0
+    approx = int((duration_ms - 1e-9) // 300) + 1
+    assert approx <= REAL_WAYNE_MAX_WRITES
 
 
 def test_authorization_flags_must_remain_false() -> None:
@@ -352,6 +398,8 @@ def test_real_mode_refuses_simulator_process(tmp_path: Path) -> None:
             _params(
                 tmp_path,
                 port=str(port),
+                poll_interval_ms=300,
+                response_timeout_ms=250,
                 simulator_validation=False,
                 skip_service_check=True,
                 skip_port_check=True,
@@ -430,9 +478,9 @@ async def test_simulator_continuous_polling_100ms_3s(tmp_path: Path) -> None:
     assert 2.8 <= elapsed <= 3.8
     assert summary["pollsSent"] == transport.write_count
     # Monotonic 100ms over 3s → ~30 polls; allow small edge variance.
-    assert 28 <= summary["pollsSent"] <= 31
+    assert 28 <= _as_int(summary["pollsSent"]) <= 31
     assert all(w == build_poll(1) for w in transport.written)
-    assert summary["validResponses"] >= 1
+    assert _as_int(summary["validResponses"]) >= 1
     assert summary["commandQueueCreated"] is False
     assert summary["authorizationObjectsCreated"] == 0
     assert summary["result"] == ContinuousBenchResult.PASS.value
@@ -471,8 +519,8 @@ async def test_no_catchup_burst_after_scheduler_delay(tmp_path: Path) -> None:
     summary = await session.run()
     # Without skip: ~10 polls; with 250ms/write catch-up would still try many.
     # With skip: roughly 1s/0.25s ≈ 4 polls.
-    assert summary["pollsSent"] <= 6
-    assert summary["scheduleLagEvents"] >= 1
+    assert _as_int(summary["pollsSent"]) <= 6
+    assert _as_int(summary["scheduleLagEvents"]) >= 1
     # No back-to-back bursts: successive TX timestamps spaced.
     records = [
         json.loads(line)
@@ -527,8 +575,8 @@ async def test_timeout_does_not_extend_duration(tmp_path: Path) -> None:
     summary = await session.run()
     elapsed = time.monotonic() - t0
     assert elapsed < 1.5
-    assert summary["actualDurationS"] < 1.5
-    assert summary["timeouts"] >= 1
+    assert _as_float(summary["actualDurationS"]) < 1.5
+    assert _as_int(summary["timeouts"]) >= 1
     assert summary["validResponses"] == 0
     assert summary["result"] == ContinuousBenchResult.INCONCLUSIVE.value
 
@@ -575,6 +623,12 @@ async def test_stale_partial_not_concatenated_into_next_poll(
             data = self.chunks.pop(0)
             return data[:max_bytes]
 
+        async def drain_available(self) -> bytes:
+            return b""
+
+        def device_path_exists(self) -> bool:
+            return True
+
         async def write(self, data: bytes) -> int:
             self.write_count += 1
             self.written.append(data)
@@ -594,8 +648,8 @@ async def test_stale_partial_not_concatenated_into_next_poll(
         max_writes=10,
     )
     summary = await session.run()
-    assert summary["timeouts"] >= 1
-    assert summary["validResponses"] >= 1
+    assert _as_int(summary["timeouts"]) >= 1
+    assert _as_int(summary["validResponses"]) >= 1
     assert summary["crcErrors"] == 0
     assert summary["commandQueueCreated"] is False
     assert summary["authorizationObjectsCreated"] == 0
@@ -742,8 +796,8 @@ async def test_max_writes_enforced_at_runtime(tmp_path: Path) -> None:
         simulator_validation=True,
     )
     summary = await session.run()
-    assert summary["pollsSent"] <= 5
-    assert summary["writeCount"] <= 5
+    assert _as_int(summary["pollsSent"]) <= 5
+    assert _as_int(summary["writeCount"]) <= 5
     assert summary["stopReason"] == "max_writes"
     assert summary["result"] == ContinuousBenchResult.FAIL.value
 
@@ -789,7 +843,7 @@ async def test_evidence_records_every_poll_and_stop_reason(tmp_path: Path) -> No
     assert stopped[0]["stopReason"] == summary["stopReason"]
     md = (tmp_path / "e.md").read_text()
     assert "Stop reason:" in md
-    assert summary["result"] in md
+    assert _as_str(summary["result"]) in md
 
 
 @pytest.mark.asyncio
@@ -877,3 +931,356 @@ async def test_transport_not_open_maps_to_disconnect(tmp_path: Path) -> None:
     session = _session(BrokenTransport(), tmp_path, duration_seconds=1.0)  # type: ignore[arg-type]
     summary = await session.run()
     assert summary["stopReason"] == "serial_disconnect"
+
+
+WAYNE_25 = bytes.fromhex(
+    "50 30 02 08 00 00 00 00 00 00 00 00 03 04 00 99 "
+    "07 07 01 01 00 0e 55 03 fa"
+)
+
+
+@pytest.mark.asyncio
+async def test_three_consecutive_wayne_25_byte_data_frames(
+    tmp_path: Path,
+) -> None:
+    """Each of three poll cycles must yield one CRC-valid DATA_FRAME."""
+    assert len(WAYNE_25) == 25
+
+    @dataclass
+    class WayneFrameTransport:
+        device: str = "/tmp/fake-wayne25"
+        written: list[bytes] = field(default_factory=list)
+        write_count: int = 0
+        buf: bytearray = field(default_factory=bytearray)
+        _open: bool = False
+        drain_calls: int = 0
+
+        @property
+        def is_open(self) -> bool:
+            return self._open
+
+        async def open(self) -> None:
+            self._open = True
+
+        async def close(self) -> None:
+            self._open = False
+
+        async def drain_available(self) -> bytes:
+            self.drain_calls += 1
+            if not self.buf:
+                return b""
+            data = bytes(self.buf)
+            self.buf.clear()
+            return data
+
+        def device_path_exists(self) -> bool:
+            return True
+
+        async def read(self, max_bytes: int) -> bytes:
+            if not self.buf:
+                await asyncio.sleep(0.002)
+                return b""
+            data = bytes(self.buf[:max_bytes])
+            del self.buf[:max_bytes]
+            return data
+
+        async def write(self, data: bytes) -> int:
+            self.write_count += 1
+            self.written.append(data)
+            self.buf.extend(WAYNE_25)
+            return len(data)
+
+    transport = WayneFrameTransport()
+    session = _session(
+        transport,  # type: ignore[arg-type]
+        tmp_path,
+        duration_seconds=1.0,
+        poll_interval_ms=100,
+        response_timeout_ms=50,
+        max_writes=3,
+    )
+    summary = await session.run()
+    assert summary["pollsSent"] == 3
+    assert summary["validResponses"] == 3
+    assert summary["crcErrors"] == 0
+    assert summary["commandQueueCreated"] is False
+    assert summary["authorizationObjectsCreated"] == 0
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "e.jsonl").read_text().splitlines()
+        if line
+    ]
+    for seq in (1, 2, 3):
+        rx = [
+            r
+            for r in records
+            if r.get("pollSequence") == seq
+            and r.get("direction") == "RX"
+            and r.get("responseClassification") == "DATA_FRAME"
+            and r.get("crcValid") is True
+        ]
+        assert len(rx) == 1
+        raw = bytes(int(p, 16) for p in rx[0]["rawHex"].split())
+        assert raw == WAYNE_25
+
+    chunks = [r for r in records if r.get("source") == "serial_read_chunk"]
+    assert chunks
+    assert all(r.get("event") == "serial_read_chunk" for r in chunks)
+
+
+@pytest.mark.asyncio
+async def test_leading_0x50_not_removed_by_pre_tx_drain(tmp_path: Path) -> None:
+    """Bytes already in the UART buffer must not be drained before every TX."""
+
+    @dataclass
+    class LeadingByteTransport:
+        device: str = "/tmp/fake-leading50"
+        written: list[bytes] = field(default_factory=list)
+        write_count: int = 0
+        buf: bytearray = field(default_factory=bytearray)
+        drained: list[bytes] = field(default_factory=list)
+        _open: bool = False
+        _plant_task: asyncio.Task[None] | None = None
+
+        @property
+        def is_open(self) -> bool:
+            return self._open
+
+        async def open(self) -> None:
+            self._open = True
+
+        async def close(self) -> None:
+            self._open = False
+            if self._plant_task is not None:
+                self._plant_task.cancel()
+
+        async def drain_available(self) -> bytes:
+            if not self.buf:
+                return b""
+            data = bytes(self.buf)
+            self.buf.clear()
+            self.drained.append(data)
+            return data
+
+        def device_path_exists(self) -> bool:
+            return True
+
+        async def read(self, max_bytes: int) -> bytes:
+            if not self.buf:
+                await asyncio.sleep(0.002)
+                return b""
+            data = bytes(self.buf[:max_bytes])
+            del self.buf[:max_bytes]
+            return data
+
+        async def _plant_leading_after_first_response(self) -> None:
+            # After poll-1 TX, wait for its response to be consumed, then plant
+            # leading 0x50 before poll-2 TX (where a pre-TX drain would steal it).
+            await asyncio.sleep(0.02)
+            for _ in range(100):
+                if self.write_count >= 2:
+                    return
+                if not self.buf:
+                    self.buf.append(0x50)
+                    return
+                await asyncio.sleep(0.005)
+
+        async def write(self, data: bytes) -> int:
+            self.write_count += 1
+            self.written.append(data)
+            if self.write_count == 1:
+                self.buf.extend(WAYNE_25)
+                self._plant_task = asyncio.create_task(
+                    self._plant_leading_after_first_response()
+                )
+            else:
+                # Remainder only; leading 0x50 must still be in the UART buffer.
+                if not self.buf or self.buf[0] != 0x50:
+                    # Make the failure mode obvious if a pre-TX drain ate 0x50.
+                    self.buf.clear()
+                    self.buf.extend(WAYNE_25[1:])
+                else:
+                    self.buf.extend(WAYNE_25[1:])
+            return len(data)
+
+    transport = LeadingByteTransport()
+    session = _session(
+        transport,  # type: ignore[arg-type]
+        tmp_path,
+        duration_seconds=1.0,
+        poll_interval_ms=100,
+        response_timeout_ms=50,
+        max_writes=3,
+    )
+    summary = await session.run()
+    assert _as_int(summary["validResponses"]) >= 2
+    assert summary["crcErrors"] == 0
+    # After the first successful poll, pre-TX drain must not eat leading 0x50.
+    assert not any(b[:1] == b"\x50" for b in transport.drained)
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "e.jsonl").read_text().splitlines()
+        if line
+    ]
+    data_frames = [
+        r
+        for r in records
+        if r.get("direction") == "RX"
+        and r.get("responseClassification") == "DATA_FRAME"
+        and r.get("crcValid") is True
+        and r.get("rawHex")
+    ]
+    assert len(data_frames) >= 2
+    for r in data_frames:
+        raw = bytes(int(p, 16) for p in r["rawHex"].split())
+        assert raw[0] == 0x50
+        assert raw == WAYNE_25
+
+
+@pytest.mark.asyncio
+async def test_transient_empty_read_recovers(tmp_path: Path) -> None:
+    @dataclass
+    class TransientEmptyTransport:
+        device: str = "/tmp/fake-transient"
+        written: list[bytes] = field(default_factory=list)
+        write_count: int = 0
+        chunks: list[bytes] = field(default_factory=list)
+        empty_raises_left: int = 1
+        _open: bool = False
+
+        @property
+        def is_open(self) -> bool:
+            return self._open
+
+        async def open(self) -> None:
+            self._open = True
+
+        async def close(self) -> None:
+            self._open = False
+
+        async def drain_available(self) -> bytes:
+            return b""
+
+        def device_path_exists(self) -> bool:
+            return True
+
+        async def read(self, max_bytes: int) -> bytes:
+            if self.empty_raises_left > 0:
+                self.empty_raises_left -= 1
+                raise OSError(
+                    "device reports readiness to read but returned no data "
+                    "(device disconnected or multiple access on port?)"
+                )
+            if not self.chunks:
+                await asyncio.sleep(0.002)
+                return b""
+            data = self.chunks.pop(0)
+            return data[:max_bytes]
+
+        async def write(self, data: bytes) -> int:
+            self.write_count += 1
+            self.written.append(data)
+            self.chunks.append(WAYNE_25)
+            return len(data)
+
+    transport = TransientEmptyTransport()
+    session = _session(
+        transport,  # type: ignore[arg-type]
+        tmp_path,
+        duration_seconds=1.0,
+        poll_interval_ms=100,
+        response_timeout_ms=80,
+        max_writes=2,
+    )
+    summary = await session.run()
+    assert summary["stopReason"] != "serial_disconnect"
+    assert _as_int(summary["validResponses"]) >= 1
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "e.jsonl").read_text().splitlines()
+        if line
+    ]
+    assert any(r.get("event") == "transient_empty_read" for r in records)
+
+
+@pytest.mark.asyncio
+async def test_repeated_transient_empty_read_disconnects(tmp_path: Path) -> None:
+    @dataclass
+    class RepeatedEmptyTransport:
+        device: str = "/tmp/fake-repeated-empty"
+        written: list[bytes] = field(default_factory=list)
+        write_count: int = 0
+        _open: bool = False
+
+        @property
+        def is_open(self) -> bool:
+            return self._open
+
+        async def open(self) -> None:
+            self._open = True
+
+        async def close(self) -> None:
+            self._open = False
+
+        async def drain_available(self) -> bytes:
+            return b""
+
+        def device_path_exists(self) -> bool:
+            return True
+
+        async def read(self, max_bytes: int) -> bytes:
+            raise OSError(
+                "device reports readiness to read but returned no data "
+                "(device disconnected or multiple access on port?)"
+            )
+
+        async def write(self, data: bytes) -> int:
+            self.write_count += 1
+            self.written.append(data)
+            return len(data)
+
+    transport = RepeatedEmptyTransport()
+    session = _session(
+        transport,  # type: ignore[arg-type]
+        tmp_path,
+        duration_seconds=1.0,
+        poll_interval_ms=100,
+        response_timeout_ms=80,
+        max_writes=5,
+    )
+    summary = await session.run()
+    assert summary["stopReason"] == "serial_disconnect"
+    assert summary["result"] == ContinuousBenchResult.FAIL.value
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "e.jsonl").read_text().splitlines()
+        if line
+    ]
+    assert any(r.get("event") == "transient_empty_read" for r in records)
+    assert any(r.get("event") == "serial_disconnect" for r in records)
+
+
+def test_cli_defaults_are_conservative_for_real_wayne() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--port",
+            "/tmp/x",
+            "--address",
+            "1",
+            "--evidence-dir",
+            "/tmp/ev",
+            "--confirm-owned-lab-pump",
+            "--confirm-technician-present",
+            "--confirm-emergency-isolation-ready",
+            "--confirm-no-fuel-test",
+            "--confirm-authorization-disabled",
+            "--confirm-status-poll-only",
+            "--confirm-bounded-duration",
+        ]
+    )
+    assert args.poll_interval_ms == 300
+    assert args.response_timeout_ms == 250
+    assert args.duration_seconds == 3
