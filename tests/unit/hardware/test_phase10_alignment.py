@@ -73,9 +73,13 @@ def test_jsonl_capture_fields_and_sanitize(tmp_path: Path) -> None:
 def test_timing_stats_percentiles_and_separate_targets() -> None:
     tracker = LatencyTracker(protocol_target_ms=25.0, configured_bench_timeout_ms=100.0)
     for i, dt in enumerate([5.0, 10.0, 15.0, 20.0, 40.0]):
-        tracker.mark_poll_start(1, monotonic_s=float(i))
-        tracker.mark_response(1, monotonic_s=float(i) + dt / 1000.0, response_kind="EOT")
-    tracker.mark_poll_start(2, monotonic_s=100.0)
+        tracker.mark_write_start(1, monotonic_s=float(i))
+        tracker.mark_write_complete(1, monotonic_s=float(i))
+        tracker.mark_response(
+            1, monotonic_s=float(i) + dt / 1000.0, response_kind="EOT_RECEIVED"
+        )
+    tracker.mark_write_start(2, monotonic_s=100.0)
+    tracker.mark_write_complete(2, monotonic_s=100.0)
     tracker.mark_response(2, monotonic_s=100.2, response_kind="RESPONSE_TIMEOUT")
     d = tracker.to_dict()
     assert d["count"] == 5
@@ -88,6 +92,53 @@ def test_timing_stats_percentiles_and_separate_targets() -> None:
     assert d["p95_ms"] is not None
     assert d["p99_ms"] is not None
     assert d["jitter_ms"] is not None
+    assert "intervals" in d
+    assert d["intervals"]["poll_write_complete_to_complete_response"]["count"] == 5
+
+
+def test_four_latency_intervals_are_separate() -> None:
+    tracker = LatencyTracker(protocol_target_ms=25.0, configured_bench_timeout_ms=100.0)
+    # Attempt 1: EOT path — intervals 1+2 only.
+    tracker.mark_write_start(1, monotonic_s=1.000)
+    tracker.mark_write_complete(1, monotonic_s=1.001)
+    tracker.mark_first_response_byte(1, monotonic_s=1.003)
+    tracker.mark_response(1, monotonic_s=1.004, response_kind="EOT_RECEIVED")
+    # Attempt 2: DATA + ACK + next POLL - intervals 1-4.
+    tracker.mark_write_start(1, monotonic_s=2.000)
+    tracker.mark_write_complete(1, monotonic_s=2.001)
+    tracker.mark_first_response_byte(1, monotonic_s=2.005)
+    tracker.mark_response(1, monotonic_s=2.006, response_kind="DATA_RECEIVED")
+    tracker.mark_ack_write_start(1, monotonic_s=2.007)
+    tracker.mark_ack_write(1, monotonic_s=2.008)
+    tracker.mark_write_start(2, monotonic_s=2.020)  # next POLL closes interval 4
+
+    assert tracker.poll_to_first_byte.count == 2
+    assert tracker.poll_to_complete_response.count == 2
+    assert tracker.data_to_ack.count == 1
+    assert tracker.ack_to_next_poll.count == 1
+    # (2 ms + 4 ms) / 2 and (3 ms + 5 ms) / 2
+    assert tracker.poll_to_first_byte.mean_ms == pytest.approx(3.0, abs=0.01)
+    assert tracker.poll_to_complete_response.mean_ms == pytest.approx(4.0, abs=0.01)
+    assert tracker.data_to_ack.mean_ms == pytest.approx(1.0, abs=0.01)
+    assert tracker.ack_to_next_poll.mean_ms == pytest.approx(12.0, abs=0.01)
+    # Must not fold timeout config into samples.
+    assert all(v < 50.0 for v in tracker.poll_to_complete_response.values_ms)
+
+
+def test_immediate_response_latency_below_bench_deadline() -> None:
+    """Synthetic immediate reply must report latency << configured 100 ms."""
+    tracker = LatencyTracker(protocol_target_ms=25.0, configured_bench_timeout_ms=100.0)
+    for i in range(20):
+        t0 = float(i)
+        tracker.mark_write_start(1, monotonic_s=t0)
+        tracker.mark_write_complete(1, monotonic_s=t0 + 0.0005)
+        tracker.mark_first_response_byte(1, monotonic_s=t0 + 0.002)
+        tracker.mark_response(1, monotonic_s=t0 + 0.0025, response_kind="EOT_RECEIVED")
+    assert tracker.poll_to_first_byte.mean_ms == pytest.approx(1.5, abs=0.05)
+    assert tracker.poll_to_complete_response.mean_ms == pytest.approx(2.0, abs=0.05)
+    assert tracker.poll_to_complete_response.mean_ms < 10.0
+    assert tracker.configured_bench_timeout_ms == 100.0
+    assert tracker.protocol_target_ms == 25.0
 
 
 def test_all_bench_fault_kinds_are_named() -> None:

@@ -1,0 +1,420 @@
+"""Deterministic tests for intelipump-poll-bench."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from intelipump_fdc.bench_poll.cli import build_parser
+from intelipump_fdc.bench_poll.cli import run as poll_bench_run
+from intelipump_fdc.bench_poll.evidence import BenchResult
+from intelipump_fdc.bench_poll.guards import (
+    PollBenchConfirmations,
+    PollBenchParams,
+    PollBenchRefusedError,
+    assert_simulator_not_owning_adapters,
+    run_poll_bench_preflight,
+    validate_poll_bench_params,
+    validate_poll_bench_settings,
+)
+from intelipump_fdc.bench_poll.session import PollBenchSession, PollBenchSessionConfig
+from intelipump_fdc.controller.safety import (
+    ControllerSafetyContext,
+    evaluate_outbound_safety,
+    evaluate_polling_allowed,
+)
+from intelipump_fdc.controller.session_models import (
+    IdempotencyClass,
+    OutboundDataItem,
+)
+from intelipump_fdc.core.config import ControllerMode, Settings
+from intelipump_fdc.domain.pump_command import PumpCommand
+from intelipump_fdc.protocol.dart.line.constants import SF
+from intelipump_fdc.protocol.dart.line.escaping import escape_dle, unescape_dle
+from intelipump_fdc.protocol.dart.line.frame_builder import build_data_frame, build_eot, build_poll
+from intelipump_fdc.simulator.encoding import encode_dc1_status
+
+
+def _confirms(**overrides: bool) -> PollBenchConfirmations:
+    base = dict(
+        owned_lab_pump=True,
+        technician_present=True,
+        emergency_isolation_ready=True,
+        no_fuel_test=True,
+        authorization_disabled=True,
+    )
+    base.update(overrides)
+    return PollBenchConfirmations(**base)
+
+
+def _lab_poll_settings(**kwargs: object) -> Settings:
+    s = Settings(
+        environment="LAB",
+        controller={"mode": ControllerMode.POLL_ONLY_BENCH},
+        safety={
+            "active_commands_enabled": False,
+            "remote_authorization_enabled": False,
+            "automatic_authorization_enabled": False,
+            "command_replay_enabled": False,
+            "allow_lab_simulator_commands": False,
+        },
+        mqtt={"enabled": False},
+    )
+    for key, value in kwargs.items():
+        setattr(s, key, value)
+    return s
+
+
+@dataclass
+class FakeBenchTransport:
+    device: str = "/tmp/fake-poll-bench"
+    chunks: list[bytes] = field(default_factory=list)
+    written: list[bytes] = field(default_factory=list)
+    write_count: int = 0
+    _open: bool = False
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    async def open(self) -> None:
+        self._open = True
+
+    async def close(self) -> None:
+        self._open = False
+
+    async def read(self, max_bytes: int) -> bytes:
+        if not self.chunks:
+            await asyncio.sleep(0.01)
+            return b""
+        data = self.chunks.pop(0)
+        return data[:max_bytes]
+
+    async def write(self, data: bytes) -> int:
+        self.write_count += 1
+        self.written.append(data)
+        return len(data)
+
+
+def test_parser_has_no_raw_hex_or_payload() -> None:
+    parser = build_parser()
+    option_strings = {
+        opt
+        for action in parser._actions
+        for opt in (action.option_strings or [])
+    }
+    forbidden = {
+        "--raw-hex",
+        "--payload",
+        "--command",
+        "--authorize",
+        "--replay",
+        "--hex",
+    }
+    assert forbidden.isdisjoint(option_strings)
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--port",
+                "/tmp/x",
+                "--address",
+                "1",
+                "--raw-hex",
+                "01 fa",
+            ]
+        )
+
+
+def test_missing_confirmation_refuses() -> None:
+    with pytest.raises(PollBenchRefusedError, match="missing confirmation"):
+        validate_poll_bench_params(
+            PollBenchParams(
+                port="/tmp/x",
+                address=1,
+                baud=9600,
+                max_polls=1,
+                response_timeout_ms=100,
+                evidence_dir=Path("/tmp"),
+                confirmations=_confirms(technician_present=False),
+            )
+        )
+
+
+def test_non_lab_refuses() -> None:
+    s = _lab_poll_settings()
+    s.environment = "PROD"
+    with pytest.raises(PollBenchRefusedError, match="LAB"):
+        validate_poll_bench_settings(s)
+
+
+def test_wrong_mode_refuses() -> None:
+    s = _lab_poll_settings()
+    s.controller.mode = ControllerMode.LISTEN_ONLY
+    with pytest.raises(PollBenchRefusedError, match="POLL_ONLY_BENCH"):
+        validate_poll_bench_settings(s)
+
+
+def test_max_polls_bounds() -> None:
+    base = dict(
+        port="/tmp/x",
+        address=1,
+        baud=9600,
+        response_timeout_ms=100,
+        evidence_dir=Path("/tmp"),
+        confirmations=_confirms(),
+    )
+    with pytest.raises(PollBenchRefusedError, match="max-polls"):
+        validate_poll_bench_params(PollBenchParams(**base, max_polls=0))
+    with pytest.raises(PollBenchRefusedError, match="max-polls"):
+        validate_poll_bench_params(PollBenchParams(**base, max_polls=11))
+
+
+def test_authorization_replay_mqtt_refuse() -> None:
+    cases: list[tuple[str, str]] = [
+        ("active_commands_enabled", "active"),
+        ("remote_authorization_enabled", "remote"),
+        ("automatic_authorization_enabled", "automatic"),
+        ("command_replay_enabled", "replay"),
+    ]
+    for attr, match in cases:
+        s = _lab_poll_settings()
+        setattr(s.safety, attr, True)
+        with pytest.raises(PollBenchRefusedError, match=match):
+            validate_poll_bench_settings(s)
+    s = _lab_poll_settings()
+    s.mqtt.enabled = True
+    with pytest.raises(PollBenchRefusedError, match="MQTT"):
+        validate_poll_bench_settings(s)
+
+
+def test_service_active_refuses(tmp_path: Path) -> None:
+    def runner(*_a: object, **_k: object) -> MagicMock:
+        m = MagicMock()
+        m.returncode = 0
+        return m
+
+    params = PollBenchParams(
+        port=str(tmp_path / "ttyUSB0"),
+        address=1,
+        baud=9600,
+        max_polls=1,
+        response_timeout_ms=50,
+        evidence_dir=tmp_path / "ev",
+        confirmations=_confirms(),
+        lock_dir=tmp_path / "locks",
+        skip_port_check=True,
+    )
+    (tmp_path / "ttyUSB0").touch()
+    with pytest.raises(PollBenchRefusedError, match="active"):
+        run_poll_bench_preflight(
+            params, _lab_poll_settings(), systemctl_runner=runner
+        )
+
+
+def test_simulator_process_active_refuses(tmp_path: Path) -> None:
+    port = tmp_path / "ttyUSB1"
+    port.touch()
+    with pytest.raises(PollBenchRefusedError, match="simulator"):
+        assert_simulator_not_owning_adapters(
+            [str(port)],
+            holder_finder=lambda _p: [4242],
+            simulator_checker=lambda pid: pid == 4242,
+        )
+
+
+def test_poll_only_bench_blocks_controller_queue() -> None:
+    ctx = ControllerSafetyContext(
+        environment="LAB",
+        mode=ControllerMode.POLL_ONLY_BENCH,
+        active_commands_enabled=False,
+        require_physical_control_enable=True,
+    )
+    assert evaluate_polling_allowed(ctx).allowed is False
+    item = OutboundDataItem.create(
+        address=1,
+        application_payload=b"\x00",
+        command_type=PumpCommand.READ_STATUS,
+        simulator_only=True,
+        idempotency=IdempotencyClass.IDEMPOTENT,
+    )
+    assert evaluate_outbound_safety(item, ctx).allowed is False
+
+
+@pytest.mark.asyncio
+async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
+    eot = build_eot(1, 0)
+    transport = FakeBenchTransport(chunks=[eot])
+    session = PollBenchSession(
+        transport,
+        PollBenchSessionConfig(
+            port="/tmp/fake",
+            address=1,
+            baud=9600,
+            max_polls=1,
+            response_timeout_ms=200,
+            evidence_jsonl=tmp_path / "e.jsonl",
+            evidence_md=tmp_path / "e.md",
+        ),
+    )
+    summary = await session.run()
+    assert summary["pollsSent"] == 1
+    assert transport.write_count == 1
+    assert transport.written[0] == build_poll(1)
+    assert summary["validResponses"] == 1
+    assert summary["commandQueueCreated"] is False
+    assert summary["authorizationObjectsCreated"] == 0
+    assert summary["result"] == BenchResult.PASS.value
+    lines = (tmp_path / "e.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in lines]
+    tx = [r for r in records if r.get("direction") == "TX"]
+    rx = [r for r in records if r.get("direction") == "RX"]
+    assert tx and rx
+    assert bytes(int(p, 16) for p in tx[0]["rawHex"].split()) == build_poll(1)
+    assert bytes(int(p, 16) for p in rx[0]["rawHex"].split()) == eot
+    assert any(r.get("event") == "bench_stopped" for r in records)
+
+
+@pytest.mark.asyncio
+async def test_timeout_exits_cleanly(tmp_path: Path) -> None:
+    transport = FakeBenchTransport(chunks=[])
+    session = PollBenchSession(
+        transport,
+        PollBenchSessionConfig(
+            port="/tmp/fake",
+            address=1,
+            baud=9600,
+            max_polls=1,
+            response_timeout_ms=40,
+            evidence_jsonl=tmp_path / "t.jsonl",
+            evidence_md=tmp_path / "t.md",
+        ),
+    )
+    summary = await session.run()
+    assert summary["timeouts"] == 1
+    assert summary["pollsSent"] == 1
+    assert not transport.is_open
+    text = (tmp_path / "t.jsonl").read_text()
+    assert "response_timeout" in text
+    assert "bench_stopped" in text
+
+
+@pytest.mark.asyncio
+async def test_crc_invalid_reported_and_stops(tmp_path: Path) -> None:
+    good = build_data_frame(1, 0, encode_dc1_status(1))
+    body = bytearray(unescape_dle(good[:-1]))
+    body[-3] ^= 0xFF
+    bad = escape_dle(bytes(body)) + bytes((SF,))
+    transport = FakeBenchTransport(chunks=[bad])
+    session = PollBenchSession(
+        transport,
+        PollBenchSessionConfig(
+            port="/tmp/fake",
+            address=1,
+            baud=9600,
+            max_polls=3,
+            response_timeout_ms=200,
+            evidence_jsonl=tmp_path / "c.jsonl",
+            evidence_md=tmp_path / "c.md",
+        ),
+    )
+    summary = await session.run()
+    assert summary["pollsSent"] == 1  # stops after CRC error
+    assert summary["crcErrors"] == 1
+    assert summary["result"] == BenchResult.FAIL.value
+
+
+@pytest.mark.asyncio
+async def test_sigterm_closes_and_writes_bench_stopped(tmp_path: Path) -> None:
+    transport = FakeBenchTransport(chunks=[])
+    session = PollBenchSession(
+        transport,
+        PollBenchSessionConfig(
+            port="/tmp/fake",
+            address=1,
+            baud=9600,
+            max_polls=10,
+            response_timeout_ms=500,
+            evidence_jsonl=tmp_path / "s.jsonl",
+            evidence_md=tmp_path / "s.md",
+        ),
+    )
+
+    async def _stop_soon() -> None:
+        await asyncio.sleep(0.05)
+        session.request_stop()
+
+    summary, _ = await asyncio.gather(session.run(), _stop_soon())
+    assert "bench_stopped" in (tmp_path / "s.jsonl").read_text()
+    assert not transport.is_open
+    assert summary["commandQueueCreated"] is False
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_path_writes_bench_stopped(tmp_path: Path) -> None:
+    transport = FakeBenchTransport(chunks=[build_eot(1, 0)])
+    session = PollBenchSession(
+        transport,
+        PollBenchSessionConfig(
+            port="/tmp/fake",
+            address=1,
+            baud=9600,
+            max_polls=5,
+            response_timeout_ms=200,
+            evidence_jsonl=tmp_path / "i.jsonl",
+            evidence_md=tmp_path / "i.md",
+        ),
+    )
+
+    async def _intr() -> None:
+        await asyncio.sleep(0.02)
+        session.request_stop()
+
+    await asyncio.gather(session.run(), _intr())
+    assert "bench_stopped" in (tmp_path / "i.jsonl").read_text()
+    assert not transport.is_open
+
+
+def test_cli_refuses_without_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("INTELIPUMP_ENVIRONMENT", "LAB")
+    monkeypatch.setenv("INTELIPUMP_CONTROLLER__MODE", "LISTEN_ONLY")
+    from intelipump_fdc.core.config import get_settings
+
+    get_settings.cache_clear()
+    with pytest.raises(SystemExit) as excinfo:
+        poll_bench_run(
+            [
+                "--port",
+                str(tmp_path / "p"),
+                "--address",
+                "1",
+                "--max-polls",
+                "1",
+                "--evidence-dir",
+                str(tmp_path / "ev"),
+                "--confirm-owned-lab-pump",
+                "--confirm-technician-present",
+                "--confirm-emergency-isolation-ready",
+                "--confirm-no-fuel-test",
+                "--confirm-authorization-disabled",
+                "--skip-service-check",
+                "--skip-port-check",
+            ]
+        )
+    assert excinfo.value.code == 2
+    get_settings.cache_clear()
+
+
+def test_multiple_addresses_not_accepted_by_cli() -> None:
+    parser = build_parser()
+    # --address is a single int; comma lists are rejected by argparse type=int
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--port", "/tmp/x", "--address", "1,2", "--max-polls", "1"]
+        )

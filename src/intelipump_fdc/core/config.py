@@ -10,6 +10,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class ControllerMode(StrEnum):
     LISTEN_ONLY = "LISTEN_ONLY"
     BENCH_CONTROL = "BENCH_CONTROL"
+    # Bounded one-address status poll against owned lab pump (intelipump-poll-bench).
+    POLL_ONLY_BENCH = "POLL_ONLY_BENCH"
     FIELD_CONTROL = "FIELD_CONTROL"
     LOCKED_OUT = "LOCKED_OUT"
 
@@ -32,6 +34,8 @@ class DartSettings(BaseModel):
 class SafetySettings(BaseModel):
     active_commands_enabled: bool = False
     remote_authorization_enabled: bool = False
+    automatic_authorization_enabled: bool = False
+    command_replay_enabled: bool = False
     require_physical_control_enable: bool = True
     # Phase 8: LAB simulator command submission via API (virtual transport only).
     allow_lab_simulator_commands: bool = False
@@ -159,6 +163,19 @@ def get_settings() -> Settings:
         and settings.safety.active_commands_enabled
     ):
         raise ValueError("Active commands must be disabled in LISTEN_ONLY mode")
+    if settings.controller.mode == ControllerMode.POLL_ONLY_BENCH:
+        if settings.safety.active_commands_enabled:
+            raise ValueError("Active commands must be disabled in POLL_ONLY_BENCH")
+        if settings.safety.remote_authorization_enabled:
+            raise ValueError("Remote authorization must be disabled in POLL_ONLY_BENCH")
+        if settings.safety.automatic_authorization_enabled:
+            raise ValueError(
+                "Automatic authorization must be disabled in POLL_ONLY_BENCH"
+            )
+        if settings.safety.command_replay_enabled:
+            raise ValueError("Command replay must be disabled in POLL_ONLY_BENCH")
+        if settings.mqtt.enabled:
+            raise ValueError("MQTT must be disabled in POLL_ONLY_BENCH")
     if (
         settings.environment.upper() == "LAB"
         and not settings.controller.station_id.endswith("-Lab")

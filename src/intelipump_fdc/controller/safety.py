@@ -47,6 +47,10 @@ def evaluate_outbound_safety(
         return SafetyDecision(False, ("controller_LOCKED_OUT",))
     if ctx.mode is ControllerMode.FIELD_CONTROL:
         return SafetyDecision(False, ("FIELD_CONTROL_not_enabled_in_phase8",))
+    if ctx.mode is ControllerMode.POLL_ONLY_BENCH:
+        return SafetyDecision(
+            False, ("POLL_ONLY_BENCH_blocks_command_queue_use_intelipump_poll_bench",)
+        )
 
     if item.command_type in _READ_COMMANDS:
         if not item.simulator_only:
@@ -86,6 +90,11 @@ def evaluate_outbound_safety(
 def evaluate_polling_allowed(ctx: ControllerSafetyContext) -> SafetyDecision:
     if ctx.mode is ControllerMode.LOCKED_OUT:
         return SafetyDecision(False, ("controller_LOCKED_OUT",))
+    if ctx.mode is ControllerMode.POLL_ONLY_BENCH:
+        # Continuous controller polling is not permitted; use intelipump-poll-bench.
+        return SafetyDecision(
+            False, ("POLL_ONLY_BENCH_requires_intelipump_poll_bench",)
+        )
     if ctx.environment.upper() != "LAB" and not ctx.allow_virtual_polling:
         return SafetyDecision(False, ("polling_requires_LAB_or_explicit_virtual_config",))
     if ctx.mode in {

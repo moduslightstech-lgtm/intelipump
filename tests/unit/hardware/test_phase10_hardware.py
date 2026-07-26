@@ -170,6 +170,7 @@ def test_corruption_detected_by_crc_mismatch() -> None:
 def test_latency_tracker() -> None:
     tracker = LatencyTracker(protocol_target_ms=25)
     tracker.mark_poll_start(1, monotonic_s=1.0)
+    tracker.mark_write_complete(1, monotonic_s=1.0)
     sample = tracker.mark_response(1, monotonic_s=1.01, response_kind="EOT_RECEIVED")
     assert sample is not None
     assert abs((sample.poll_to_response_ms or 0) - 10.0) < 0.001
@@ -198,7 +199,9 @@ def test_evidence_write(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_memory_bench_controller_simulator_latency() -> None:
     a, b = create_memory_transport_pair()
-    tracker = LatencyTracker(protocol_target_ms=100)
+    tracker = LatencyTracker(
+        protocol_target_ms=25.0, configured_bench_timeout_ms=100.0
+    )
     runtime = ControllerRuntime(
         transport=a,
         safety=default_lab_safety(),
@@ -233,6 +236,20 @@ async def test_memory_bench_controller_simulator_latency() -> None:
     assert isinstance(totals, dict)
     assert totals["poll_count"] > 0
     assert tracker.summary.count > 0
+    # Immediate in-memory responses must stay well below the 100 ms deadline and
+    # near the 25 ms protocol target (scheduler noise allowed).
+    assert tracker.poll_to_complete_response.mean_ms is not None
+    assert tracker.poll_to_complete_response.mean_ms < 25.0
+    assert tracker.poll_to_first_byte.count > 0
+    assert tracker.poll_to_first_byte.mean_ms is not None
+    assert tracker.poll_to_first_byte.mean_ms < 25.0
+    assert tracker.poll_to_complete_response.p95_ms is not None
+    assert tracker.poll_to_complete_response.p95_ms < 40.0
+    assert tracker.configured_bench_timeout_ms == 100.0
+    assert tracker.protocol_target_ms == 25.0
+    d = tracker.to_dict()
+    assert "intervals" in d
+    assert len(d["intervals"]) == 4
     assert runtime.safety.mode.value == "LISTEN_ONLY"
     assert runtime.safety.active_commands_enabled is False
 

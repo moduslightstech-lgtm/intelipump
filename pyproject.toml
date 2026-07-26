@@ -40,6 +40,7 @@ intelipump-cloud-sync = "intelipump_fdc.cloud.cli:run"
 intelipump-rs485-bench = "intelipump_fdc.hardware.cli:run"
 intelipump-capture-passive = "intelipump_fdc.capture.cli_capture:run"
 intelipump-decode-capture = "intelipump_fdc.capture.cli_decode:run"
+intelipump-poll-bench = "intelipump_fdc.bench_poll.cli:run"
 
 [build-system]
 requires = ["hatchling"]

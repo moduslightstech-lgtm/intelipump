@@ -44,6 +44,11 @@ Receive-only observation tooling and runbook for the privately owned lab
 dispenser. See `docs/wayne-passive-lab-runbook.md`. No authorization.
 Does not start Phase 11D–11H.
 
+## Real-pump poll bench (POLL_ONLY_BENCH)
+Bounded verified status poll via `intelipump-poll-bench` against the owned
+lab dispenser. See `docs/poll-bench-real-wayne.md`. No authorization.
+Does not start continuous real-pump polling or Phase 11D–11H.
+
 ## Phase 12 - Disabled Wayne electronic-head bench
 Receive-only first, then controlled commands.
 
