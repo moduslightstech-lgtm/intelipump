@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -14,6 +15,8 @@ from intelipump_fdc.bench_poll.cli import build_parser
 from intelipump_fdc.bench_poll.cli import run as poll_bench_run
 from intelipump_fdc.bench_poll.evidence import BenchResult
 from intelipump_fdc.bench_poll.guards import (
+    TARGET_OWNED_LAB_WAYNE,
+    TARGET_SIMULATOR,
     PollBenchConfirmations,
     PollBenchParams,
     PollBenchRefusedError,
@@ -227,6 +230,211 @@ def test_simulator_process_active_refuses(tmp_path: Path) -> None:
         )
 
 
+def _alias_pair(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Return (ctrl, sim, ctrl_alias, sim_alias)."""
+    ctrl = tmp_path / "ttyUSB0"
+    sim = tmp_path / "ttyUSB1"
+    ctrl.touch()
+    sim.touch()
+    ctrl_alias = tmp_path / "intelipump-controller"
+    sim_alias = tmp_path / "intelipump-simulator"
+    ctrl_alias.symlink_to(ctrl)
+    sim_alias.symlink_to(sim)
+    return ctrl, sim, ctrl_alias, sim_alias
+
+
+def test_simulator_owns_sim_adapter_with_flag_allowed(tmp_path: Path) -> None:
+    ctrl, sim, ctrl_alias, sim_alias = _alias_pair(tmp_path)
+    sim_canon = os.path.realpath(sim)
+    ctrl_canon = os.path.realpath(ctrl)
+
+    def holders(path: str) -> list[int]:
+        if path == sim_canon:
+            return [3085]
+        if path == ctrl_canon:
+            return []
+        return []
+
+    params = PollBenchParams(
+        port=str(ctrl_alias),
+        address=1,
+        baud=9600,
+        max_polls=1,
+        response_timeout_ms=50,
+        evidence_dir=tmp_path / "ev",
+        confirmations=_confirms(),
+        lock_dir=tmp_path / "locks",
+        simulator_ports=(str(sim_alias),),
+        simulator_validation=True,
+    )
+    canonical, lock = run_poll_bench_preflight(
+        params,
+        _lab_poll_settings(),
+        systemctl_runner=lambda *_a, **_k: MagicMock(returncode=3),
+        holder_finder=holders,
+        simulator_checker=lambda pid: pid == 3085,
+        simulator_pid_finder=lambda **_k: [3085],
+    )
+    assert canonical == ctrl_canon
+    assert params.target_type == "SIMULATOR"
+    assert lock is not None
+    lock.release()
+
+
+def test_simulator_owns_sim_adapter_without_flag_refused(tmp_path: Path) -> None:
+    _ctrl, sim, ctrl_alias, sim_alias = _alias_pair(tmp_path)
+    sim_canon = os.path.realpath(sim)
+
+    def holders(path: str) -> list[int]:
+        return [3085] if path == sim_canon else []
+
+    params = PollBenchParams(
+        port=str(ctrl_alias),
+        address=1,
+        baud=9600,
+        max_polls=1,
+        response_timeout_ms=50,
+        evidence_dir=tmp_path / "ev",
+        confirmations=_confirms(),
+        lock_dir=tmp_path / "locks",
+        simulator_ports=(str(sim_alias),),
+        simulator_validation=False,
+    )
+    with pytest.raises(PollBenchRefusedError, match="simulator"):
+        run_poll_bench_preflight(
+            params,
+            _lab_poll_settings(),
+            systemctl_runner=lambda *_a, **_k: MagicMock(returncode=3),
+            holder_finder=holders,
+            simulator_checker=lambda pid: pid == 3085,
+            simulator_pid_finder=lambda **_k: [3085],
+        )
+
+
+def test_simulator_owns_controller_adapter_refused(tmp_path: Path) -> None:
+    ctrl, _sim, ctrl_alias, sim_alias = _alias_pair(tmp_path)
+    ctrl_canon = os.path.realpath(ctrl)
+
+    def holders(path: str) -> list[int]:
+        return [3085] if path == ctrl_canon else []
+
+    for sim_validation in (True, False):
+        params = PollBenchParams(
+            port=str(ctrl_alias),
+            address=1,
+            baud=9600,
+            max_polls=1,
+            response_timeout_ms=50,
+            evidence_dir=tmp_path / "ev",
+            confirmations=_confirms(),
+            lock_dir=tmp_path / "locks",
+            simulator_ports=(str(sim_alias),),
+            simulator_validation=sim_validation,
+            skip_port_check=False,
+        )
+        with pytest.raises(PollBenchRefusedError, match="simulator"):
+            run_poll_bench_preflight(
+                params,
+                _lab_poll_settings(),
+                systemctl_runner=lambda *_a, **_k: MagicMock(returncode=3),
+                holder_finder=holders,
+                simulator_checker=lambda pid: pid == 3085,
+                simulator_pid_finder=lambda _sv=sim_validation, **_k: (
+                    [] if _sv else [3085]
+                ),
+            )
+
+
+def test_unrelated_process_owns_simulator_adapter_refused(tmp_path: Path) -> None:
+    ctrl, sim, ctrl_alias, sim_alias = _alias_pair(tmp_path)
+    sim_canon = os.path.realpath(sim)
+
+    def holders(path: str) -> list[int]:
+        if path == sim_canon:
+            return [9999]
+        return []
+
+    params = PollBenchParams(
+        port=str(ctrl_alias),
+        address=1,
+        baud=9600,
+        max_polls=1,
+        response_timeout_ms=50,
+        evidence_dir=tmp_path / "ev",
+        confirmations=_confirms(),
+        lock_dir=tmp_path / "locks",
+        simulator_ports=(str(sim_alias),),
+        simulator_validation=True,
+    )
+    with pytest.raises(PollBenchRefusedError, match="unrelated"):
+        run_poll_bench_preflight(
+            params,
+            _lab_poll_settings(),
+            systemctl_runner=lambda *_a, **_k: MagicMock(returncode=3),
+            holder_finder=holders,
+            simulator_checker=lambda pid: pid == 3085,
+            simulator_pid_finder=lambda **_k: [3085],
+        )
+    del ctrl
+
+
+def test_controller_adapter_already_owned_refused(tmp_path: Path) -> None:
+    ctrl, _sim, ctrl_alias, sim_alias = _alias_pair(tmp_path)
+    ctrl_canon = os.path.realpath(ctrl)
+
+    def holders(path: str) -> list[int]:
+        return [777] if path == ctrl_canon else []
+
+    params = PollBenchParams(
+        port=str(ctrl_alias),
+        address=1,
+        baud=9600,
+        max_polls=1,
+        response_timeout_ms=50,
+        evidence_dir=tmp_path / "ev",
+        confirmations=_confirms(),
+        lock_dir=tmp_path / "locks",
+        simulator_ports=(str(sim_alias),),
+        simulator_validation=True,
+    )
+    with pytest.raises(PollBenchRefusedError, match="busy"):
+        run_poll_bench_preflight(
+            params,
+            _lab_poll_settings(),
+            systemctl_runner=lambda *_a, **_k: MagicMock(returncode=3),
+            holder_finder=holders,
+            simulator_checker=lambda pid: pid == 3085,
+            simulator_pid_finder=lambda **_k: [3085],
+        )
+
+
+def test_real_pump_mode_refuses_any_simulator_process(tmp_path: Path) -> None:
+    ctrl, _sim, ctrl_alias, sim_alias = _alias_pair(tmp_path)
+    params = PollBenchParams(
+        port=str(ctrl_alias),
+        address=1,
+        baud=9600,
+        max_polls=1,
+        response_timeout_ms=50,
+        evidence_dir=tmp_path / "ev",
+        confirmations=_confirms(),
+        lock_dir=tmp_path / "locks",
+        simulator_ports=(str(sim_alias),),
+        simulator_validation=False,
+        skip_port_check=True,
+    )
+    with pytest.raises(PollBenchRefusedError, match="simulator process running"):
+        run_poll_bench_preflight(
+            params,
+            _lab_poll_settings(),
+            systemctl_runner=lambda *_a, **_k: MagicMock(returncode=3),
+            holder_finder=lambda _p: [],
+            simulator_checker=lambda pid: pid == 3085,
+            simulator_pid_finder=lambda **_k: [3085],
+        )
+    del ctrl
+
+
 def test_poll_only_bench_blocks_controller_queue() -> None:
     ctx = ControllerSafetyContext(
         environment="LAB",
@@ -259,6 +467,8 @@ async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
             response_timeout_ms=200,
             evidence_jsonl=tmp_path / "e.jsonl",
             evidence_md=tmp_path / "e.md",
+            target_type=TARGET_OWNED_LAB_WAYNE,
+            simulator_validation=False,
         ),
     )
     summary = await session.run()
@@ -269,6 +479,8 @@ async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
     assert summary["commandQueueCreated"] is False
     assert summary["authorizationObjectsCreated"] == 0
     assert summary["result"] == BenchResult.PASS.value
+    assert summary["targetType"] == TARGET_OWNED_LAB_WAYNE
+    assert summary["simulatorValidation"] is False
     lines = (tmp_path / "e.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     tx = [r for r in records if r.get("direction") == "TX"]
@@ -277,6 +489,45 @@ async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
     assert bytes(int(p, 16) for p in tx[0]["rawHex"].split()) == build_poll(1)
     assert bytes(int(p, 16) for p in rx[0]["rawHex"].split()) == eot
     assert any(r.get("event") == "bench_stopped" for r in records)
+    assert all(r.get("targetType") == TARGET_OWNED_LAB_WAYNE for r in records)
+    assert all(r.get("simulatorValidation") is False for r in records)
+
+
+@pytest.mark.asyncio
+async def test_simulator_validation_one_poll_and_evidence(tmp_path: Path) -> None:
+    eot = build_eot(1, 0)
+    transport = FakeBenchTransport(chunks=[eot])
+    session = PollBenchSession(
+        transport,
+        PollBenchSessionConfig(
+            port="/tmp/fake",
+            address=1,
+            baud=9600,
+            max_polls=1,
+            response_timeout_ms=200,
+            evidence_jsonl=tmp_path / "sim.jsonl",
+            evidence_md=tmp_path / "sim.md",
+            target_type=TARGET_SIMULATOR,
+            simulator_validation=True,
+        ),
+    )
+    summary = await session.run()
+    assert summary["pollsSent"] == 1
+    assert transport.written[0] == build_poll(1)
+    assert summary["commandQueueCreated"] is False
+    assert summary["authorizationObjectsCreated"] == 0
+    assert summary["targetType"] == TARGET_SIMULATOR
+    assert summary["simulatorValidation"] is True
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "sim.jsonl").read_text().splitlines()
+        if line
+    ]
+    assert all(r.get("targetType") == TARGET_SIMULATOR for r in records)
+    assert all(r.get("simulatorValidation") is True for r in records)
+    md = (tmp_path / "sim.md").read_text()
+    assert "Target type: `SIMULATOR`" in md
+    assert "Simulator validation: `True`" in md
 
 
 @pytest.mark.asyncio

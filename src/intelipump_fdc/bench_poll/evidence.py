@@ -58,6 +58,8 @@ class EvidenceRecord:
     crcValid: bool | None
     notes: str | None
     event: str | None = None
+    targetType: str | None = None
+    simulatorValidation: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,9 +81,18 @@ class BenchSessionStats:
 
 
 class EvidenceWriter:
-    def __init__(self, path: Path, session_id: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        session_id: str,
+        *,
+        target_type: str,
+        simulator_validation: bool,
+    ) -> None:
         self.path = path
         self.session_id = session_id
+        self.target_type = target_type
+        self.simulator_validation = simulator_validation
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fp: IO[str] | None = self.path.open("w", encoding="utf-8")
         self.records = 0
@@ -126,6 +137,8 @@ class EvidenceWriter:
                 crcValid=crc_valid,
                 notes=notes,
                 event=event.value,
+                targetType=self.target_type,
+                simulatorValidation=self.simulator_validation,
             )
         )
 
@@ -160,6 +173,8 @@ class EvidenceWriter:
                 crcValid=crc_valid,
                 notes=notes,
                 event=event.value if event else None,
+                targetType=self.target_type,
+                simulatorValidation=self.simulator_validation,
             )
         )
 
@@ -188,6 +203,8 @@ def write_markdown_summary(
     max_polls: int,
     stats: BenchSessionStats,
     result: BenchResult,
+    target_type: str,
+    simulator_validation: bool,
     dispenser_observations: str = "(operator to fill)",
 ) -> None:
     lat = stats.latencies_ms
@@ -206,6 +223,8 @@ def write_markdown_summary(
         "",
         f"- Session ID: `{session_id}`",
         f"- Software commit: `{software_commit()}`",
+        f"- Target type: `{target_type}`",
+        f"- Simulator validation: `{simulator_validation}`",
         f"- Serial port: `{port}`",
         f"- Baud: {baud}",
         f"- Address: {address}",

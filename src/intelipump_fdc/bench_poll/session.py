@@ -17,6 +17,7 @@ from intelipump_fdc.bench_poll.evidence import (
     suggest_result,
     write_markdown_summary,
 )
+from intelipump_fdc.bench_poll.guards import TARGET_OWNED_LAB_WAYNE
 from intelipump_fdc.bench_poll.transport import BenchByteTransport
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
@@ -38,6 +39,8 @@ class PollBenchSessionConfig:
     evidence_jsonl: Path
     evidence_md: Path
     read_size: int = 256
+    target_type: str = TARGET_OWNED_LAB_WAYNE
+    simulator_validation: bool = False
 
 
 class PollBenchSession:
@@ -66,7 +69,12 @@ class PollBenchSession:
     async def run(self) -> dict[str, object]:
         jsonl_path = self.config.evidence_jsonl
         md_path = self.config.evidence_md
-        writer = EvidenceWriter(jsonl_path, self.session_id)
+        writer = EvidenceWriter(
+            jsonl_path,
+            self.session_id,
+            target_type=self.config.target_type,
+            simulator_validation=self.config.simulator_validation,
+        )
         try:
             if not self.transport.is_open:
                 await self.transport.open()
@@ -76,7 +84,9 @@ class PollBenchSession:
                 pump_address=self.config.address,
                 notes=(
                     f"POLL_ONLY_BENCH port={self.config.port} "
-                    f"baud={self.config.baud} max_polls={self.config.max_polls}"
+                    f"baud={self.config.baud} max_polls={self.config.max_polls} "
+                    f"targetType={self.config.target_type} "
+                    f"simulatorValidation={self.config.simulator_validation}"
                 ),
             )
             for seq in range(1, self.config.max_polls + 1):
@@ -115,6 +125,8 @@ class PollBenchSession:
                 max_polls=self.config.max_polls,
                 stats=self.stats,
                 result=self.result,
+                target_type=self.config.target_type,
+                simulator_validation=self.config.simulator_validation,
             )
 
         return {
@@ -126,6 +138,8 @@ class PollBenchSession:
             "crcErrors": self.stats.crc_errors,
             "commandQueueCreated": self.command_queue_created,
             "authorizationObjectsCreated": self.authorization_objects_created,
+            "targetType": self.config.target_type,
+            "simulatorValidation": self.config.simulator_validation,
             "evidenceJsonl": str(jsonl_path),
             "evidenceMd": str(md_path),
             "writeCount": getattr(self.transport, "write_count", self.stats.polls_sent),

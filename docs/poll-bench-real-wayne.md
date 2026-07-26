@@ -22,6 +22,41 @@
 
 Outbound bytes: only `build_poll(address)` from the existing DART line builder.
 
+## Simulator validation vs real Wayne
+
+Default (no flag) is **real Wayne** mode and refuses any running simulator.
+
+For LAB simulator one-poll validation only:
+
+```bash
+intelipump-poll-bench \
+  --port /dev/intelipump-controller \
+  --address 1 \
+  --baud 9600 \
+  --max-polls 1 \
+  --response-timeout-ms 100 \
+  --evidence-dir data/bench/real-wayne \
+  --simulator-validation \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-emergency-isolation-ready \
+  --confirm-no-fuel-test \
+  --confirm-authorization-disabled
+```
+
+With `--simulator-validation`:
+
+- known simulator may own only `/dev/intelipump-simulator`
+- `/dev/intelipump-controller` must be free
+- refuse if simulator owns the controller adapter
+- refuse unrelated holders on either adapter
+- evidence records `targetType=SIMULATOR` and `simulatorValidation=true`
+
+Without the flag (real Wayne):
+
+- refuse if any simulator process is running
+- evidence records `targetType=OWNED_LAB_WAYNE` and `simulatorValidation=false`
+
 ## Pi one-poll field procedure
 
 ```bash

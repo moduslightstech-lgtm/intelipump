@@ -79,6 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional simulator adapter path to check for ownership (repeatable)",
     )
     parser.add_argument(
+        "--simulator-validation",
+        action="store_true",
+        help=(
+            "LAB simulator one-poll mode: allow known simulator to own only "
+            "/dev/intelipump-simulator; controller adapter must remain free. "
+            "Default (flag absent) refuses any running simulator (real Wayne)."
+        ),
+    )
+    parser.add_argument(
         "--skip-service-check",
         action="store_true",
         help="LAB/test only",
@@ -118,6 +127,7 @@ async def _async_main(args: argparse.Namespace) -> int:
         controller_service=args.controller_service,
         lock_dir=Path(args.lock_dir),
         simulator_ports=tuple(args.simulator_port or ()),
+        simulator_validation=bool(args.simulator_validation),
         skip_service_check=args.skip_service_check,
         skip_port_check=args.skip_port_check,
     )
@@ -148,6 +158,8 @@ async def _async_main(args: argparse.Namespace) -> int:
             response_timeout_ms=params.response_timeout_ms,
             evidence_jsonl=jsonl_path,
             evidence_md=md_path,
+            target_type=params.target_type,
+            simulator_validation=params.simulator_validation,
         ),
     )
 

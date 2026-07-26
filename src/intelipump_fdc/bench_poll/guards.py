@@ -14,12 +14,17 @@ from intelipump_fdc.capture.port_guards import (
     PassiveCaptureRefusedError,
     SystemctlRunner,
     assert_controller_service_inactive,
-    assert_no_foreign_holders,
     find_device_holder_pids,
     is_virtual_or_test_port,
     resolve_canonical_device,
 )
 from intelipump_fdc.core.config import ControllerMode, Settings
+
+DEFAULT_SIMULATOR_ALIAS = "/dev/intelipump-simulator"
+DEFAULT_CONTROLLER_ALIAS = "/dev/intelipump-controller"
+
+TARGET_SIMULATOR = "SIMULATOR"
+TARGET_OWNED_LAB_WAYNE = "OWNED_LAB_WAYNE"
 
 
 class PollBenchRefusedError(RuntimeError):
@@ -66,8 +71,15 @@ class PollBenchParams:
     controller_service: str = DEFAULT_CONTROLLER_SERVICE
     lock_dir: Path = DEFAULT_LOCK_DIR
     simulator_ports: tuple[str, ...] = ()
+    simulator_validation: bool = False
     skip_service_check: bool = False
     skip_port_check: bool = False
+
+    @property
+    def target_type(self) -> str:
+        if self.simulator_validation:
+            return TARGET_SIMULATOR
+        return TARGET_OWNED_LAB_WAYNE
 
 
 def _cmdline_of(pid: int) -> str:
@@ -99,20 +111,69 @@ def is_simulator_process(pid: int) -> bool:
     return any(m in cmd for m in markers)
 
 
+def find_running_simulator_pids(
+    *,
+    simulator_checker: Callable[[int], bool] | None = None,
+    proc_root: Path | None = None,
+) -> list[int]:
+    """Best-effort scan for running intelipump simulator processes."""
+    is_sim = simulator_checker or is_simulator_process
+    root = proc_root or Path("/proc")
+    if not root.is_dir():
+        return []
+    found: list[int] = []
+    self_pid = os.getpid()
+    for entry in root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        try:
+            if is_sim(pid):
+                found.append(pid)
+        except OSError:
+            continue
+    return sorted(found)
+
+
+def _resolve_existing(path: str) -> str | None:
+    if not path or is_virtual_or_test_port(path):
+        return path or None
+    try:
+        return resolve_canonical_device(path)
+    except PassiveCaptureRefusedError:
+        return None
+
+
+def known_simulator_canonicals(
+    settings: Settings,
+    extra_ports: Sequence[str] = (),
+) -> set[str]:
+    ports = list(extra_ports)
+    if settings.bench.simulator_port:
+        ports.append(settings.bench.simulator_port)
+    ports.append(DEFAULT_SIMULATOR_ALIAS)
+    out: set[str] = set()
+    for port in ports:
+        canonical = _resolve_existing(port)
+        if canonical:
+            out.add(canonical)
+    return out
+
+
 def assert_simulator_not_owning_adapters(
     ports: Sequence[str],
     *,
     holder_finder: Callable[[str], list[int]] | None = None,
     simulator_checker: Callable[[int], bool] | None = None,
 ) -> None:
+    """Refuse when a simulator PID owns any of the given adapter paths."""
     finder = holder_finder or find_device_holder_pids
     is_sim = simulator_checker or is_simulator_process
     for port in ports:
-        if not port or is_virtual_or_test_port(port):
-            continue
-        try:
-            canonical = resolve_canonical_device(port)
-        except PassiveCaptureRefusedError:
+        canonical = _resolve_existing(port)
+        if not canonical:
             continue
         for pid in finder(canonical):
             if is_sim(pid):
@@ -121,6 +182,39 @@ def assert_simulator_not_owning_adapters(
                     f"{canonical} (requested={port})",
                     reason="simulator_owns_adapter",
                 )
+
+
+def assert_adapter_holders_allowed(
+    *,
+    port: str,
+    canonical: str,
+    allow_simulator: bool,
+    holder_finder: Callable[[str], list[int]] | None = None,
+    simulator_checker: Callable[[int], bool] | None = None,
+) -> None:
+    """Validate holders on one adapter.
+
+    - ``allow_simulator=True``: only known simulator PIDs may hold the device.
+    - ``allow_simulator=False``: any holder is refused (device must be free).
+    """
+    finder = holder_finder or find_device_holder_pids
+    is_sim = simulator_checker or is_simulator_process
+    holders = finder(canonical)
+    if not holders:
+        return
+    if not allow_simulator:
+        raise PollBenchRefusedError(
+            f"serial device busy: canonical={canonical} requested={port} "
+            f"holder_pids={holders}",
+            reason="device_busy",
+        )
+    for pid in holders:
+        if not is_sim(pid):
+            raise PollBenchRefusedError(
+                f"unrelated process pid={pid} owns serial adapter "
+                f"{canonical} (requested={port})",
+                reason="unrelated_holder",
+            )
 
 
 def validate_poll_bench_settings(settings: Settings) -> None:
@@ -206,6 +300,7 @@ def run_poll_bench_preflight(
     systemctl_runner: SystemctlRunner | None = None,
     holder_finder: Callable[[str], list[int]] | None = None,
     simulator_checker: Callable[[int], bool] | None = None,
+    simulator_pid_finder: Callable[..., list[int]] | None = None,
 ) -> tuple[str, AppDeviceLock | None]:
     """Validate all guards. Returns (canonical_port, app_lock)."""
     validate_poll_bench_settings(settings)
@@ -222,44 +317,79 @@ def run_poll_bench_preflight(
                 str(exc), reason="controller_service_active"
             ) from exc
 
-    sim_ports = list(params.simulator_ports)
-    if settings.bench.simulator_port:
-        sim_ports.append(settings.bench.simulator_port)
-    # Common udev alias used on the Pi lab.
-    sim_ports.append("/dev/intelipump-simulator")
-    assert_simulator_not_owning_adapters(
-        sim_ports,
-        holder_finder=holder_finder,
-        simulator_checker=simulator_checker,
-    )
+    sim_canonicals = known_simulator_canonicals(settings, params.simulator_ports)
+    find_sims = simulator_pid_finder or find_running_simulator_pids
+
+    if not params.simulator_validation:
+        # Real Wayne mode: any running simulator is refuse-closed.
+        running = find_sims(simulator_checker=simulator_checker)
+        if running:
+            raise PollBenchRefusedError(
+                f"simulator process running (pids={running}); "
+                "refuse for real Wayne poll. Use --simulator-validation "
+                "only for LAB simulator one-poll checks.",
+                reason="simulator_running",
+            )
+        # Also refuse if a simulator still owns either adapter.
+        check_ports = list(sim_canonicals)
+        if params.port:
+            check_ports.append(params.port)
+        check_ports.append(DEFAULT_CONTROLLER_ALIAS)
+        assert_simulator_not_owning_adapters(
+            check_ports,
+            holder_finder=holder_finder,
+            simulator_checker=simulator_checker,
+        )
 
     if is_virtual_or_test_port(params.port):
         return params.port, None
 
     try:
-        canonical = resolve_canonical_device(params.port)
+        controller_canonical = resolve_canonical_device(params.port)
     except PassiveCaptureRefusedError as exc:
         raise PollBenchRefusedError(str(exc), reason=exc.reason.value) from exc
 
     app_lock: AppDeviceLock | None = None
     if not params.skip_port_check:
         try:
-            app_lock = AppDeviceLock.acquire(
-                requested_path=params.port,
-                canonical_path=canonical,
-                lock_dir=params.lock_dir,
-                process_name="intelipump-poll-bench",
-            )
-            assert_no_foreign_holders(
-                canonical,
-                requested_path=params.port,
-                holder_finder=holder_finder,
-            )
-            # Also ensure simulator is not on the controller canonical device.
+            # Controller adapter must never be held by a simulator.
             assert_simulator_not_owning_adapters(
-                [canonical],
+                [controller_canonical],
                 holder_finder=holder_finder,
                 simulator_checker=simulator_checker,
+            )
+            # Controller adapter must be free of all holders before exclusive open.
+            assert_adapter_holders_allowed(
+                port=params.port,
+                canonical=controller_canonical,
+                allow_simulator=False,
+                holder_finder=holder_finder,
+                simulator_checker=simulator_checker,
+            )
+
+            if params.simulator_validation:
+                # Simulator may own only known simulator adapters; unrelated
+                # holders on those adapters are refused.
+                for sim_canonical in sim_canonicals:
+                    if sim_canonical == controller_canonical:
+                        raise PollBenchRefusedError(
+                            "simulator adapter path resolves to the controller "
+                            f"device ({controller_canonical})",
+                            reason="simulator_controller_path_collision",
+                        )
+                    assert_adapter_holders_allowed(
+                        port=sim_canonical,
+                        canonical=sim_canonical,
+                        allow_simulator=True,
+                        holder_finder=holder_finder,
+                        simulator_checker=simulator_checker,
+                    )
+
+            app_lock = AppDeviceLock.acquire(
+                requested_path=params.port,
+                canonical_path=controller_canonical,
+                lock_dir=params.lock_dir,
+                process_name="intelipump-poll-bench",
             )
         except PassiveCaptureRefusedError as exc:
             if app_lock is not None:
@@ -270,7 +400,7 @@ def run_poll_bench_preflight(
                 app_lock.release()
             raise
 
-    return canonical, app_lock
+    return controller_canonical, app_lock
 
 
 def software_commit() -> str:
