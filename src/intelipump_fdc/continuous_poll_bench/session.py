@@ -97,6 +97,121 @@ class ContinuousPollSession:
     def request_stop(self) -> None:
         self._stop.set()
 
+    async def _clear_stale_before_poll(
+        self, writer: EvidenceWriter, *, poll_sequence: int
+    ) -> None:
+        """Drop incomplete parser state and optionally drain stale serial input.
+
+        Incomplete bytes must not span independent poll cycles. Within one
+        response window, :meth:`LegacyIgemStreamAssembler.feed` still buffers
+        across serial read chunks.
+        """
+        pending = self._assembler.pending_raw
+        discarded = self._assembler.reset()
+        stale = pending or discarded
+        if stale:
+            writer.emit_frame(
+                direction="RX",
+                raw=stale,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=poll_sequence,
+                timeout_ms=self.config.response_timeout_ms,
+                classification="PARTIAL_OR_NOISE",
+                crc_valid=None,
+                event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
+                notes="stale_assembler_bytes_cleared_before_poll",
+            )
+            logger.info(
+                "cleared %d stale assembler byte(s) before poll %s",
+                len(stale),
+                poll_sequence,
+            )
+
+        # Best-effort drain of already-buffered serial input (non-blocking).
+        drained = bytearray()
+        if self.transport.is_open:
+            for _ in range(8):
+                try:
+                    chunk = await asyncio.wait_for(
+                        self.transport.read(self.config.read_size),
+                        timeout=0.001,
+                    )
+                except (TimeoutError, TransportNotOpenError, OSError):
+                    break
+                if not chunk:
+                    break
+                drained.extend(chunk)
+        if drained:
+            writer.emit_frame(
+                direction="RX",
+                raw=bytes(drained),
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=poll_sequence,
+                timeout_ms=self.config.response_timeout_ms,
+                classification="PARTIAL_OR_NOISE",
+                crc_valid=None,
+                event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
+                notes="stale_serial_input_drained_before_poll",
+            )
+            logger.info(
+                "drained %d stale serial byte(s) before poll %s",
+                len(drained),
+                poll_sequence,
+            )
+
+    def _record_timeout_partial(
+        self,
+        writer: EvidenceWriter,
+        *,
+        seq: int,
+        rx_bytes: bytes,
+    ) -> None:
+        """Record timed-out partial bytes and clear the response assembler."""
+        # Prefer the assembler's incomplete frame; otherwise all window RX bytes.
+        partial = self._assembler.pending_raw or rx_bytes
+        emitted = False
+        for event in self._assembler.expire_partial():
+            writer.emit_frame(
+                direction="RX",
+                raw=event.raw,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                timeout_ms=self.config.response_timeout_ms,
+                classification="PARTIAL_OR_NOISE",
+                crc_valid=None,
+                event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
+                notes=event.message or "partial_frame_timeout",
+            )
+            emitted = True
+
+        # Guarantee a clean assembler for the next independent poll cycle.
+        self._assembler.reset()
+
+        if not emitted and partial:
+            writer.emit_frame(
+                direction="RX",
+                raw=partial,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                timeout_ms=self.config.response_timeout_ms,
+                classification="PARTIAL_OR_NOISE",
+                crc_valid=None,
+                event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
+                notes="bytes_before_timeout",
+            )
+
     async def run(self) -> dict[str, object]:
         jsonl_path = self.config.evidence_jsonl
         md_path = self.config.evidence_md
@@ -315,6 +430,9 @@ class ContinuousPollSession:
         lag_ms: float,
     ) -> bool:
         """Return True to stop the bench early."""
+        # Never carry incomplete response bytes into the next poll cycle.
+        await self._clear_stale_before_poll(writer, poll_sequence=seq)
+
         poll = build_poll(self.config.address)
         t0 = time.monotonic()
         mono_tx = time.monotonic_ns()
@@ -577,28 +695,20 @@ class ContinuousPollSession:
         if self._stop.is_set():
             self._fault = True
             self.stats.stop_reason = StopReason.OPERATOR_INTERRUPT
+            self._assembler.reset()
             return True
 
-        # Record all received bytes even on timeout.
-        if rx_bytes:
-            writer.emit_frame(
-                direction="RX",
-                raw=bytes(rx_bytes),
-                monotonic_ns=time.monotonic_ns(),
-                pump_address=self.config.address,
-                poll_sequence=seq,
-                timeout_ms=self.config.response_timeout_ms,
-                classification="PARTIAL_OR_NOISE",
-                crc_valid=None,
-                event=ContinuousBenchEvent.RESPONSE_TIMEOUT,
-                notes="bytes_before_timeout",
-            )
+        # Timeout: evidence the incomplete response, then clear assembler so
+        # the next poll cannot concatenate a stale prefix with a new frame.
+        self._record_timeout_partial(writer, seq=seq, rx_bytes=bytes(rx_bytes))
 
         self.stats.timeouts += 1
         writer.emit_event(
             ContinuousBenchEvent.RESPONSE_TIMEOUT,
             monotonic_ns=time.monotonic_ns(),
-            pump_address=self.config.address,
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
             poll_sequence=seq,
             timeout_ms=self.config.response_timeout_ms,
             notes="no_frame_before_deadline",

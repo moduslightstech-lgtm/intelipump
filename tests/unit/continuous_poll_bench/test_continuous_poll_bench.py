@@ -534,6 +534,116 @@ async def test_timeout_does_not_extend_duration(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stale_partial_not_concatenated_into_next_poll(
+    tmp_path: Path,
+) -> None:
+    """Timed-out 16-byte prefix must not glue onto the next complete DATA frame."""
+    partial_16 = bytes.fromhex(
+        "50 30 02 08 00 00 00 00 00 00 00 00 03 04 00 99"
+    )
+    full_25 = bytes.fromhex(
+        "50 30 02 08 00 00 00 00 00 00 00 00 03 04 00 99 "
+        "07 07 01 01 00 0e 55 03 fa"
+    )
+    assert len(partial_16) == 16
+    assert len(full_25) == 25
+    concatenated_41 = partial_16 + full_25
+    assert len(concatenated_41) == 41
+
+    @dataclass
+    class PartialThenFullTransport:
+        device: str = "/tmp/fake-stale"
+        written: list[bytes] = field(default_factory=list)
+        write_count: int = 0
+        chunks: list[bytes] = field(default_factory=list)
+        _open: bool = False
+
+        @property
+        def is_open(self) -> bool:
+            return self._open
+
+        async def open(self) -> None:
+            self._open = True
+
+        async def close(self) -> None:
+            self._open = False
+
+        async def read(self, max_bytes: int) -> bytes:
+            if not self.chunks:
+                await asyncio.sleep(0.005)
+                return b""
+            data = self.chunks.pop(0)
+            return data[:max_bytes]
+
+        async def write(self, data: bytes) -> int:
+            self.write_count += 1
+            self.written.append(data)
+            if self.write_count == 1:
+                self.chunks.append(partial_16)
+            elif self.write_count == 2:
+                self.chunks.append(full_25)
+            return len(data)
+
+    transport = PartialThenFullTransport()
+    session = _session(
+        transport,  # type: ignore[arg-type]
+        tmp_path,
+        duration_seconds=1.0,
+        poll_interval_ms=100,
+        response_timeout_ms=40,
+        max_writes=10,
+    )
+    summary = await session.run()
+    assert summary["timeouts"] >= 1
+    assert summary["validResponses"] >= 1
+    assert summary["crcErrors"] == 0
+    assert summary["commandQueueCreated"] is False
+    assert summary["authorizationObjectsCreated"] == 0
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "e.jsonl").read_text().splitlines()
+        if line
+    ]
+    # Poll 1 timed out with PARTIAL_OR_NOISE evidence of the 16-byte prefix.
+    partial_events = [
+        r
+        for r in records
+        if r.get("pollSequence") == 1
+        and r.get("responseClassification") == "PARTIAL_OR_NOISE"
+    ]
+    assert partial_events
+    assert any(
+        bytes(int(p, 16) for p in r["rawHex"].split()) == partial_16
+        for r in partial_events
+        if r.get("rawHex")
+    )
+
+    # Poll 2 must accept exactly the 25-byte CRC-valid DATA_FRAME once.
+    poll2_rx = [
+        r
+        for r in records
+        if r.get("pollSequence") == 2
+        and r.get("direction") == "RX"
+        and r.get("responseClassification") == "DATA_FRAME"
+        and r.get("crcValid") is True
+    ]
+    assert len(poll2_rx) == 1
+    rx_raw = bytes(int(p, 16) for p in poll2_rx[0]["rawHex"].split())
+    assert rx_raw == full_25
+    assert len(rx_raw) == 25
+
+    # Never emit the 41-byte stale-prefix concatenation.
+    all_rx = [
+        bytes(int(p, 16) for p in r["rawHex"].split())
+        for r in records
+        if r.get("direction") == "RX" and r.get("rawHex")
+    ]
+    assert concatenated_41 not in all_rx
+    assert all(len(raw) != 41 for raw in all_rx)
+
+
+@pytest.mark.asyncio
 async def test_ctrl_c_bounded_clean_stop(tmp_path: Path) -> None:
     transport = FakeBenchTransport()
     session = _session(
@@ -594,7 +704,15 @@ async def test_crc_error_handling(tmp_path: Path) -> None:
     body[-3] ^= 0xFF
     bad = escape_dle(bytes(body)) + bytes((SF,))
     transport = FakeBenchTransport(auto_eot_address=None)
-    transport.chunks = [bad]
+
+    async def write(data: bytes) -> int:
+        transport.write_count += 1
+        transport.written.append(data)
+        # Queue after TX so pre-poll stale-drain cannot consume it.
+        transport.chunks.append(bad)
+        return len(data)
+
+    transport.write = write  # type: ignore[method-assign]
     session = _session(transport, tmp_path, duration_seconds=2.0)
     summary = await session.run()
     assert summary["pollsSent"] == 1
