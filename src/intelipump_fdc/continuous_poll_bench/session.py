@@ -10,6 +10,7 @@ from pathlib import Path
 
 from intelipump_fdc.bench_poll.guards import TARGET_OWNED_LAB_WAYNE
 from intelipump_fdc.bench_poll.poll_io import (
+    ObservedFrame,
     StatusPollOutcome,
     send_status_poll_and_read_response,
 )
@@ -39,12 +40,8 @@ from intelipump_fdc.protocol.dart.transport.errors import TransportNotOpenError
 
 logger = logging.getLogger(__name__)
 
-_VALID_RESPONSE_CLASSES = frozenset(
-    {
-        CapturedFrameClass.SHORT_CONTROL_70,
-        CapturedFrameClass.DATA_FRAME,
-    }
-)
+_VALID_DATA_CLASSES = frozenset({CapturedFrameClass.DATA_FRAME})
+_INTERIM_CONTROL_CLASSES = frozenset({CapturedFrameClass.SHORT_CONTROL_70})
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +205,12 @@ class ContinuousPollSession:
             "sessionId": self.session_id,
             "result": self.result.value if self.result else None,
             "pollsSent": self.stats.polls_sent,
+            "protocolFramesReceived": self.stats.protocol_frames_received,
+            # validResponses is a documented alias of protocolFramesReceived.
             "validResponses": self.stats.valid_responses,
+            "controlResponses": self.stats.control_responses,
+            "dataResponses": self.stats.data_responses,
+            "controlOnlyCycles": self.stats.control_only_cycles,
             "timeouts": self.stats.timeouts,
             "crcErrors": self.stats.crc_errors,
             "protocolErrors": self.stats.protocol_errors,
@@ -324,7 +326,7 @@ class ContinuousPollSession:
         *,
         lag_ms: float,
     ) -> bool:
-        """One poll cycle via the shared single-poll receive path."""
+        """One poll cycle via the shared status-poll receive path."""
 
         def _on_chunk(chunk: bytes) -> None:
             writer.emit_frame(
@@ -342,6 +344,44 @@ class ContinuousPollSession:
                 source="serial_read_chunk",
                 notes="raw_serial_read_chunk",
             )
+
+        def _on_observed(observed: ObservedFrame) -> None:
+            self.stats.protocol_frames_received += 1
+            classification = observed.classification
+            raw = observed.frame.raw_frame
+            if observed.is_short_control_70:
+                self.stats.control_responses += 1
+                writer.emit_frame(
+                    direction="RX",
+                    raw=raw,
+                    monotonic_ns=time.monotonic_ns(),
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
+                    poll_sequence=seq,
+                    timeout_ms=self.config.response_timeout_ms,
+                    classification=classification,
+                    crc_valid=observed.frame.crc_valid,
+                    event=ContinuousBenchEvent.CONTROL_RESPONSE,
+                    latency_ms=observed.latency_ms,
+                    notes=(
+                        f"interim_short_control_70 latency_ms="
+                        f"{observed.latency_ms:.2f}"
+                    ),
+                )
+                writer.emit_event(
+                    ContinuousBenchEvent.CONTROL_RESPONSE,
+                    monotonic_ns=time.monotonic_ns(),
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
+                    poll_sequence=seq,
+                    classification=classification,
+                    latency_ms=observed.latency_ms,
+                    notes="interim_continue_response_window",
+                )
+                return
+            # DATA or unexpected — final handling occurs after collector returns.
 
         def _on_transient(exc: BaseException, count: int) -> None:
             writer.emit_event(
@@ -362,6 +402,7 @@ class ContinuousPollSession:
                 read_size=self.config.read_size,
                 stop_event=self._stop,
                 on_chunk=_on_chunk,
+                on_observed_frame=_on_observed,
                 on_transient_empty=_on_transient,
             )
         except (OSError, TransportNotOpenError) as exc:
@@ -376,6 +417,7 @@ class ContinuousPollSession:
                 poll_sequence=seq,
                 notes=str(exc),
                 stop_reason=StopReason.SERIAL_DISCONNECT.value,
+                poll_cycle_outcome=StatusPollOutcome.DISCONNECT.value,
             )
             return True
 
@@ -419,6 +461,7 @@ class ContinuousPollSession:
                 poll_sequence=seq,
                 notes=response.message or "serial_disconnect",
                 stop_reason=StopReason.SERIAL_DISCONNECT.value,
+                poll_cycle_outcome=StatusPollOutcome.DISCONNECT.value,
             )
             return True
 
@@ -427,7 +470,82 @@ class ContinuousPollSession:
             self.stats.stop_reason = StopReason.OPERATOR_INTERRUPT
             return True
 
-        if response.outcome is StatusPollOutcome.OVERFLOW:
+        if response.outcome is StatusPollOutcome.PROTOCOL_ERROR:
+            event = response.terminal_event
+            classification = (
+                response.captured.classification.value
+                if response.captured is not None
+                else "PROTOCOL_ERROR"
+            )
+            if event is not None and event.kind.value == "REJECTED":
+                self.stats.malformed_count += 1
+                writer.emit_frame(
+                    direction="RX",
+                    raw=event.raw,
+                    monotonic_ns=time.monotonic_ns(),
+                    pump_address=self.config.address,
+                    poll_sequence=seq,
+                    timeout_ms=self.config.response_timeout_ms,
+                    classification="REJECTED",
+                    crc_valid=None,
+                    event=ContinuousBenchEvent.PROTOCOL_ERROR,
+                    notes=response.message,
+                    poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
+                )
+                if self.stats.malformed_count > MALFORMED_THRESHOLD:
+                    self._fault = True
+                    self.stats.protocol_errors += 1
+                    self.stats.stop_reason = StopReason.MALFORMED_THRESHOLD
+                    return True
+                return False
+
+            # Unexpected complete frame or overflow.
+            if response.frame is not None:
+                if response.frame.address != self.wire_address:
+                    self._fault = True
+                    self.stats.protocol_errors += 1
+                    self.stats.stop_reason = StopReason.ADDRESS_MISMATCH
+                    writer.emit_event(
+                        ContinuousBenchEvent.PROTOCOL_ERROR,
+                        monotonic_ns=time.monotonic_ns(),
+                        pump_address=self.logical_address,
+                        logical_address=self.logical_address,
+                        wire_address=self.wire_address,
+                        poll_sequence=seq,
+                        notes=response.message or "address_mismatch",
+                        classification="ADDRESS_MISMATCH",
+                        stop_reason=StopReason.ADDRESS_MISMATCH.value,
+                        poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
+                    )
+                    return True
+                captured_class = (
+                    response.captured.classification
+                    if response.captured is not None
+                    else None
+                )
+                if (
+                    captured_class is not None
+                    and captured_class not in _VALID_DATA_CLASSES
+                    and captured_class not in _INTERIM_CONTROL_CLASSES
+                ):
+                    self._fault = True
+                    self.stats.unexpected_frames += 1
+                    self.stats.protocol_errors += 1
+                    self.stats.stop_reason = StopReason.UNEXPECTED_FRAME
+                    writer.emit_event(
+                        ContinuousBenchEvent.PROTOCOL_ERROR,
+                        monotonic_ns=time.monotonic_ns(),
+                        pump_address=self.logical_address,
+                        logical_address=self.logical_address,
+                        wire_address=self.wire_address,
+                        poll_sequence=seq,
+                        classification=classification,
+                        notes=response.message or "unexpected_frame",
+                        stop_reason=StopReason.UNEXPECTED_FRAME.value,
+                        poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
+                    )
+                    return True
+
             self._fault = True
             self.stats.protocol_errors += 1
             self.stats.stop_reason = StopReason.PROTOCOL_ERROR
@@ -436,44 +554,14 @@ class ContinuousPollSession:
                 monotonic_ns=time.monotonic_ns(),
                 pump_address=self.config.address,
                 poll_sequence=seq,
-                notes=response.message or "overflow",
-                classification="OVERFLOW",
+                notes=response.message or "protocol_error",
+                classification=classification,
                 stop_reason=StopReason.PROTOCOL_ERROR.value,
+                poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
             )
             return True
 
-        if response.outcome is StatusPollOutcome.REJECTED:
-            self.stats.malformed_count += 1
-            event = response.terminal_event
-            writer.emit_frame(
-                direction="RX",
-                raw=event.raw if event is not None else b"",
-                monotonic_ns=time.monotonic_ns(),
-                pump_address=self.config.address,
-                poll_sequence=seq,
-                timeout_ms=self.config.response_timeout_ms,
-                classification="REJECTED",
-                crc_valid=None,
-                event=ContinuousBenchEvent.PROTOCOL_ERROR,
-                notes=response.message,
-            )
-            if self.stats.malformed_count > MALFORMED_THRESHOLD:
-                self._fault = True
-                self.stats.protocol_errors += 1
-                self.stats.stop_reason = StopReason.MALFORMED_THRESHOLD
-                writer.emit_event(
-                    ContinuousBenchEvent.PROTOCOL_ERROR,
-                    monotonic_ns=time.monotonic_ns(),
-                    pump_address=self.config.address,
-                    poll_sequence=seq,
-                    notes="malformed_threshold_exceeded",
-                    classification="MALFORMED",
-                    stop_reason=StopReason.MALFORMED_THRESHOLD.value,
-                )
-                return True
-            return False
-
-        if response.outcome is StatusPollOutcome.TIMEOUT:
+        if response.outcome is StatusPollOutcome.TIMEOUT_NO_RESPONSE:
             for event in response.partial_events:
                 writer.emit_frame(
                     direction="RX",
@@ -514,10 +602,31 @@ class ContinuousPollSession:
                 poll_sequence=seq,
                 timeout_ms=self.config.response_timeout_ms,
                 notes="no_frame_before_deadline",
+                poll_cycle_outcome=StatusPollOutcome.TIMEOUT_NO_RESPONSE.value,
             )
             return False
 
-        # FRAME — validate like the previous continuous path.
+        if response.outcome is StatusPollOutcome.CONTROL_ONLY:
+            self.stats.control_only_cycles += 1
+            if response.frame is not None:
+                self.stats.last_rx_hex = response.frame.raw_frame.hex(" ")
+            writer.emit_event(
+                ContinuousBenchEvent.CONTROL_ONLY,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                timeout_ms=self.config.response_timeout_ms,
+                classification=CapturedFrameClass.SHORT_CONTROL_70.value,
+                latency_ms=response.latency_ms,
+                notes=response.message or "control_only_no_data_frame",
+                poll_cycle_outcome=StatusPollOutcome.CONTROL_ONLY.value,
+            )
+            return False
+
+        # DATA_RESPONSE
+        assert response.outcome is StatusPollOutcome.DATA_RESPONSE
         frame = response.frame
         assert frame is not None
         captured = response.captured
@@ -530,6 +639,10 @@ class ContinuousPollSession:
             else frame.control_type.value
         )
         crc_valid = frame.crc_valid
+
+        # Count DATA as a protocol frame if on_observed did not already
+        # (on_observed increments for every complete frame including DATA).
+        # on_observed already counted it via protocol_frames_received.
 
         if (
             (
@@ -555,6 +668,7 @@ class ContinuousPollSession:
                 event=ContinuousBenchEvent.PROTOCOL_ERROR,
                 latency_ms=latency_ms,
                 notes="crc_invalid_stop",
+                poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
             )
             return True
 
@@ -576,38 +690,11 @@ class ContinuousPollSession:
                 classification="ADDRESS_MISMATCH",
                 latency_ms=latency_ms,
                 stop_reason=StopReason.ADDRESS_MISMATCH.value,
+                poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
             )
             return True
 
-        captured_class = captured.classification if captured is not None else None
-        if captured_class is not None and captured_class not in _VALID_RESPONSE_CLASSES:
-            self._fault = True
-            self.stats.unexpected_frames += 1
-            self.stats.protocol_errors += 1
-            self.stats.stop_reason = StopReason.UNEXPECTED_FRAME
-            note = "unsupported_or_unexpected_frame"
-            if (
-                captured is not None
-                and captured_class is CapturedFrameClass.SEQUENCE_CONTROL_OR_ACK
-            ):
-                note = (
-                    f"{note}; sequenceNibble={captured.sequence_nibble}; "
-                    "possibleAcknowledgement=true; not nozzle_lift"
-                )
-            writer.emit_event(
-                ContinuousBenchEvent.PROTOCOL_ERROR,
-                monotonic_ns=time.monotonic_ns(),
-                pump_address=self.logical_address,
-                logical_address=self.logical_address,
-                wire_address=self.wire_address,
-                poll_sequence=seq,
-                classification=classification,
-                notes=note,
-                stop_reason=StopReason.UNEXPECTED_FRAME.value,
-            )
-            return True
-
-        self.stats.valid_responses += 1
+        self.stats.data_responses += 1
         writer.emit_frame(
             direction="RX",
             raw=frame.raw_frame,
@@ -619,9 +706,23 @@ class ContinuousPollSession:
             timeout_ms=self.config.response_timeout_ms,
             classification=classification,
             crc_valid=crc_valid,
-            event=ContinuousBenchEvent.RESPONSE_RECEIVED,
+            event=ContinuousBenchEvent.DATA_RESPONSE,
             latency_ms=latency_ms,
             notes=f"latency_ms={latency_ms:.2f}",
+            poll_cycle_outcome=StatusPollOutcome.DATA_RESPONSE.value,
+        )
+        writer.emit_event(
+            ContinuousBenchEvent.DATA_RESPONSE,
+            monotonic_ns=time.monotonic_ns(),
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=seq,
+            classification=classification,
+            crc_valid=crc_valid,
+            latency_ms=latency_ms,
+            notes=f"latency_ms={latency_ms:.2f}",
+            poll_cycle_outcome=StatusPollOutcome.DATA_RESPONSE.value,
         )
         writer.emit_event(
             ContinuousBenchEvent.RESPONSE_RECEIVED,
@@ -633,6 +734,7 @@ class ContinuousPollSession:
             classification=classification,
             crc_valid=crc_valid,
             latency_ms=latency_ms,
-            notes=f"latency_ms={latency_ms:.2f}",
+            notes=f"data_response latency_ms={latency_ms:.2f}",
+            poll_cycle_outcome=StatusPollOutcome.DATA_RESPONSE.value,
         )
         return False

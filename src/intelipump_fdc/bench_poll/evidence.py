@@ -73,13 +73,21 @@ class EvidenceRecord:
 @dataclass
 class BenchSessionStats:
     polls_sent: int = 0
-    valid_responses: int = 0
+    protocol_frames_received: int = 0
+    control_responses: int = 0
+    data_responses: int = 0
+    control_only_cycles: int = 0
     timeouts: int = 0
     crc_errors: int = 0
     protocol_errors: int = 0
     latencies_ms: list[float] = field(default_factory=list)
     last_tx_hex: str | None = None
     last_rx_hex: str | None = None
+
+    @property
+    def valid_responses(self) -> int:
+        """Alias of protocol_frames_received (not status-data completions)."""
+        return self.protocol_frames_received
 
 
 class EvidenceWriter:
@@ -196,11 +204,12 @@ def suggest_result(stats: BenchSessionStats, *, max_polls: int) -> BenchResult:
         return BenchResult.FAIL
     if stats.polls_sent == 0:
         return BenchResult.FAIL
-    if stats.valid_responses >= 1 and stats.timeouts == 0:
+    # Status-data PASS requires at least one DATA_FRAME cycle.
+    if stats.data_responses >= 1 and stats.timeouts == 0:
         return BenchResult.PASS
-    if stats.valid_responses >= 1:
+    if stats.data_responses >= 1:
         return BenchResult.INCONCLUSIVE
-    if stats.timeouts >= max_polls:
+    if stats.control_only_cycles >= 1 or stats.timeouts >= max_polls:
         return BenchResult.INCONCLUSIVE
     return BenchResult.INCONCLUSIVE
 

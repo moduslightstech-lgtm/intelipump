@@ -14,6 +14,12 @@ Every poll cycle uses the shared
 `intelipump-poll-bench` (one writer/reader, TX flush, no second drain path
 during the response window).
 
+`SHORT_CONTROL_70` (`50 70 FA`) is an interim control response: it is logged and
+preserved, but the cycle continues within the bounded response window until a
+`DATA_FRAME`, disconnect, or deadline. Status-data PASS requires
+`dataResponses > 0` (not merely control frames).
+`validResponses` is an alias of `protocolFramesReceived` (any recognized frame).
+
 This is **not** production polling. No authorization, transactions, presets,
 price changes, resets, MQTT commands, or daemon mode.
 

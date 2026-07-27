@@ -43,6 +43,9 @@ from intelipump_fdc.protocol.dart.line.escaping import escape_dle, unescape_dle
 from intelipump_fdc.protocol.dart.line.frame_builder import build_data_frame, build_eot, build_poll
 from intelipump_fdc.simulator.encoding import encode_dc1_status
 
+WAYNE_DATA_1 = build_data_frame(encode_wire_address(1), 0, encode_dc1_status(1))
+SHORT_70_1 = build_eot(encode_wire_address(1), 0)
+
 
 def _confirms(**overrides: bool) -> PollBenchConfirmations:
     base = dict(
@@ -81,6 +84,7 @@ class FakeBenchTransport:
     written: list[bytes] = field(default_factory=list)
     write_count: int = 0
     _open: bool = False
+    auto_response: bytes | None = None
 
     @property
     def is_open(self) -> bool:
@@ -105,6 +109,8 @@ class FakeBenchTransport:
     async def write(self, data: bytes) -> int:
         self.write_count += 1
         self.written.append(data)
+        if self.auto_response is not None:
+            self.chunks.append(self.auto_response)
         return len(data)
 
 
@@ -458,9 +464,8 @@ def test_poll_only_bench_blocks_controller_queue() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
-    eot = build_eot(encode_wire_address(1), 0)
-    transport = FakeBenchTransport(chunks=[eot])
+async def test_exactly_one_verified_poll_and_data(tmp_path: Path) -> None:
+    transport = FakeBenchTransport(chunks=[SHORT_70_1, WAYNE_DATA_1])
     session = PollBenchSession(
         transport,
         PollBenchSessionConfig(
@@ -479,7 +484,10 @@ async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
     assert summary["pollsSent"] == 1
     assert transport.write_count == 1
     assert transport.written[0] == build_poll(1)
-    assert summary["validResponses"] == 1
+    assert summary["dataResponses"] == 1
+    assert summary["controlResponses"] == 1
+    assert summary["protocolFramesReceived"] == 2
+    assert summary["validResponses"] == 2
     assert summary["commandQueueCreated"] is False
     assert summary["authorizationObjectsCreated"] == 0
     assert summary["result"] == BenchResult.PASS.value
@@ -491,7 +499,11 @@ async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
     rx = [r for r in records if r.get("direction") == "RX"]
     assert tx and rx
     assert bytes(int(p, 16) for p in tx[0]["rawHex"].split()) == build_poll(1)
-    assert bytes(int(p, 16) for p in rx[0]["rawHex"].split()) == eot
+    assert any(
+        bytes(int(p, 16) for p in r["rawHex"].split()) == WAYNE_DATA_1
+        for r in rx
+        if r.get("rawHex")
+    )
     assert any(r.get("event") == "bench_stopped" for r in records)
     assert all(r.get("targetType") == TARGET_OWNED_LAB_WAYNE for r in records)
     assert all(r.get("simulatorValidation") is False for r in records)
@@ -499,8 +511,7 @@ async def test_exactly_one_verified_poll_and_eot(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_simulator_validation_one_poll_and_evidence(tmp_path: Path) -> None:
-    eot = build_eot(encode_wire_address(1), 0)
-    transport = FakeBenchTransport(chunks=[eot])
+    transport = FakeBenchTransport(chunks=[WAYNE_DATA_1])
     session = PollBenchSession(
         transport,
         PollBenchSessionConfig(
@@ -518,6 +529,7 @@ async def test_simulator_validation_one_poll_and_evidence(tmp_path: Path) -> Non
     summary = await session.run()
     assert summary["pollsSent"] == 1
     assert transport.written[0] == build_poll(1)
+    assert summary["dataResponses"] == 1
     assert summary["commandQueueCreated"] is False
     assert summary["authorizationObjectsCreated"] == 0
     assert summary["targetType"] == TARGET_SIMULATOR
@@ -611,7 +623,7 @@ async def test_sigterm_closes_and_writes_bench_stopped(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_ctrl_c_path_writes_bench_stopped(tmp_path: Path) -> None:
-    transport = FakeBenchTransport(chunks=[build_eot(encode_wire_address(1), 0)])
+    transport = FakeBenchTransport(auto_response=WAYNE_DATA_1)
     session = PollBenchSession(
         transport,
         PollBenchSessionConfig(

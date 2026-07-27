@@ -54,6 +54,12 @@ from intelipump_fdc.protocol.dart.line.frame_builder import (
 from intelipump_fdc.protocol.dart.transport.errors import TransportNotOpenError
 from intelipump_fdc.simulator.encoding import encode_dc1_status
 
+WAYNE_25 = bytes.fromhex(
+    "50 30 02 08 00 00 00 00 00 00 00 00 03 04 00 99 "
+    "07 07 01 01 00 0e 55 03 fa"
+)
+SHORT_70 = bytes.fromhex("50 70 FA")
+
 
 def _as_int(value: object) -> int:
     return cast(int, value)
@@ -125,7 +131,8 @@ class FakeBenchTransport:
     write_delay_s: float = 0.0
     disconnect_after_writes: int | None = None
     _open: bool = False
-    auto_eot_address: int | None = 1
+    auto_eot_address: int | None = None
+    auto_data: bool = True
 
     @property
     def is_open(self) -> bool:
@@ -162,6 +169,8 @@ class FakeBenchTransport:
         self.written.append(data)
         if self.auto_eot_address is not None:
             self.chunks.append(build_eot(encode_wire_address(self.auto_eot_address), 0))
+        elif self.auto_data:
+            self.chunks.append(WAYNE_25)
         return len(data)
 
 
@@ -479,7 +488,8 @@ async def test_simulator_continuous_polling_100ms_3s(tmp_path: Path) -> None:
     # Monotonic 100ms over 3s → ~30 polls; allow small edge variance.
     assert 28 <= _as_int(summary["pollsSent"]) <= 31
     assert all(w == build_poll(1) for w in transport.written)
-    assert _as_int(summary["validResponses"]) >= 1
+    assert _as_int(summary["dataResponses"]) >= 1
+    assert _as_int(summary["protocolFramesReceived"]) >= 1
     assert summary["commandQueueCreated"] is False
     assert summary["authorizationObjectsCreated"] == 0
     assert summary["result"] == ContinuousBenchResult.PASS.value
@@ -562,7 +572,7 @@ async def test_monotonic_scheduling(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_timeout_does_not_extend_duration(tmp_path: Path) -> None:
-    transport = FakeBenchTransport(auto_eot_address=None, chunks=[])
+    transport = FakeBenchTransport(auto_data=False, auto_eot_address=None, chunks=[])
     session = _session(
         transport,
         tmp_path,
@@ -576,6 +586,7 @@ async def test_timeout_does_not_extend_duration(tmp_path: Path) -> None:
     assert elapsed < 1.5
     assert _as_float(summary["actualDurationS"]) < 1.5
     assert _as_int(summary["timeouts"]) >= 1
+    assert summary["dataResponses"] == 0
     assert summary["validResponses"] == 0
     assert summary["result"] == ContinuousBenchResult.INCONCLUSIVE.value
 
@@ -648,7 +659,7 @@ async def test_stale_partial_not_concatenated_into_next_poll(
     )
     summary = await session.run()
     assert _as_int(summary["timeouts"]) >= 1
-    assert _as_int(summary["validResponses"]) >= 1
+    assert _as_int(summary["dataResponses"]) >= 1
     assert summary["crcErrors"] == 0
     assert summary["commandQueueCreated"] is False
     assert summary["authorizationObjectsCreated"] == 0
@@ -722,7 +733,18 @@ async def test_ctrl_c_bounded_clean_stop(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_unexpected_address_immediate_stop(tmp_path: Path) -> None:
-    transport = FakeBenchTransport(auto_eot_address=2)
+    transport = FakeBenchTransport(auto_data=False)
+
+    async def write(data: bytes) -> int:
+        transport.write_count += 1
+        transport.written.append(data)
+        # DATA frame for wire address 0x51 while session polls logical 1 (0x50).
+        transport.chunks.append(
+            build_data_frame(encode_wire_address(2), 0, encode_dc1_status(2))
+        )
+        return len(data)
+
+    transport.write = write  # type: ignore[method-assign]
     session = _session(transport, tmp_path, duration_seconds=2.0)
     summary = await session.run()
     assert summary["pollsSent"] == 1
@@ -732,8 +754,7 @@ async def test_unexpected_address_immediate_stop(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_unsupported_response_immediate_stop(tmp_path: Path) -> None:
-    transport = FakeBenchTransport(auto_eot_address=None)
-    transport.chunks = []  # filled on write manually
+    transport = FakeBenchTransport(auto_data=False)
 
     async def write(data: bytes) -> int:
         transport.write_count += 1
@@ -756,7 +777,7 @@ async def test_crc_error_handling(tmp_path: Path) -> None:
     body = bytearray(unescape_dle(good[:-1]))
     body[-3] ^= 0xFF
     bad = escape_dle(bytes(body)) + bytes((SF,))
-    transport = FakeBenchTransport(auto_eot_address=None)
+    transport = FakeBenchTransport(auto_data=False)
 
     async def write(data: bytes) -> int:
         transport.write_count += 1
@@ -847,7 +868,17 @@ async def test_evidence_records_every_poll_and_stop_reason(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_poll_runner_sends_only_build_poll(tmp_path: Path) -> None:
-    transport = FakeBenchTransport()
+    transport = FakeBenchTransport(auto_data=False)
+
+    async def write(data: bytes) -> int:
+        transport.write_count += 1
+        transport.written.append(data)
+        transport.chunks.append(
+            build_data_frame(encode_wire_address(2), 0, encode_dc1_status(2))
+        )
+        return len(data)
+
+    transport.write = write  # type: ignore[method-assign]
     session = _session(
         transport,
         tmp_path,
@@ -856,7 +887,6 @@ async def test_poll_runner_sends_only_build_poll(tmp_path: Path) -> None:
         response_timeout_ms=40,
         address=2,
     )
-    transport.auto_eot_address = 2
     await session.run()
     expected = build_poll(2)
     assert transport.written
@@ -932,12 +962,6 @@ async def test_transport_not_open_maps_to_disconnect(tmp_path: Path) -> None:
     assert summary["stopReason"] == "serial_disconnect"
 
 
-WAYNE_25 = bytes.fromhex(
-    "50 30 02 08 00 00 00 00 00 00 00 00 03 04 00 99 "
-    "07 07 01 01 00 0e 55 03 fa"
-)
-
-
 @pytest.mark.asyncio
 async def test_three_consecutive_wayne_25_byte_data_frames(
     tmp_path: Path,
@@ -994,6 +1018,7 @@ async def test_three_consecutive_wayne_25_byte_data_frames(
     )
     summary = await session.run()
     assert summary["pollsSent"] == 3
+    assert summary["dataResponses"] == 3
     assert summary["validResponses"] == 3
     assert summary["crcErrors"] == 0
     assert summary["commandQueueCreated"] is False
@@ -1079,7 +1104,7 @@ async def test_transient_empty_read_recovers(tmp_path: Path) -> None:
     )
     summary = await session.run()
     assert summary["stopReason"] != "serial_disconnect"
-    assert _as_int(summary["validResponses"]) >= 1
+    assert _as_int(summary["dataResponses"]) >= 1
     records = [
         json.loads(line)
         for line in (tmp_path / "e.jsonl").read_text().splitlines()

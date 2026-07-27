@@ -27,12 +27,17 @@ from intelipump_fdc.protocol.dart.line.captured_classify import (
     is_nozzle_lift_classification,
     sequence_correlation_note,
 )
-from intelipump_fdc.protocol.dart.line.frame_builder import FrameBuildError, build_poll
+from intelipump_fdc.protocol.dart.line.frame_builder import (
+    FrameBuildError,
+    build_data_frame,
+    build_poll,
+)
 from intelipump_fdc.protocol.dart.line.legacy_stream import (
     AssemblerEventKind,
     LegacyIgemStreamAssembler,
 )
 from intelipump_fdc.simulator.config import PumpConfig, SimulatorConfig
+from intelipump_fdc.simulator.encoding import encode_dc1_status
 from intelipump_fdc.simulator.session import SimulatorSession
 
 FIXTURE_DIR = Path(__file__).resolve().parents[3] / "fixtures" / "dart" / "legacy_igem_epump"
@@ -309,7 +314,7 @@ async def test_one_poll_simulator_bench_logical_1(tmp_path: Path) -> None:
         async def write(self, data: bytes) -> int:
             self.write_count += 1
             self.written.append(data)
-            self.chunks.append(bytes.fromhex("50 70 FA"))
+            self.chunks.append(build_data_frame(0x50, 0, encode_dc1_status(1)))
             return len(data)
 
     transport = Fake()
@@ -330,6 +335,7 @@ async def test_one_poll_simulator_bench_logical_1(tmp_path: Path) -> None:
     summary = await session.run()
     assert transport.written[0] == bytes.fromhex("50 20 FA")
     assert summary["result"] == "POLL_BENCH_PASS"
+    assert summary["dataResponses"] == 1
     assert summary["logicalAddress"] == 1
     assert summary["wireAddress"] == 0x50
     assert summary["commandQueueCreated"] is False
@@ -366,7 +372,9 @@ async def test_one_poll_simulator_bench_logical_2(tmp_path: Path) -> None:
         async def write(self, data: bytes) -> int:
             self.write_count += 1
             self.written.append(data)
-            self.chunks.append(bytes.fromhex("51 70 FA"))
+            self.chunks.append(
+                build_data_frame(encode_wire_address(2), 0, encode_dc1_status(2))
+            )
             return len(data)
 
     transport = Fake()
@@ -387,16 +395,21 @@ async def test_one_poll_simulator_bench_logical_2(tmp_path: Path) -> None:
     summary = await session.run()
     assert transport.written[0] == bytes.fromhex("51 20 FA")
     assert summary["result"] == "POLL_BENCH_PASS"
+    assert summary["dataResponses"] == 1
     assert summary["logicalAddress"] == 2
     assert summary["wireAddress"] == 0x51
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("logical,wire_eot", [(1, "50 70 FA"), (2, "51 70 FA")])
+@pytest.mark.parametrize("logical", [1, 2])
 async def test_continuous_simulator_polling_both_sides(
-    tmp_path: Path, logical: int, wire_eot: str
+    tmp_path: Path, logical: int
 ) -> None:
     from dataclasses import dataclass, field
+
+    data = build_data_frame(
+        encode_wire_address(logical), 0, encode_dc1_status(logical)
+    )
 
     @dataclass
     class Fake:
@@ -404,7 +417,7 @@ async def test_continuous_simulator_polling_both_sides(
         write_count: int = 0
         chunks: list[bytes] = field(default_factory=list)
         _open: bool = False
-        eot: bytes = bytes.fromhex(wire_eot)
+        response: bytes = data
 
         @property
         def is_open(self) -> bool:
@@ -425,7 +438,7 @@ async def test_continuous_simulator_polling_both_sides(
         async def write(self, data: bytes) -> int:
             self.write_count += 1
             self.written.append(data)
-            self.chunks.append(self.eot)
+            self.chunks.append(self.response)
             return len(data)
 
     transport = Fake()
@@ -448,6 +461,7 @@ async def test_continuous_simulator_polling_both_sides(
     summary = await session.run()
     expected = build_poll(logical)
     assert all(w == expected for w in transport.written)
+    assert summary["dataResponses"] >= 1
     assert summary["validResponses"] >= 1
     assert summary["logicalAddress"] == logical
     assert summary["wireAddress"] == encode_wire_address(logical)
@@ -487,7 +501,9 @@ def test_evidence_records_logical_and_wire(tmp_path: Path) -> None:
             async def write(self, data: bytes) -> int:
                 self.write_count += 1
                 self.written.append(data)
-                self.chunks.append(bytes.fromhex("50 70 FA"))
+                self.chunks.append(
+                    build_data_frame(0x50, 0, encode_dc1_status(1))
+                )
                 return len(data)
 
         session = PollBenchSession(

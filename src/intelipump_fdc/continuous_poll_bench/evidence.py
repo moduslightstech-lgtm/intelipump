@@ -32,6 +32,9 @@ class ContinuousBenchEvent(StrEnum):
     SERIAL_READ_CHUNK = "serial_read_chunk"
     STALE_INPUT_DRAINED = "stale_input_drained"
     TRANSIENT_EMPTY_READ = "transient_empty_read"
+    CONTROL_RESPONSE = "control_response"
+    DATA_RESPONSE = "data_response"
+    CONTROL_ONLY = "control_only"
     BENCH_STOPPED = "bench_stopped"
     SAFETY_REFUSED = "safety_refused"
 
@@ -85,6 +88,7 @@ class EvidenceRecord:
     stopReason: str | None = None
     softwareCommit: str | None = None
     source: str | None = None
+    pollCycleOutcome: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -96,7 +100,12 @@ class EvidenceRecord:
 @dataclass
 class ContinuousSessionStats:
     polls_sent: int = 0
-    valid_responses: int = 0
+    # Any complete recognized protocol frame (SHORT_CONTROL_70 or DATA_FRAME).
+    # valid_responses / validResponses is a documented alias of this counter.
+    protocol_frames_received: int = 0
+    control_responses: int = 0
+    data_responses: int = 0
+    control_only_cycles: int = 0
     timeouts: int = 0
     crc_errors: int = 0
     protocol_errors: int = 0
@@ -110,6 +119,11 @@ class ContinuousSessionStats:
     stop_reason: StopReason | None = None
     requested_duration_s: float = 0.0
     actual_duration_s: float = 0.0
+
+    @property
+    def valid_responses(self) -> int:
+        """Alias of protocol_frames_received (not status-data completions)."""
+        return self.protocol_frames_received
 
 
 class EvidenceWriter:
@@ -160,6 +174,7 @@ class EvidenceWriter:
         stop_reason: str | None = None,
         source: str | None = None,
         raw: bytes | None = None,
+        poll_cycle_outcome: str | None = None,
     ) -> None:
         logical = logical_address if logical_address is not None else pump_address
         self.write(
@@ -188,6 +203,7 @@ class EvidenceWriter:
                 stopReason=stop_reason,
                 softwareCommit=self.commit,
                 source=source,
+                pollCycleOutcome=poll_cycle_outcome,
             )
         )
 
@@ -209,6 +225,7 @@ class EvidenceWriter:
         logical_address: int | None = None,
         wire_address: int | None = None,
         source: str | None = None,
+        poll_cycle_outcome: str | None = None,
     ) -> None:
         logical = logical_address if logical_address is not None else pump_address
         self.write(
@@ -237,6 +254,7 @@ class EvidenceWriter:
                 stopReason=None,
                 softwareCommit=self.commit,
                 source=source,
+                pollCycleOutcome=poll_cycle_outcome,
             )
         )
 
@@ -260,14 +278,17 @@ def suggest_result(
         return ContinuousBenchResult.FAIL
     if stats.polls_sent == 0:
         return ContinuousBenchResult.FAIL
+    # Status-data collection PASS requires at least one DATA_FRAME cycle.
     if (
-        stats.valid_responses >= 1
+        stats.data_responses >= 1
         and stats.crc_errors == 0
         and stats.protocol_errors == 0
         and stats.unexpected_frames == 0
     ):
         return ContinuousBenchResult.PASS
-    if stats.valid_responses == 0 and stats.timeouts >= 1:
+    if stats.data_responses == 0 and (
+        stats.timeouts >= 1 or stats.control_only_cycles >= 1
+    ):
         return ContinuousBenchResult.INCONCLUSIVE
     return ContinuousBenchResult.INCONCLUSIVE
 
@@ -313,8 +334,14 @@ def write_markdown_summary(
         f"- Poll interval (ms): `{poll_interval_ms}`",
         f"- Response timeout (ms): `{response_timeout_ms}`",
         f"- Polls sent / write count: `{stats.polls_sent}` / `{write_count}`",
-        f"- Valid responses: `{stats.valid_responses}`",
-        f"- Timeouts: `{stats.timeouts}`",
+        (
+            f"- Protocol frames received (validResponses alias): "
+            f"`{stats.protocol_frames_received}`"
+        ),
+        f"- Control responses (SHORT_CONTROL_70): `{stats.control_responses}`",
+        f"- Data responses (DATA_FRAME): `{stats.data_responses}`",
+        f"- Control-only cycles: `{stats.control_only_cycles}`",
+        f"- Timeouts (no protocol frame): `{stats.timeouts}`",
         f"- CRC errors: `{stats.crc_errors}`",
         f"- Protocol errors: `{stats.protocol_errors}`",
         f"- Unexpected frames: `{stats.unexpected_frames}`",
@@ -335,6 +362,12 @@ def write_markdown_summary(
         f"- authorizationObjectsCreated: `{authorization_objects_created}`",
         f"- Stop reason: `{stats.stop_reason.value if stats.stop_reason else 'n/a'}`",
         f"- Result: `{result.value}`",
+        "",
+        (
+            "Note: PASS requires dataResponses > 0. "
+            "validResponses/protocolFramesReceived counts any recognized "
+            "protocol frame including interim SHORT_CONTROL_70."
+        ),
         "",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
