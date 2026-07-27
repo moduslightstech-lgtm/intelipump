@@ -21,6 +21,7 @@ from intelipump_fdc.bench_poll.guards import TARGET_OWNED_LAB_WAYNE
 from intelipump_fdc.bench_poll.poll_io import (
     StatusPollOutcome,
     send_status_poll_and_read_response,
+    wait_for_quiet_gap,
 )
 from intelipump_fdc.bench_poll.transport import (
     BenchByteTransport,
@@ -185,8 +186,16 @@ class PollBenchSession:
         )
         self.stats.polls_sent += 1
         self.stats.last_tx_hex = response.poll_tx.hex(" ")
-        self.stats.protocol_frames_received += len(response.observed_frames)
+        owned_frames = [
+            f
+            for f in response.observed_frames
+            if f.ownership.value == "owned"
+        ]
+        self.stats.protocol_frames_received += len(owned_frames)
         self.stats.control_responses += len(response.control_frames)
+        self.stats.stale_chunks += response.stale_chunks
+        self.stats.late_chunks += response.late_chunks
+        self.stats.unowned_frames += response.unowned_frames
         writer.emit_frame(
             direction="TX",
             raw=response.poll_tx,
@@ -295,6 +304,7 @@ class PollBenchSession:
                     notes=event.message,
                 )
             self.stats.timeouts += 1
+            self.stats.timeout_no_response += 1
             writer.emit_event(
                 BenchEvent.RESPONSE_TIMEOUT,
                 monotonic_ns=time.monotonic_ns(),
@@ -305,6 +315,9 @@ class PollBenchSession:
                 timeout_ms=self.config.response_timeout_ms,
                 notes="no_frame_before_deadline",
             )
+            late, unowned = await wait_for_quiet_gap(self.transport)
+            self.stats.late_chunks += late
+            self.stats.unowned_frames += unowned
             return False
 
         if response.outcome is StatusPollOutcome.CONTROL_ONLY:

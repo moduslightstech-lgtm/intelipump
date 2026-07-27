@@ -10,10 +10,13 @@ from pathlib import Path
 
 from intelipump_fdc.bench_poll.guards import TARGET_OWNED_LAB_WAYNE
 from intelipump_fdc.bench_poll.poll_io import (
+    ChunkOwnership,
     ObservedFrame,
     StatusPollOutcome,
     send_status_poll_and_read_response,
+    wait_for_quiet_gap,
 )
+from intelipump_fdc.bench_poll.serial_reader import SerialChunk
 from intelipump_fdc.bench_poll.transport import (
     BenchByteTransport,
     format_serial_config,
@@ -199,6 +202,7 @@ class ContinuousPollSession:
                     self.transport, "write_count", self.stats.polls_sent
                 ),
                 commit=self._commit,
+                records=writer.record_list,
             )
 
         return {
@@ -212,10 +216,15 @@ class ContinuousPollSession:
             "dataResponses": self.stats.data_responses,
             "controlOnlyCycles": self.stats.control_only_cycles,
             "timeouts": self.stats.timeouts,
+            "timeoutNoResponse": self.stats.timeout_no_response,
+            "lateChunks": self.stats.late_chunks,
+            "staleChunks": self.stats.stale_chunks,
+            "unownedFrames": self.stats.unowned_frames,
             "crcErrors": self.stats.crc_errors,
             "protocolErrors": self.stats.protocol_errors,
             "unexpectedFrames": self.stats.unexpected_frames,
             "scheduleLagEvents": self.stats.schedule_lag_events,
+            "skippedSlotsTotal": self.stats.skipped_slots_total,
             "commandQueueCreated": self.command_queue_created,
             "authorizationObjectsCreated": self.authorization_objects_created,
             "targetType": self.config.target_type,
@@ -238,9 +247,15 @@ class ContinuousPollSession:
     async def _run_scheduler(
         self, writer: EvidenceWriter, t_start: float
     ) -> None:
+        """Monotonic schedule: never TX sooner than previous_tx + poll_interval.
+
+        Ideal cadence slots are skipped when late — never compressed catch-up
+        bursts. Spacing is always measured from the previous actual TX time.
+        """
         interval_s = self.config.poll_interval_ms / 1000.0
         end = t_start + self.config.duration_seconds
-        next_deadline = t_start
+        next_ideal = t_start
+        previous_tx: float | None = None
         seq = 0
 
         while True:
@@ -254,16 +269,29 @@ class ContinuousPollSession:
                 self.stats.stop_reason = StopReason.DURATION_EXPIRED
                 return
 
-            # Skip missed slots — never burst catch-up polls.
-            while next_deadline + interval_s <= now:
-                next_deadline += interval_s
+            min_next = (
+                previous_tx + interval_s if previous_tx is not None else t_start
+            )
 
-            if next_deadline >= end:
+            # Skip missed ideal slots; never schedule a catch-up burst.
+            # Advance only by whole intervals past `now` / before `min_next`.
+            # Do NOT use `next_ideal < min_next` — a tiny TX overshoot would
+            # skip an extra full interval and double the effective cadence.
+            skipped = 0
+            while next_ideal + interval_s <= now:
+                next_ideal += interval_s
+                skipped += 1
+            while next_ideal + interval_s <= min_next:
+                next_ideal += interval_s
+                skipped += 1
+
+            next_tx = max(next_ideal, min_next)
+            if next_tx >= end:
                 self.stats.stop_reason = StopReason.DURATION_EXPIRED
                 return
 
-            if now < next_deadline:
-                wait = min(next_deadline - now, end - now)
+            if now < next_tx:
+                wait = min(next_tx - now, end - now)
                 if wait > 0:
                     try:
                         await asyncio.wait_for(self._stop.wait(), timeout=wait)
@@ -273,28 +301,24 @@ class ContinuousPollSession:
                         self._fault = True
                         self.stats.stop_reason = StopReason.OPERATOR_INTERRUPT
                         return
-                now = time.monotonic()
-                if now >= end:
-                    self.stats.stop_reason = StopReason.DURATION_EXPIRED
-                    return
+                # Recompute with fresh monotonic time after the wait.
+                continue
 
-            while next_deadline + interval_s <= now:
-                next_deadline += interval_s
-            if next_deadline >= end:
-                self.stats.stop_reason = StopReason.DURATION_EXPIRED
-                return
-
-            lag_ms = max(0.0, (now - next_deadline) * 1000.0)
-            if lag_ms > 0.5:
+            lag_ms = max(0.0, (now - next_ideal) * 1000.0)
+            if lag_ms > 0.5 or skipped > 0:
                 self.stats.schedule_lag_events += 1
                 self.stats.schedule_lags_ms.append(lag_ms)
+                self.stats.skipped_slots_total += skipped
                 writer.emit_event(
                     ContinuousBenchEvent.SCHEDULE_LAG,
                     monotonic_ns=time.monotonic_ns(),
                     pump_address=self.config.address,
                     poll_sequence=seq + 1,
                     schedule_lag_ms=lag_ms,
-                    notes=f"schedule_lag_ms={lag_ms:.2f}",
+                    notes=(
+                        f"schedule_lag_ms={lag_ms:.2f}; "
+                        f"skipped_slots={skipped}"
+                    ),
                 )
 
             write_count = getattr(self.transport, "write_count", self.stats.polls_sent)
@@ -314,10 +338,78 @@ class ContinuousPollSession:
                 return
 
             seq += 1
-            stop_early = await self._one_poll(writer, seq, lag_ms=lag_ms)
-            next_deadline += interval_s
+            stop_early, tx_monotonic = await self._one_poll(
+                writer, seq, lag_ms=lag_ms
+            )
+            previous_tx = (
+                tx_monotonic if tx_monotonic is not None else time.monotonic()
+            )
+            next_ideal += interval_s
             if stop_early:
                 return
+
+    async def _wait_quiet_gap(
+        self,
+        writer: EvidenceWriter,
+        seq: int,
+        *,
+        t0: float,
+    ) -> None:
+        """After timeout, wait for a quiet capture gap before the next TX."""
+        writer.emit_event(
+            ContinuousBenchEvent.QUIET_GAP_WAIT,
+            monotonic_ns=time.monotonic_ns(),
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=seq,
+            notes="waiting_quiet_gap_after_timeout",
+        )
+
+        def _on_chunk(chunk: SerialChunk, ownership: ChunkOwnership) -> None:
+            writer.emit_frame(
+                direction="RX",
+                raw=chunk.raw,
+                monotonic_ns=chunk.monotonic_ns,
+                timestamp_utc=chunk.timestamp_utc,
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=None,
+                timeout_ms=self.config.response_timeout_ms,
+                classification=None,
+                crc_valid=None,
+                event=ContinuousBenchEvent.LATE_CHUNK,
+                source="quiet_gap",
+                notes=f"quiet_gap_{ownership.value}",
+            )
+
+        def _on_observed(observed: ObservedFrame) -> None:
+            writer.emit_frame(
+                direction="RX",
+                raw=observed.frame.raw_frame,
+                monotonic_ns=observed.capture_monotonic_ns or time.monotonic_ns(),
+                timestamp_utc=observed.capture_timestamp_utc,
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=None,
+                timeout_ms=self.config.response_timeout_ms,
+                classification=observed.classification,
+                crc_valid=observed.frame.crc_valid,
+                event=ContinuousBenchEvent.UNOWNED_FRAME,
+                latency_ms=observed.latency_ms,
+                notes="quiet_gap_unowned_frame",
+            )
+
+        late, unowned = await wait_for_quiet_gap(
+            self.transport,
+            on_chunk=_on_chunk,
+            on_observed_frame=_on_observed,
+            t0_reference=t0,
+        )
+        self.stats.late_chunks += late
+        self.stats.unowned_frames += unowned
 
     async def _one_poll(
         self,
@@ -325,36 +417,70 @@ class ContinuousPollSession:
         seq: int,
         *,
         lag_ms: float,
-    ) -> bool:
-        """One poll cycle via the shared status-poll receive path."""
+    ) -> tuple[bool, float | None]:
+        """Return ``(stop_early, tx_monotonic)`` for schedule spacing."""
 
-        def _on_chunk(chunk: bytes) -> None:
+        def _on_chunk(chunk: SerialChunk, ownership: ChunkOwnership) -> None:
+            if ownership is ChunkOwnership.STALE:
+                event = ContinuousBenchEvent.STALE_CHUNK
+                notes = "stale_unowned_before_tx"
+            elif ownership is ChunkOwnership.LATE:
+                event = ContinuousBenchEvent.LATE_CHUNK
+                notes = "late_unowned_after_deadline"
+            else:
+                event = ContinuousBenchEvent.SERIAL_READ_CHUNK
+                notes = "owned_serial_read_chunk"
+            # pollSequence is only set for owned chunks; stale/late stay unowned.
             writer.emit_frame(
                 direction="RX",
-                raw=chunk,
-                monotonic_ns=time.monotonic_ns(),
+                raw=chunk.raw,
+                monotonic_ns=chunk.monotonic_ns,
+                timestamp_utc=chunk.timestamp_utc,
                 pump_address=self.logical_address,
                 logical_address=self.logical_address,
                 wire_address=self.wire_address,
-                poll_sequence=seq,
+                poll_sequence=(
+                    seq if ownership is ChunkOwnership.OWNED else None
+                ),
                 timeout_ms=self.config.response_timeout_ms,
                 classification=None,
                 crc_valid=None,
-                event=ContinuousBenchEvent.SERIAL_READ_CHUNK,
-                source="serial_read_chunk",
-                notes="raw_serial_read_chunk",
+                event=event,
+                source="permanent_serial_reader",
+                notes=notes,
             )
 
         def _on_observed(observed: ObservedFrame) -> None:
-            self.stats.protocol_frames_received += 1
             classification = observed.classification
             raw = observed.frame.raw_frame
+            mono = observed.capture_monotonic_ns or time.monotonic_ns()
+            utc = observed.capture_timestamp_utc
+            if observed.ownership is not ChunkOwnership.OWNED:
+                writer.emit_frame(
+                    direction="RX",
+                    raw=raw,
+                    monotonic_ns=mono,
+                    timestamp_utc=utc,
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
+                    poll_sequence=None,
+                    timeout_ms=self.config.response_timeout_ms,
+                    classification=classification,
+                    crc_valid=observed.frame.crc_valid,
+                    event=ContinuousBenchEvent.UNOWNED_FRAME,
+                    latency_ms=observed.latency_ms,
+                    notes=f"unowned_{observed.ownership.value}",
+                )
+                return
+            self.stats.protocol_frames_received += 1
             if observed.is_short_control_70:
                 self.stats.control_responses += 1
                 writer.emit_frame(
                     direction="RX",
                     raw=raw,
-                    monotonic_ns=time.monotonic_ns(),
+                    monotonic_ns=mono,
+                    timestamp_utc=utc,
                     pump_address=self.logical_address,
                     logical_address=self.logical_address,
                     wire_address=self.wire_address,
@@ -371,7 +497,8 @@ class ContinuousPollSession:
                 )
                 writer.emit_event(
                     ContinuousBenchEvent.CONTROL_RESPONSE,
-                    monotonic_ns=time.monotonic_ns(),
+                    monotonic_ns=mono,
+                    timestamp_utc=utc,
                     pump_address=self.logical_address,
                     logical_address=self.logical_address,
                     wire_address=self.wire_address,
@@ -383,17 +510,6 @@ class ContinuousPollSession:
                 return
             # DATA or unexpected — final handling occurs after collector returns.
 
-        def _on_transient(exc: BaseException, count: int) -> None:
-            writer.emit_event(
-                ContinuousBenchEvent.TRANSIENT_EMPTY_READ,
-                monotonic_ns=time.monotonic_ns(),
-                pump_address=self.logical_address,
-                logical_address=self.logical_address,
-                wire_address=self.wire_address,
-                poll_sequence=seq,
-                notes=f"transient_empty_read count={count}: {exc}",
-            )
-
         try:
             response = await send_status_poll_and_read_response(
                 self.transport,
@@ -403,7 +519,6 @@ class ContinuousPollSession:
                 stop_event=self._stop,
                 on_chunk=_on_chunk,
                 on_observed_frame=_on_observed,
-                on_transient_empty=_on_transient,
             )
         except (OSError, TransportNotOpenError) as exc:
             self._fault = True
@@ -419,14 +534,19 @@ class ContinuousPollSession:
                 stop_reason=StopReason.SERIAL_DISCONNECT.value,
                 poll_cycle_outcome=StatusPollOutcome.DISCONNECT.value,
             )
-            return True
+            return True, None
 
+        tx_monotonic = response.t0
         self.stats.polls_sent += 1
         self.stats.last_tx_hex = response.poll_tx.hex(" ")
+        self.stats.stale_chunks += response.stale_chunks
+        self.stats.late_chunks += response.late_chunks
+        self.stats.unowned_frames += response.unowned_frames
         writer.emit_frame(
             direction="TX",
             raw=response.poll_tx,
             monotonic_ns=response.mono_tx_ns,
+            timestamp_utc=response.timestamp_utc_tx,
             pump_address=self.logical_address,
             logical_address=self.logical_address,
             wire_address=self.wire_address,
@@ -441,6 +561,7 @@ class ContinuousPollSession:
         writer.emit_event(
             ContinuousBenchEvent.POLL_SENT,
             monotonic_ns=response.mono_tx_ns,
+            timestamp_utc=response.timestamp_utc_tx,
             pump_address=self.logical_address,
             logical_address=self.logical_address,
             wire_address=self.wire_address,
@@ -463,13 +584,11 @@ class ContinuousPollSession:
                 stop_reason=StopReason.SERIAL_DISCONNECT.value,
                 poll_cycle_outcome=StatusPollOutcome.DISCONNECT.value,
             )
-            return True
-
+            return True, tx_monotonic
         if response.outcome is StatusPollOutcome.STOPPED:
             self._fault = True
             self.stats.stop_reason = StopReason.OPERATOR_INTERRUPT
-            return True
-
+            return True, tx_monotonic
         if response.outcome is StatusPollOutcome.PROTOCOL_ERROR:
             event = response.terminal_event
             classification = (
@@ -496,9 +615,8 @@ class ContinuousPollSession:
                     self._fault = True
                     self.stats.protocol_errors += 1
                     self.stats.stop_reason = StopReason.MALFORMED_THRESHOLD
-                    return True
-                return False
-
+                    return True, tx_monotonic
+                return False, tx_monotonic
             # Unexpected complete frame or overflow.
             if response.frame is not None:
                 if response.frame.address != self.wire_address:
@@ -517,7 +635,7 @@ class ContinuousPollSession:
                         stop_reason=StopReason.ADDRESS_MISMATCH.value,
                         poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
                     )
-                    return True
+                    return True, tx_monotonic
                 captured_class = (
                     response.captured.classification
                     if response.captured is not None
@@ -544,8 +662,7 @@ class ContinuousPollSession:
                         stop_reason=StopReason.UNEXPECTED_FRAME.value,
                         poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
                     )
-                    return True
-
+                    return True, tx_monotonic
             self._fault = True
             self.stats.protocol_errors += 1
             self.stats.stop_reason = StopReason.PROTOCOL_ERROR
@@ -559,8 +676,7 @@ class ContinuousPollSession:
                 stop_reason=StopReason.PROTOCOL_ERROR.value,
                 poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
             )
-            return True
-
+            return True, tx_monotonic
         if response.outcome is StatusPollOutcome.TIMEOUT_NO_RESPONSE:
             for event in response.partial_events:
                 writer.emit_frame(
@@ -593,6 +709,7 @@ class ContinuousPollSession:
                     notes="bytes_before_timeout",
                 )
             self.stats.timeouts += 1
+            self.stats.timeout_no_response += 1
             writer.emit_event(
                 ContinuousBenchEvent.RESPONSE_TIMEOUT,
                 monotonic_ns=time.monotonic_ns(),
@@ -604,8 +721,8 @@ class ContinuousPollSession:
                 notes="no_frame_before_deadline",
                 poll_cycle_outcome=StatusPollOutcome.TIMEOUT_NO_RESPONSE.value,
             )
-            return False
-
+            await self._wait_quiet_gap(writer, seq, t0=response.t0)
+            return False, tx_monotonic
         if response.outcome is StatusPollOutcome.CONTROL_ONLY:
             self.stats.control_only_cycles += 1
             if response.frame is not None:
@@ -623,8 +740,7 @@ class ContinuousPollSession:
                 notes=response.message or "control_only_no_data_frame",
                 poll_cycle_outcome=StatusPollOutcome.CONTROL_ONLY.value,
             )
-            return False
-
+            return False, tx_monotonic
         # DATA_RESPONSE
         assert response.outcome is StatusPollOutcome.DATA_RESPONSE
         frame = response.frame
@@ -670,8 +786,7 @@ class ContinuousPollSession:
                 notes="crc_invalid_stop",
                 poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
             )
-            return True
-
+            return True, tx_monotonic
         if frame.address != self.wire_address:
             self._fault = True
             self.stats.protocol_errors += 1
@@ -692,13 +807,24 @@ class ContinuousPollSession:
                 stop_reason=StopReason.ADDRESS_MISMATCH.value,
                 poll_cycle_outcome=StatusPollOutcome.PROTOCOL_ERROR.value,
             )
-            return True
-
+            return True, tx_monotonic
         self.stats.data_responses += 1
+        data_mono = (
+            response.data_frame.capture_monotonic_ns
+            if response.data_frame is not None
+            and response.data_frame.capture_monotonic_ns is not None
+            else time.monotonic_ns()
+        )
+        data_utc = (
+            response.data_frame.capture_timestamp_utc
+            if response.data_frame is not None
+            else None
+        )
         writer.emit_frame(
             direction="RX",
             raw=frame.raw_frame,
-            monotonic_ns=time.monotonic_ns(),
+            monotonic_ns=data_mono,
+            timestamp_utc=data_utc,
             pump_address=self.logical_address,
             logical_address=self.logical_address,
             wire_address=self.wire_address,
@@ -713,7 +839,8 @@ class ContinuousPollSession:
         )
         writer.emit_event(
             ContinuousBenchEvent.DATA_RESPONSE,
-            monotonic_ns=time.monotonic_ns(),
+            monotonic_ns=data_mono,
+            timestamp_utc=data_utc,
             pump_address=self.logical_address,
             logical_address=self.logical_address,
             wire_address=self.wire_address,
@@ -726,7 +853,8 @@ class ContinuousPollSession:
         )
         writer.emit_event(
             ContinuousBenchEvent.RESPONSE_RECEIVED,
-            monotonic_ns=time.monotonic_ns(),
+            monotonic_ns=data_mono,
+            timestamp_utc=data_utc,
             pump_address=self.logical_address,
             logical_address=self.logical_address,
             wire_address=self.wire_address,
@@ -737,4 +865,4 @@ class ContinuousPollSession:
             notes=f"data_response latency_ms={latency_ms:.2f}",
             poll_cycle_outcome=StatusPollOutcome.DATA_RESPONSE.value,
         )
-        return False
+        return False, tx_monotonic

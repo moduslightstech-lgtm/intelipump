@@ -30,11 +30,15 @@ class ContinuousBenchEvent(StrEnum):
     PROTOCOL_ERROR = "protocol_error"
     SERIAL_DISCONNECT = "serial_disconnect"
     SERIAL_READ_CHUNK = "serial_read_chunk"
+    STALE_CHUNK = "stale_chunk"
+    LATE_CHUNK = "late_chunk"
+    UNOWNED_FRAME = "unowned_frame"
     STALE_INPUT_DRAINED = "stale_input_drained"
     TRANSIENT_EMPTY_READ = "transient_empty_read"
     CONTROL_RESPONSE = "control_response"
     DATA_RESPONSE = "data_response"
     CONTROL_ONLY = "control_only"
+    QUIET_GAP_WAIT = "quiet_gap_wait"
     BENCH_STOPPED = "bench_stopped"
     SAFETY_REFUSED = "safety_refused"
 
@@ -107,11 +111,16 @@ class ContinuousSessionStats:
     data_responses: int = 0
     control_only_cycles: int = 0
     timeouts: int = 0
+    timeout_no_response: int = 0
     crc_errors: int = 0
     protocol_errors: int = 0
     unexpected_frames: int = 0
     malformed_count: int = 0
     schedule_lag_events: int = 0
+    skipped_slots_total: int = 0
+    late_chunks: int = 0
+    stale_chunks: int = 0
+    unowned_frames: int = 0
     latencies_ms: list[float] = field(default_factory=list)
     schedule_lags_ms: list[float] = field(default_factory=list)
     last_tx_hex: str | None = None
@@ -144,16 +153,22 @@ class EvidenceWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fp: IO[str] | None = self.path.open("w", encoding="utf-8")
         self.records = 0
+        self._record_list: list[EvidenceRecord] = []
 
     def close(self) -> None:
         if self._fp is not None:
             self._fp.close()
             self._fp = None
 
+    @property
+    def record_list(self) -> list[EvidenceRecord]:
+        return list(self._record_list)
+
     def write(self, record: EvidenceRecord) -> None:
         assert self._fp is not None
         self._fp.write(record.to_json_line() + "\n")
         self._fp.flush()
+        self._record_list.append(record)
         self.records += 1
 
     def emit_event(
@@ -175,13 +190,14 @@ class EvidenceWriter:
         source: str | None = None,
         raw: bytes | None = None,
         poll_cycle_outcome: str | None = None,
+        timestamp_utc: str | None = None,
     ) -> None:
         logical = logical_address if logical_address is not None else pump_address
         self.write(
             EvidenceRecord(
                 schemaVersion=SCHEMA_VERSION,
                 sessionId=self.session_id,
-                timestampUtc=datetime.now(UTC).isoformat(),
+                timestampUtc=timestamp_utc or datetime.now(UTC).isoformat(),
                 monotonicNs=monotonic_ns,
                 recordType=RecordType.EVENT.value,
                 direction=None,
@@ -214,7 +230,7 @@ class EvidenceWriter:
         raw: bytes,
         monotonic_ns: int,
         pump_address: int,
-        poll_sequence: int,
+        poll_sequence: int | None,
         timeout_ms: int | None,
         classification: str | None,
         crc_valid: bool | None,
@@ -226,13 +242,14 @@ class EvidenceWriter:
         wire_address: int | None = None,
         source: str | None = None,
         poll_cycle_outcome: str | None = None,
+        timestamp_utc: str | None = None,
     ) -> None:
         logical = logical_address if logical_address is not None else pump_address
         self.write(
             EvidenceRecord(
                 schemaVersion=SCHEMA_VERSION,
                 sessionId=self.session_id,
-                timestampUtc=datetime.now(UTC).isoformat(),
+                timestampUtc=timestamp_utc or datetime.now(UTC).isoformat(),
                 monotonicNs=monotonic_ns,
                 recordType=RecordType.FRAME.value,
                 direction=direction,
@@ -311,6 +328,7 @@ def write_markdown_summary(
     authorization_objects_created: int,
     write_count: int,
     commit: str,
+    records: list[EvidenceRecord] | None = None,
 ) -> None:
     avg_lat = (
         statistics.mean(stats.latencies_ms) if stats.latencies_ms else None
@@ -341,11 +359,16 @@ def write_markdown_summary(
         f"- Control responses (SHORT_CONTROL_70): `{stats.control_responses}`",
         f"- Data responses (DATA_FRAME): `{stats.data_responses}`",
         f"- Control-only cycles: `{stats.control_only_cycles}`",
-        f"- Timeouts (no protocol frame): `{stats.timeouts}`",
+        f"- Timeouts / timeoutNoResponse: `{stats.timeouts}` / "
+        f"`{stats.timeout_no_response}`",
+        f"- Late chunks: `{stats.late_chunks}`",
+        f"- Stale chunks: `{stats.stale_chunks}`",
+        f"- Unowned frames: `{stats.unowned_frames}`",
         f"- CRC errors: `{stats.crc_errors}`",
         f"- Protocol errors: `{stats.protocol_errors}`",
         f"- Unexpected frames: `{stats.unexpected_frames}`",
         f"- Schedule lag events: `{stats.schedule_lag_events}`",
+        f"- Skipped schedule slots: `{stats.skipped_slots_total}`",
         (
             f"- Avg latency (ms): `{avg_lat:.2f}`"
             if avg_lat is not None
@@ -366,9 +389,31 @@ def write_markdown_summary(
         (
             "Note: PASS requires dataResponses > 0. "
             "validResponses/protocolFramesReceived counts any recognized "
-            "protocol frame including interim SHORT_CONTROL_70."
+            "owned protocol frame including interim SHORT_CONTROL_70. "
+            "Ownership is by capture timestamp, not dequeue time."
         ),
         "",
     ]
+    if records:
+        lines.extend(
+            [
+                "## Evidence timeline (by monotonic capture time)",
+                "",
+            ]
+        )
+        for rec in sorted(records, key=lambda r: r.monotonicNs):
+            label = rec.event or rec.recordType
+            direction = f" {rec.direction}" if rec.direction else ""
+            seq = (
+                f" poll={rec.pollSequence}"
+                if rec.pollSequence is not None
+                else ""
+            )
+            raw = f" `{rec.rawHex}`" if rec.rawHex else ""
+            lines.append(
+                f"- `{rec.timestampUtc}` mono_ns={rec.monotonicNs} "
+                f"{label}{direction}{seq}{raw}"
+            )
+        lines.append("")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")

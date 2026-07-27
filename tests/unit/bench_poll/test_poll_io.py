@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import pytest
 
@@ -11,6 +13,7 @@ from intelipump_fdc.bench_poll.poll_io import (
     StatusPollOutcome,
     send_status_poll_and_read_response,
 )
+from intelipump_fdc.bench_poll.serial_reader import SerialChunk
 from intelipump_fdc.protocol.dart.line.captured_classify import CapturedFrameClass
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
 
@@ -47,13 +50,24 @@ class ScriptedTransport:
     async def flush(self) -> None:
         self.flush_count += 1
 
-    async def read(self, max_bytes: int) -> bytes:
+    _read_seq: int = 0
+
+    async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
         self.read_calls += 1
-        if not self._queue:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() < deadline:
+            if self._queue:
+                data = self._queue.pop(0)
+                self._read_seq += 1
+                return SerialChunk(
+                    raw=data,
+                    monotonic_ns=time.monotonic_ns(),
+                    monotonic_s=time.monotonic(),
+                    timestamp_utc=datetime.now(UTC).isoformat(),
+                    read_sequence=self._read_seq,
+                )
             await asyncio.sleep(0.002)
-            return b""
-        data = self._queue.pop(0)
-        return data[:max_bytes]
+        return None
 
     async def write(self, data: bytes) -> int:
         self.write_count += 1
@@ -128,7 +142,7 @@ async def test_fragmented_70_and_fragmented_data_lose_no_bytes() -> None:
         transport,
         1,
         250,
-        on_chunk=seen.append,
+        on_chunk=lambda chunk, _own: seen.append(chunk.raw),
     )
     assert response.outcome is StatusPollOutcome.DATA_RESPONSE
     assert b"".join(response.chunks) == SHORT_70 + WAYNE_25
@@ -172,7 +186,7 @@ async def test_no_second_reader_and_cancelled_read_byte_loss() -> None:
 
     orig_write = transport.write
     orig_flush = transport.flush
-    orig_read = transport.read
+    orig_get = transport.get_chunk
 
     async def write(data: bytes) -> int:
         order.append("write")
@@ -182,18 +196,19 @@ async def test_no_second_reader_and_cancelled_read_byte_loss() -> None:
         order.append("flush")
         await orig_flush()
 
-    async def read(max_bytes: int) -> bytes:
-        order.append("read")
-        return await orig_read(max_bytes)
+    async def get_chunk(timeout_s: float) -> SerialChunk | None:
+        order.append("get_chunk")
+        return await orig_get(timeout_s)
 
     transport.write = write  # type: ignore[method-assign]
     transport.flush = flush  # type: ignore[method-assign]
-    transport.read = read  # type: ignore[method-assign]
+    transport.get_chunk = get_chunk  # type: ignore[method-assign]
 
     response = await send_status_poll_and_read_response(transport, 1, 250)
     assert response.outcome is StatusPollOutcome.DATA_RESPONSE
-    assert order[:3] == ["write", "flush", "read"]
+    assert order[:3] == ["write", "flush", "get_chunk"]
     assert "drain" not in order
+    assert "read" not in order
     assert transport.write_count == 1
     assert response.poll_tx == build_poll(1)
 

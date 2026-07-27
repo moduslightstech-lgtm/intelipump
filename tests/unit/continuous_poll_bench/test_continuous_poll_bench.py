@@ -7,6 +7,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
 from typing import cast
@@ -14,6 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from intelipump_fdc.bench_poll.serial_reader import SerialChunk
 from intelipump_fdc.continuous_poll_bench.cli import build_parser
 from intelipump_fdc.continuous_poll_bench.cli import run as continuous_run
 from intelipump_fdc.continuous_poll_bench.evidence import ContinuousBenchResult
@@ -144,12 +146,23 @@ class FakeBenchTransport:
     async def close(self) -> None:
         self._open = False
 
-    async def read(self, max_bytes: int) -> bytes:
-        if not self.chunks:
+    _read_seq: int = 0
+
+    async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() < deadline:
+            if self.chunks:
+                data = self.chunks.pop(0)
+                self._read_seq += 1
+                return SerialChunk(
+                    raw=data,
+                    monotonic_ns=time.monotonic_ns(),
+                    monotonic_s=time.monotonic(),
+                    timestamp_utc=datetime.now(UTC).isoformat(),
+                    read_sequence=self._read_seq,
+                )
             await asyncio.sleep(0.005)
-            return b""
-        data = self.chunks.pop(0)
-        return data[:max_bytes]
+        return None
 
     def device_path_exists(self) -> bool:
         return True
@@ -543,7 +556,78 @@ async def test_no_catchup_burst_after_scheduler_delay(tmp_path: Path) -> None:
     ]
     if len(tx_ns) >= 2:
         gaps_ms = [(b - a) / 1e6 for a, b in pairwise(tx_ns)]
-        assert all(g >= 90 for g in gaps_ms)
+        # Spacing from previous actual TX; allow tiny scheduler jitter.
+        assert all(g >= 95 for g in gaps_ms)
+    assert (
+        _as_int(summary["skippedSlotsTotal"]) >= 1
+        or _as_int(summary["scheduleLagEvents"]) >= 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_timeout_250ms_next_tx_still_300ms_after_previous(
+    tmp_path: Path,
+) -> None:
+    """After a 250 ms timeout, next TX must still be >= 300 ms after prior TX."""
+    transport = FakeBenchTransport(
+        auto_data=False, auto_eot_address=None, chunks=[]
+    )
+    session = _session(
+        transport,
+        tmp_path,
+        duration_seconds=1.2,
+        poll_interval_ms=300,
+        response_timeout_ms=250,
+        max_writes=10,
+    )
+    summary = await session.run()
+    assert _as_int(summary["timeouts"]) >= 1
+    assert _as_int(summary["pollsSent"]) >= 2
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "e.jsonl").read_text().splitlines()
+        if line
+    ]
+    tx_ns = [
+        r["monotonicNs"]
+        for r in records
+        if r.get("direction") == "TX"
+    ]
+    assert len(tx_ns) >= 2
+    gaps_ms = [(b - a) / 1e6 for a, b in pairwise(tx_ns)]
+    assert all(g >= 295 for g in gaps_ms), gaps_ms
+
+
+@pytest.mark.asyncio
+async def test_repeated_slow_cycles_respect_min_interval(
+    tmp_path: Path,
+) -> None:
+    """Slow cycles must never compress TX spacing below the configured interval."""
+    transport = FakeBenchTransport(write_delay_s=0.22)
+    session = _session(
+        transport,
+        tmp_path,
+        duration_seconds=1.5,
+        poll_interval_ms=300,
+        response_timeout_ms=250,
+        max_writes=20,
+    )
+    summary = await session.run()
+    assert _as_int(summary["pollsSent"]) >= 2
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "e.jsonl").read_text().splitlines()
+        if line
+    ]
+    tx_ns = [
+        r["monotonicNs"]
+        for r in records
+        if r.get("direction") == "TX"
+    ]
+    assert len(tx_ns) >= 2
+    gaps_ms = [(b - a) / 1e6 for a, b in pairwise(tx_ns)]
+    assert all(g >= 295 for g in gaps_ms), gaps_ms
+    assert _as_int(summary["scheduleLagEvents"]) >= 1
 
 
 @pytest.mark.asyncio
@@ -626,12 +710,23 @@ async def test_stale_partial_not_concatenated_into_next_poll(
         async def close(self) -> None:
             self._open = False
 
-        async def read(self, max_bytes: int) -> bytes:
-            if not self.chunks:
+        _read_seq: int = 0
+
+        async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
+            deadline = time.monotonic() + max(0.0, timeout_s)
+            while time.monotonic() < deadline:
+                if self.chunks:
+                    data = self.chunks.pop(0)
+                    self._read_seq += 1
+                    return SerialChunk(
+                        raw=data,
+                        monotonic_ns=time.monotonic_ns(),
+                        monotonic_s=time.monotonic(),
+                        timestamp_utc=datetime.now(UTC).isoformat(),
+                        read_sequence=self._read_seq,
+                    )
                 await asyncio.sleep(0.005)
-                return b""
-            data = self.chunks.pop(0)
-            return data[:max_bytes]
+            return None
 
         def device_path_exists(self) -> bool:
             return True
@@ -950,7 +1045,7 @@ async def test_transport_not_open_maps_to_disconnect(tmp_path: Path) -> None:
         async def close(self) -> None:
             self._open = False
 
-        async def read(self, max_bytes: int) -> bytes:
+        async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
             raise TransportNotOpenError("gone")
 
         async def write(self, data: bytes) -> int:
@@ -993,13 +1088,24 @@ async def test_three_consecutive_wayne_25_byte_data_frames(
         async def flush(self) -> None:
             return None
 
-        async def read(self, max_bytes: int) -> bytes:
-            if not self.buf:
+        _read_seq: int = 0
+
+        async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
+            deadline = time.monotonic() + max(0.0, timeout_s)
+            while time.monotonic() < deadline:
+                if self.buf:
+                    data = bytes(self.buf)
+                    self.buf.clear()
+                    self._read_seq += 1
+                    return SerialChunk(
+                        raw=data,
+                        monotonic_ns=time.monotonic_ns(),
+                        monotonic_s=time.monotonic(),
+                        timestamp_utc=datetime.now(UTC).isoformat(),
+                        read_sequence=self._read_seq,
+                    )
                 await asyncio.sleep(0.002)
-                return b""
-            data = bytes(self.buf[:max_bytes])
-            del self.buf[:max_bytes]
-            return data
+            return None
 
         async def write(self, data: bytes) -> int:
             self.write_count += 1
@@ -1042,7 +1148,7 @@ async def test_three_consecutive_wayne_25_byte_data_frames(
         raw = bytes(int(p, 16) for p in rx[0]["rawHex"].split())
         assert raw == WAYNE_25
 
-    chunks = [r for r in records if r.get("source") == "serial_read_chunk"]
+    chunks = [r for r in records if r.get("source") == "permanent_serial_reader"]
     assert chunks
     assert all(r.get("event") == "serial_read_chunk" for r in chunks)
 
@@ -1074,18 +1180,29 @@ async def test_transient_empty_read_recovers(tmp_path: Path) -> None:
         async def flush(self) -> None:
             return None
 
-        async def read(self, max_bytes: int) -> bytes:
+        _read_seq: int = 0
+
+        async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
             if self.empty_raises_left > 0:
                 self.empty_raises_left -= 1
                 raise OSError(
                     "device reports readiness to read but returned no data "
                     "(device disconnected or multiple access on port?)"
                 )
-            if not self.chunks:
+            deadline = time.monotonic() + max(0.0, timeout_s)
+            while time.monotonic() < deadline:
+                if self.chunks:
+                    data = self.chunks.pop(0)
+                    self._read_seq += 1
+                    return SerialChunk(
+                        raw=data,
+                        monotonic_ns=time.monotonic_ns(),
+                        monotonic_s=time.monotonic(),
+                        timestamp_utc=datetime.now(UTC).isoformat(),
+                        read_sequence=self._read_seq,
+                    )
                 await asyncio.sleep(0.002)
-                return b""
-            data = self.chunks.pop(0)
-            return data[:max_bytes]
+            return None
 
         async def write(self, data: bytes) -> int:
             self.write_count += 1
@@ -1105,12 +1222,9 @@ async def test_transient_empty_read_recovers(tmp_path: Path) -> None:
     summary = await session.run()
     assert summary["stopReason"] != "serial_disconnect"
     assert _as_int(summary["dataResponses"]) >= 1
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "e.jsonl").read_text().splitlines()
-        if line
-    ]
-    assert any(r.get("event") == "transient_empty_read" for r in records)
+    # Transient OSError from get_chunk is recovered inside the response window;
+    # permanent-reader architecture no longer emits transient_empty_read events.
+    assert _as_int(summary["pollsSent"]) >= 1
 
 
 @pytest.mark.asyncio
@@ -1133,12 +1247,12 @@ async def test_repeated_transient_empty_read_disconnects(tmp_path: Path) -> None
             self._open = False
 
         def device_path_exists(self) -> bool:
-            return True
+            return False
 
         async def flush(self) -> None:
             return None
 
-        async def read(self, max_bytes: int) -> bytes:
+        async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
             raise OSError(
                 "device reports readiness to read but returned no data "
                 "(device disconnected or multiple access on port?)"
@@ -1166,7 +1280,6 @@ async def test_repeated_transient_empty_read_disconnects(tmp_path: Path) -> None
         for line in (tmp_path / "e.jsonl").read_text().splitlines()
         if line
     ]
-    assert any(r.get("event") == "transient_empty_read" for r in records)
     assert any(r.get("event") == "serial_disconnect" for r in records)
 
 

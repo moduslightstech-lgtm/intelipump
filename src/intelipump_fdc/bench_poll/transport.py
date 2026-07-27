@@ -1,4 +1,9 @@
-"""Exclusive serial transport for poll-bench (write allowed only for verified polls)."""
+"""Exclusive serial transport for poll-bench (write allowed only for verified polls).
+
+A permanent reader thread is the only code that calls ``serial.read()``. The
+asyncio poll collector consumes :class:`SerialChunk` objects from that thread's
+queue and never cancels an in-flight UART read.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from intelipump_fdc.bench_poll.serial_reader import PermanentSerialReader, SerialChunk
 from intelipump_fdc.capture.port_guards import (
     PassiveCaptureRefusedError,
     PassiveCaptureRefuseReason,
@@ -19,10 +25,12 @@ from intelipump_fdc.protocol.dart.transport.errors import TransportNotOpenError
 from intelipump_fdc.protocol.dart.transport.serial import (
     SerialParity,
     _parity_constant,
-    read_serial_chunk,
 )
 
 logger = logging.getLogger(__name__)
+
+# Short bounded OS read timeout — not the full poll response window.
+DEFAULT_SERIAL_READ_TIMEOUT_S = 0.015
 
 
 @runtime_checkable
@@ -37,9 +45,9 @@ class BenchByteTransport(Protocol):
 
     async def close(self) -> None: ...
 
-    async def read(self, max_bytes: int) -> bytes: ...
-
     async def write(self, data: bytes) -> int: ...
+
+    async def get_chunk(self, timeout_s: float) -> SerialChunk | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +56,7 @@ class BenchPollSerialConfig:
     baud_rate: int = 9600
     read_chunk_size: int = 256
     open_timeout_s: float = 2.0
-    read_timeout_s: float = 0.05
+    read_timeout_s: float = DEFAULT_SERIAL_READ_TIMEOUT_S
     write_timeout_s: float = 2.0
     requested_path: str | None = None
     apply_tiocexcl: bool = True
@@ -74,9 +82,8 @@ def format_serial_config(snapshot: dict[str, Any]) -> str:
 class BenchPollSerialTransport:
     """pyserial transport with mandatory exclusive open; write is for POLL only.
 
-    Only one reader task may consume the port. In-flight UART bytes from a
-    cancelled ``read`` await are parked and returned on the next ``read`` so
-    ``asyncio.wait_for`` cannot silently drop response bytes.
+    Starts one :class:`PermanentSerialReader` for the session lifetime. Poll
+    collectors must use :meth:`get_chunk` — never call pyserial ``read`` here.
     """
 
     def __init__(self, config: BenchPollSerialConfig) -> None:
@@ -98,8 +105,7 @@ class BenchPollSerialTransport:
         self._ser: object | None = None
         self._open = False
         self.write_count = 0
-        self._rx_park = bytearray()
-        self._read_lock = asyncio.Lock()
+        self._reader: PermanentSerialReader | None = None
 
     @property
     def is_open(self) -> bool:
@@ -108,6 +114,10 @@ class BenchPollSerialTransport:
     @property
     def device(self) -> str:
         return self._config.device
+
+    @property
+    def reader(self) -> PermanentSerialReader | None:
+        return self._reader
 
     def serial_config_snapshot(self) -> dict[str, Any]:
         """Effective pyserial settings for evidence logging."""
@@ -215,42 +225,31 @@ class BenchPollSerialTransport:
                 canonical_path=self._config.device,
             ) from exc
         self._open = True
-        self._rx_park.clear()
+        assert self._ser is not None
+        self._reader = PermanentSerialReader(
+            self._ser,
+            read_chunk_size=self._config.read_chunk_size,
+        )
+        self._reader.start()
 
     async def close(self) -> None:
+        reader = self._reader
+        self._reader = None
+        if reader is not None:
+            await asyncio.to_thread(reader.stop)
         ser = self._ser
         self._open = False
         self._ser = None
-        self._rx_park.clear()
         if ser is not None:
             await asyncio.to_thread(ser.close)  # type: ignore[attr-defined]
 
-    async def read(self, max_bytes: int) -> bytes:
-        if not self.is_open or self._ser is None:
+    async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
+        """Consume one capture-timestamped chunk from the permanent reader."""
+        if not self.is_open or self._reader is None:
             raise TransportNotOpenError("bench poll serial not open")
-        # Single-reader lock: only one task may consume the UART at a time.
-        # Keep the lock until any in-flight worker finishes so wait_for cancel
-        # cannot start a second concurrent pyserial read.
-        async with self._read_lock:
-            if self._rx_park:
-                n = min(max_bytes, len(self._rx_park))
-                out = bytes(self._rx_park[:n])
-                del self._rx_park[:n]
-                return out
-            n = min(max_bytes, self._config.read_chunk_size)
-            loop = asyncio.get_running_loop()
-            fut = loop.run_in_executor(None, read_serial_chunk, self._ser, n)
-            try:
-                return await fut
-            except asyncio.CancelledError:
-                data = await asyncio.shield(fut)
-                if data:
-                    self._rx_park.extend(data)
-                    logger.debug(
-                        "parked %d in-flight serial byte(s) after cancel",
-                        len(data),
-                    )
-                raise
+        reader = self._reader
+        # Do not cancel the underlying UART read — only wait on the queue.
+        return await asyncio.to_thread(reader.get, timeout_s)
 
     async def flush(self) -> None:
         """Flush TX so the POLL is fully on the wire before the response window."""

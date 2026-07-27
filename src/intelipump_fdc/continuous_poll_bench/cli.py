@@ -192,7 +192,7 @@ async def _async_main(args: argparse.Namespace) -> int:
             device=canonical,
             baud_rate=params.baud,
             requested_path=params.port,
-            read_timeout_s=max(0.01, params.response_timeout_ms / 1000.0),
+            read_timeout_s=0.015,
         )
     )
     session = ContinuousPollSession(

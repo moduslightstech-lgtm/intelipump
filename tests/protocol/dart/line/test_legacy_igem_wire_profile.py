@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from intelipump_fdc.bench_poll.cli import build_parser as poll_bench_parser
+from intelipump_fdc.bench_poll.serial_reader import SerialChunk
 from intelipump_fdc.bench_poll.session import PollBenchSession, PollBenchSessionConfig
 from intelipump_fdc.continuous_poll_bench.cli import build_parser as continuous_parser
 from intelipump_fdc.continuous_poll_bench.session import (
@@ -305,11 +308,24 @@ async def test_one_poll_simulator_bench_logical_1(tmp_path: Path) -> None:
         async def close(self) -> None:
             self._open = False
 
-        async def read(self, n: int) -> bytes:
-            if not self.chunks:
-                await asyncio.sleep(0.01)
-                return b""
-            return self.chunks.pop(0)[:n]
+        _read_seq: int = 0
+
+        async def get_chunk(self, timeout_s: float):
+            deadline = time.monotonic() + max(0.0, timeout_s)
+            while time.monotonic() < deadline:
+                if self.chunks:
+                    data = self.chunks.pop(0)
+                    self._read_seq += 1
+                    return SerialChunk(
+                        raw=data,
+                        monotonic_ns=time.monotonic_ns(),
+                        monotonic_s=time.monotonic(),
+                        timestamp_utc=datetime.now(UTC).isoformat(),
+                        read_sequence=self._read_seq,
+                    )
+                await asyncio.sleep(0.005)
+            return None
+
 
         async def write(self, data: bytes) -> int:
             self.write_count += 1
@@ -363,11 +379,24 @@ async def test_one_poll_simulator_bench_logical_2(tmp_path: Path) -> None:
         async def close(self) -> None:
             self._open = False
 
-        async def read(self, n: int) -> bytes:
-            if not self.chunks:
-                await asyncio.sleep(0.01)
-                return b""
-            return self.chunks.pop(0)[:n]
+        _read_seq: int = 0
+
+        async def get_chunk(self, timeout_s: float):
+            deadline = time.monotonic() + max(0.0, timeout_s)
+            while time.monotonic() < deadline:
+                if self.chunks:
+                    data = self.chunks.pop(0)
+                    self._read_seq += 1
+                    return SerialChunk(
+                        raw=data,
+                        monotonic_ns=time.monotonic_ns(),
+                        monotonic_s=time.monotonic(),
+                        timestamp_utc=datetime.now(UTC).isoformat(),
+                        read_sequence=self._read_seq,
+                    )
+                await asyncio.sleep(0.005)
+            return None
+
 
         async def write(self, data: bytes) -> int:
             self.write_count += 1
@@ -429,11 +458,24 @@ async def test_continuous_simulator_polling_both_sides(
         async def close(self) -> None:
             self._open = False
 
-        async def read(self, n: int) -> bytes:
-            if not self.chunks:
+        _read_seq: int = 0
+
+        async def get_chunk(self, timeout_s: float):
+            deadline = time.monotonic() + max(0.0, timeout_s)
+            while time.monotonic() < deadline:
+                if self.chunks:
+                    data = self.chunks.pop(0)
+                    self._read_seq += 1
+                    return SerialChunk(
+                        raw=data,
+                        monotonic_ns=time.monotonic_ns(),
+                        monotonic_s=time.monotonic(),
+                        timestamp_utc=datetime.now(UTC).isoformat(),
+                        read_sequence=self._read_seq,
+                    )
                 await asyncio.sleep(0.005)
-                return b""
-            return self.chunks.pop(0)[:n]
+            return None
+
 
         async def write(self, data: bytes) -> int:
             self.write_count += 1
@@ -492,11 +534,23 @@ def test_evidence_records_logical_and_wire(tmp_path: Path) -> None:
             async def close(self) -> None:
                 self._open = False
 
-            async def read(self, n: int) -> bytes:
-                if not self.chunks:
-                    await asyncio.sleep(0.01)
-                    return b""
-                return self.chunks.pop(0)[:n]
+            _read_seq: int = 0
+
+            async def get_chunk(self, timeout_s: float):
+                deadline = time.monotonic() + max(0.0, timeout_s)
+                while time.monotonic() < deadline:
+                    if self.chunks:
+                        data = self.chunks.pop(0)
+                        self._read_seq += 1
+                        return SerialChunk(
+                            raw=data,
+                            monotonic_ns=time.monotonic_ns(),
+                            monotonic_s=time.monotonic(),
+                            timestamp_utc=datetime.now(UTC).isoformat(),
+                            read_sequence=self._read_seq,
+                        )
+                    await asyncio.sleep(0.005)
+                return None
 
             async def write(self, data: bytes) -> int:
                 self.write_count += 1

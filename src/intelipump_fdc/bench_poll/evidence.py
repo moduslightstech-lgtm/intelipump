@@ -78,6 +78,10 @@ class BenchSessionStats:
     data_responses: int = 0
     control_only_cycles: int = 0
     timeouts: int = 0
+    timeout_no_response: int = 0
+    late_chunks: int = 0
+    stale_chunks: int = 0
+    unowned_frames: int = 0
     crc_errors: int = 0
     protocol_errors: int = 0
     latencies_ms: list[float] = field(default_factory=list)

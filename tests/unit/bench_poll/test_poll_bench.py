@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -25,6 +27,7 @@ from intelipump_fdc.bench_poll.guards import (
     validate_poll_bench_params,
     validate_poll_bench_settings,
 )
+from intelipump_fdc.bench_poll.serial_reader import SerialChunk
 from intelipump_fdc.bench_poll.session import PollBenchSession, PollBenchSessionConfig
 from intelipump_fdc.controller.safety import (
     ControllerSafetyContext,
@@ -96,12 +99,23 @@ class FakeBenchTransport:
     async def close(self) -> None:
         self._open = False
 
-    async def read(self, max_bytes: int) -> bytes:
-        if not self.chunks:
-            await asyncio.sleep(0.01)
-            return b""
-        data = self.chunks.pop(0)
-        return data[:max_bytes]
+    _read_seq: int = 0
+
+    async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() < deadline:
+            if self.chunks:
+                data = self.chunks.pop(0)
+                self._read_seq += 1
+                return SerialChunk(
+                    raw=data,
+                    monotonic_ns=time.monotonic_ns(),
+                    monotonic_s=time.monotonic(),
+                    timestamp_utc=datetime.now(UTC).isoformat(),
+                    read_sequence=self._read_seq,
+                )
+            await asyncio.sleep(0.005)
+        return None
 
     async def flush(self) -> None:
         return None
