@@ -17,9 +17,20 @@ from intelipump_fdc.protocol.dart.line.models import DartLineFrame
 class StatusPreconditionError(RuntimeError):
     """Status preconditions for price dry-run failed."""
 
-    def __init__(self, message: str, *, reasons: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reasons: list[str] | None = None,
+        last_snap: DecodedStatusSnapshot | None = None,
+        last_frame: DartLineFrame | None = None,
+        poll_count: int = 0,
+    ) -> None:
         super().__init__(message)
         self.reasons = reasons or [message]
+        self.last_snap = last_snap
+        self.last_frame = last_frame
+        self.poll_count = poll_count
 
 
 @dataclass

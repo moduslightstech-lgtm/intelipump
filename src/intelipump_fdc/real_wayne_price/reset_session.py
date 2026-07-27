@@ -192,6 +192,15 @@ class ResetWriteSession:
         except (StatusPreconditionError, CD1Error, RealWayneActiveCommandRefusedError) as exc:
             refusal_reasons = list(getattr(exc, "reasons", [str(exc)]))
             state = ResetWriteState.FAULT if transmitted else ResetWriteState.REFUSED
+            last_snap = getattr(exc, "last_snap", None)
+            last_frame = getattr(exc, "last_frame", None)
+            extra_polls = int(getattr(exc, "poll_count", 0) or 0)
+            if extra_polls:
+                poll_writes += extra_polls
+            if last_snap is not None:
+                decoded_after = last_snap.to_report_dict()
+            if last_frame is not None:
+                status_rx_after = last_frame.raw_frame.hex(" ")
             hint = sequence_stale_status_hint(
                 sequence=self.params.sequence,
                 ack_outcome=ack_outcome,

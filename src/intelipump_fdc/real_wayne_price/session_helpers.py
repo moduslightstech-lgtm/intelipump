@@ -107,6 +107,7 @@ async def poll_status_until(
         raise StatusPreconditionError(
             f"{failure_label}: no DATA status response",
             reasons=[f"{failure_label}_no_data", *notes],
+            poll_count=polls,
         )
     raise StatusPreconditionError(
         f"{failure_label}: status not reached "
@@ -116,6 +117,9 @@ async def poll_status_until(
             f"last_dc1={last_snap.dc1_name}/{last_snap.dc1_code}",
             *notes,
         ],
+        last_snap=last_snap,
+        last_frame=last_frame,
+        poll_count=polls,
     )
 
 
@@ -140,7 +144,7 @@ def sequence_stale_status_hint(
     ack_outcome: str,
     refusal_reasons: list[str],
 ) -> str | None:
-    """Hint when L2 ACK'd but DC1 did not change (common duplicate-sequence case)."""
+    """Optional diagnostic when ACK'd but DC1 did not change."""
     if ack_outcome != "ACK_MATCH":
         return None
     joined = " ".join(refusal_reasons)
@@ -148,7 +152,8 @@ def sequence_stale_status_hint(
         return None
     nxt = next_sequence_nibble(sequence)
     return (
-        "ACK_MATCH with unchanged DC1 often means DART L2 treated this DATA "
-        f"frame as a retransmission of sequence {sequence}; retry once with "
-        f"--sequence {nxt} (advance after each accepted active write)"
+        "ACK_MATCH with unchanged DC1: not necessarily a duplicate sequence. "
+        f"If the prior active write already used a lower sequence, try --sequence {nxt} "
+        "once; otherwise check DART alternate flow (nozzle OUT then RESET) and "
+        "confirm the display physically before further TX"
     )

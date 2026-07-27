@@ -167,4 +167,9 @@ Expect DC1 `AUTHORIZED` after verify.
 - Lab ACK timing and display lag may vary by pump firmware.
 - AUTHORIZE enables delivery UI even when motor/valves are isolated — treat as
   live-path enablement for the dispenser controller.
-- If ACK matches but DC1 is unchanged, advance `--sequence` once and retry.
+- If ACK matches but DC1 is unchanged after a fresh sequence, do **not** keep
+  advancing sequence blindly. Lab: seq 0 and seq 1 both ACK'd with DC1 still
+  `FILLING_COMPLETED`. Next documented alternate: nozzle **OUT**, then one
+  RESET with the next unused sequence (typically `--sequence 2`).
+- Confirm the physical display before further TX. Do not AUTHORIZE until
+  DC1 is `RESET`.

@@ -241,6 +241,7 @@ def test_sequence_stale_hint_after_ack() -> None:
     )
     assert hint is not None
     assert "--sequence 1" in hint
+    assert "nozzle OUT" in hint
     assert (
         sequence_stale_status_hint(
             sequence=0,
