@@ -21,7 +21,11 @@ from intelipump_fdc.capture.port_guards import (
     resolve_canonical_device,
     tiocexcl_request,
 )
-from intelipump_fdc.controller.price_safety import assert_real_wayne_poll_only
+from intelipump_fdc.controller.price_safety import (
+    RealWayneActiveCommandRefusedError,
+    assert_real_wayne_write_allowed,
+    is_verified_status_poll,
+)
 from intelipump_fdc.protocol.dart.transport.errors import TransportNotOpenError
 from intelipump_fdc.protocol.dart.transport.serial import (
     SerialParity,
@@ -107,6 +111,33 @@ class BenchPollSerialTransport:
         self._open = False
         self.write_count = 0
         self._reader: PermanentSerialReader | None = None
+        # Single-shot CD5 approval: exact frame bytes, at most one write.
+        self._approved_cd5_frame: bytes | None = None
+        self._cd5_writes_remaining: int = 0
+        self.cd5_write_count: int = 0
+
+    def authorize_single_cd5_write(self, frame: bytes) -> None:
+        """Allow exactly one future write of this exact CD5 DATA frame.
+
+        Does not transmit. Poll-only dry-run paths must never call this.
+        """
+        if not frame:
+            raise RealWayneActiveCommandRefusedError("empty CD5 frame cannot be approved")
+        if is_verified_status_poll(frame):
+            raise RealWayneActiveCommandRefusedError(
+                "status poll cannot be registered as CD5 approval"
+            )
+        # Minimal shape check: DATA control nibble 0x3x, application starts 0x05.
+        if len(frame) < 8 or (frame[1] & 0xF0) != 0x30 or frame[2] != 0x05:
+            raise RealWayneActiveCommandRefusedError(
+                "approved frame is not a CD5 DATA candidate"
+            )
+        self._approved_cd5_frame = bytes(frame)
+        self._cd5_writes_remaining = 1
+
+    def clear_cd5_write_authorization(self) -> None:
+        self._approved_cd5_frame = None
+        self._cd5_writes_remaining = 0
 
     @property
     def is_open(self) -> bool:
@@ -261,8 +292,22 @@ class BenchPollSerialTransport:
     async def write(self, data: bytes) -> int:
         if not self.is_open or self._ser is None:
             raise TransportNotOpenError("bench poll serial not open")
-        # Hard refusal: only verified status polls may reach serial.write().
-        assert_real_wayne_poll_only(data)
+        # Hard refusal: status poll, or one pre-approved CD5 candidate only.
+        assert_real_wayne_write_allowed(
+            data,
+            approved_cd5_frame=self._approved_cd5_frame,
+            cd5_writes_remaining=self._cd5_writes_remaining,
+        )
+        is_cd5 = (
+            self._approved_cd5_frame is not None
+            and data == self._approved_cd5_frame
+            and self._cd5_writes_remaining > 0
+        )
+        if is_cd5:
+            self._cd5_writes_remaining -= 1
+            if self._cd5_writes_remaining <= 0:
+                self._approved_cd5_frame = None
+            self.cd5_write_count += 1
         self.write_count += 1
         written = await asyncio.to_thread(self._ser.write, data)  # type: ignore[attr-defined]
         return int(written or 0)

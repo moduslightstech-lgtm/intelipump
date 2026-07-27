@@ -135,11 +135,138 @@ def validate_price_dry_run_settings(settings: Settings) -> None:
         raise PollBenchRefusedError("command_replay_enabled must be false")
 
 
+@dataclass(frozen=True, slots=True)
+class PriceWriteConfirmations:
+    """All dry-run confirms plus explicit execute-write authorization."""
+
+    owned_lab_pump: bool = False
+    technician_present: bool = False
+    no_product_connected: bool = False
+    motor_isolated: bool = False
+    valves_isolated: bool = False
+    emergency_isolation_ready: bool = False
+    authorization_disabled: bool = False
+    single_write_plan_reviewed: bool = False
+    price_scale_confirmed: bool = False
+    logical_nozzle_mapping_confirmed: bool = False
+    execute_cd5_write: bool = False
+    post_write_status_verification_required: bool = False
+    understand_transmits_to_owned_lab_pump: bool = False
+
+    def missing_flags(self) -> list[str]:
+        mapping = {
+            "owned_lab_pump": "--confirm-owned-lab-pump",
+            "technician_present": "--confirm-technician-present",
+            "no_product_connected": "--confirm-no-product-connected",
+            "motor_isolated": "--confirm-motor-isolated",
+            "valves_isolated": "--confirm-valves-isolated",
+            "emergency_isolation_ready": "--confirm-emergency-isolation-ready",
+            "authorization_disabled": "--confirm-authorization-disabled",
+            "single_write_plan_reviewed": "--confirm-single-write-plan-reviewed",
+            "price_scale_confirmed": "--price-scale-confirmed-by-technician",
+            "logical_nozzle_mapping_confirmed": (
+                "--logical-nozzle-mapping-confirmed-by-technician"
+            ),
+            "execute_cd5_write": "--confirm-execute-cd5-write",
+            "post_write_status_verification_required": (
+                "--confirm-post-write-status-verification-required"
+            ),
+            "understand_transmits_to_owned_lab_pump": (
+                "--i-understand-this-transmits-to-owned-lab-pump"
+            ),
+        }
+        return [flag for attr, flag in mapping.items() if not getattr(self, attr)]
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "ownedLabPump": self.owned_lab_pump,
+            "technicianPresent": self.technician_present,
+            "noProductConnected": self.no_product_connected,
+            "motorIsolated": self.motor_isolated,
+            "valvesIsolated": self.valves_isolated,
+            "emergencyIsolationReady": self.emergency_isolation_ready,
+            "authorizationDisabled": self.authorization_disabled,
+            "singleWritePlanReviewed": self.single_write_plan_reviewed,
+            "priceScaleConfirmed": self.price_scale_confirmed,
+            "logicalNozzleMappingConfirmed": self.logical_nozzle_mapping_confirmed,
+            "executeCd5Write": self.execute_cd5_write,
+            "postWriteStatusVerificationRequired": (
+                self.post_write_status_verification_required
+            ),
+            "understandTransmitsToOwnedLabPump": (
+                self.understand_transmits_to_owned_lab_pump
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PriceWriteParams:
+    port: str
+    address: int
+    logical_nozzle_count: int
+    price_nozzle_1: int
+    price_nozzle_2: int | None
+    evidence_dir: Path
+    confirmations: PriceWriteConfirmations
+    baud: int = 9600
+    response_timeout_ms: int = 250
+    ack_timeout_ms: int = 250
+    sequence: int = 0
+    skip_service_check: bool = False
+    skip_port_check: bool = False
+
+    @property
+    def target_type(self) -> str:
+        return TARGET_OWNED_LAB_WAYNE
+
+    def prices_dict(self) -> dict[int, int]:
+        if self.logical_nozzle_count == 1:
+            return {1: self.price_nozzle_1}
+        if self.logical_nozzle_count == 2:
+            if self.price_nozzle_2 is None:
+                raise PollBenchRefusedError(
+                    "price-nozzle-2 required when logical-nozzle-count=2"
+                )
+            return {1: self.price_nozzle_1, 2: self.price_nozzle_2}
+        raise PollBenchRefusedError(
+            f"unsupported logical-nozzle-count={self.logical_nozzle_count}"
+        )
+
+
+def validate_price_write_params(params: PriceWriteParams) -> None:
+    missing = params.confirmations.missing_flags()
+    if missing:
+        raise PollBenchRefusedError(
+            "missing required confirmations: " + ", ".join(missing)
+        )
+    if params.address not in {1, 2}:
+        raise PollBenchRefusedError("address must be 1 or 2")
+    if params.logical_nozzle_count not in {1, 2}:
+        raise PollBenchRefusedError("logical-nozzle-count must be 1 or 2")
+    if params.logical_nozzle_count == 2 and params.price_nozzle_2 is None:
+        raise PollBenchRefusedError("--price-nozzle-2 required for two nozzles")
+    if params.logical_nozzle_count == 1 and params.price_nozzle_2 is not None:
+        raise PollBenchRefusedError(
+            "--price-nozzle-2 not allowed when logical-nozzle-count=1"
+        )
+    if not 0 <= params.sequence <= 0x0F:
+        raise PollBenchRefusedError("sequence must be 0..15")
+
+
+def validate_price_write_settings(settings: Settings) -> None:
+    # Same LAB safety envelope as dry-run; write still forbids auth flags.
+    validate_price_dry_run_settings(settings)
+
+
 __all__ = [
     "PollBenchRefusedError",
     "PriceDryRunConfirmations",
     "PriceDryRunParams",
+    "PriceWriteConfirmations",
+    "PriceWriteParams",
     "software_commit",
     "validate_price_dry_run_params",
     "validate_price_dry_run_settings",
+    "validate_price_write_params",
+    "validate_price_write_settings",
 ]

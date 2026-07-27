@@ -1,0 +1,209 @@
+"""CLI: intelipump-real-wayne-price-write — single-shot CD5 transmit."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+from intelipump_fdc.bench_poll.guards import (
+    PollBenchConfirmations,
+    PollBenchParams,
+    PollBenchRefusedError,
+    run_poll_bench_preflight,
+)
+from intelipump_fdc.bench_poll.transport import (
+    BenchPollSerialConfig,
+    BenchPollSerialTransport,
+)
+from intelipump_fdc.core.config import get_settings
+from intelipump_fdc.real_wayne_price.guards import (
+    PriceWriteConfirmations,
+    PriceWriteParams,
+    validate_price_write_params,
+    validate_price_write_settings,
+)
+from intelipump_fdc.real_wayne_price.states import PriceWriteState
+from intelipump_fdc.real_wayne_price.write_session import PriceWriteSession
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="intelipump-real-wayne-price-write",
+        description=(
+            "Technician-supervised real-Wayne CD5 price write. "
+            "Polls status, transmits exactly one pre-built CD5 DATA frame, "
+            "waits for ACK hypothesis, then verifies DC1 FILLING_COMPLETE. "
+            "Does not send RESET or AUTHORIZE."
+        ),
+    )
+    p.add_argument("--port", required=True)
+    p.add_argument("--address", type=int, required=True, choices=[1, 2])
+    p.add_argument("--logical-nozzle-count", type=int, required=True, choices=[1, 2])
+    p.add_argument("--price-nozzle-1", type=int, required=True)
+    p.add_argument("--price-nozzle-2", type=int, default=None)
+    p.add_argument("--evidence-dir", required=True)
+    p.add_argument("--baud", type=int, default=9600)
+    p.add_argument("--response-timeout-ms", type=int, default=250)
+    p.add_argument("--ack-timeout-ms", type=int, default=250)
+    p.add_argument("--sequence", type=int, default=0)
+    p.add_argument("--price-scale-confirmed-by-technician", action="store_true")
+    p.add_argument(
+        "--logical-nozzle-mapping-confirmed-by-technician", action="store_true"
+    )
+    p.add_argument("--confirm-owned-lab-pump", action="store_true")
+    p.add_argument("--confirm-technician-present", action="store_true")
+    p.add_argument("--confirm-no-product-connected", action="store_true")
+    p.add_argument("--confirm-motor-isolated", action="store_true")
+    p.add_argument("--confirm-valves-isolated", action="store_true")
+    p.add_argument("--confirm-emergency-isolation-ready", action="store_true")
+    p.add_argument("--confirm-authorization-disabled", action="store_true")
+    p.add_argument("--confirm-single-write-plan-reviewed", action="store_true")
+    p.add_argument("--confirm-execute-cd5-write", action="store_true")
+    p.add_argument(
+        "--confirm-post-write-status-verification-required", action="store_true"
+    )
+    p.add_argument(
+        "--i-understand-this-transmits-to-owned-lab-pump", action="store_true"
+    )
+    p.add_argument("--skip-service-check", action="store_true")
+    p.add_argument("--skip-port-check", action="store_true")
+    p.add_argument("--json", action="store_true")
+    forbidden = {
+        "--raw-hex",
+        "--payload",
+        "--command",
+        "--authorize",
+        "--reset",
+        "--replay",
+        "--send",
+    }
+    for action in p._actions:
+        for opt in action.option_strings or []:
+            if opt in forbidden:
+                raise RuntimeError(f"forbidden option registered: {opt}")
+    return p
+
+
+def _params_from_args(args: argparse.Namespace) -> PriceWriteParams:
+    confirms = PriceWriteConfirmations(
+        owned_lab_pump=bool(args.confirm_owned_lab_pump),
+        technician_present=bool(args.confirm_technician_present),
+        no_product_connected=bool(args.confirm_no_product_connected),
+        motor_isolated=bool(args.confirm_motor_isolated),
+        valves_isolated=bool(args.confirm_valves_isolated),
+        emergency_isolation_ready=bool(args.confirm_emergency_isolation_ready),
+        authorization_disabled=bool(args.confirm_authorization_disabled),
+        single_write_plan_reviewed=bool(args.confirm_single_write_plan_reviewed),
+        price_scale_confirmed=bool(args.price_scale_confirmed_by_technician),
+        logical_nozzle_mapping_confirmed=bool(
+            args.logical_nozzle_mapping_confirmed_by_technician
+        ),
+        execute_cd5_write=bool(args.confirm_execute_cd5_write),
+        post_write_status_verification_required=bool(
+            args.confirm_post_write_status_verification_required
+        ),
+        understand_transmits_to_owned_lab_pump=bool(
+            args.i_understand_this_transmits_to_owned_lab_pump
+        ),
+    )
+    return PriceWriteParams(
+        port=args.port,
+        address=args.address,
+        logical_nozzle_count=args.logical_nozzle_count,
+        price_nozzle_1=args.price_nozzle_1,
+        price_nozzle_2=args.price_nozzle_2,
+        evidence_dir=Path(args.evidence_dir),
+        confirmations=confirms,
+        baud=args.baud,
+        response_timeout_ms=args.response_timeout_ms,
+        ack_timeout_ms=args.ack_timeout_ms,
+        sequence=args.sequence,
+        skip_service_check=bool(args.skip_service_check),
+        skip_port_check=bool(args.skip_port_check),
+    )
+
+
+async def _async_main(argv: list[str] | None) -> int:
+    args = build_parser().parse_args(argv)
+    params = _params_from_args(args)
+    settings = get_settings()
+    try:
+        validate_price_write_params(params)
+        validate_price_write_settings(settings)
+    except PollBenchRefusedError as exc:
+        print(f"PRICE_WRITE_REFUSED: {exc}", file=sys.stderr)
+        return 2
+
+    poll_params = PollBenchParams(
+        port=params.port,
+        address=params.address,
+        baud=params.baud,
+        max_polls=1,
+        response_timeout_ms=params.response_timeout_ms,
+        evidence_dir=params.evidence_dir,
+        confirmations=PollBenchConfirmations(
+            owned_lab_pump=params.confirmations.owned_lab_pump,
+            technician_present=params.confirmations.technician_present,
+            emergency_isolation_ready=params.confirmations.emergency_isolation_ready,
+            no_fuel_test=params.confirmations.no_product_connected,
+            authorization_disabled=params.confirmations.authorization_disabled,
+        ),
+        skip_service_check=params.skip_service_check,
+        skip_port_check=params.skip_port_check,
+    )
+    app_lock = None
+    try:
+        canonical, app_lock = run_poll_bench_preflight(poll_params, settings)
+    except PollBenchRefusedError as exc:
+        print(f"PRICE_WRITE_REFUSED: {exc}", file=sys.stderr)
+        return 2
+
+    transport = BenchPollSerialTransport(
+        BenchPollSerialConfig(
+            device=canonical,
+            baud_rate=params.baud,
+            requested_path=params.port,
+            read_timeout_s=0.015,
+        )
+    )
+    session = PriceWriteSession(transport, params, canonical_port=canonical)
+    try:
+        result = await session.run()
+    finally:
+        if app_lock is not None:
+            app_lock.release()
+
+    if args.json:
+        print(json.dumps(result.summary, indent=2))
+    else:
+        print(f"state: {result.state.value}")
+        print(f"transmitted: {result.transmitted}")
+        print(
+            "serialWriteCalledForCandidate: "
+            f"{result.serial_write_called_for_candidate}"
+        )
+        print(f"cd5PayloadHex: {result.summary.get('cd5PayloadHex')}")
+        print(f"candidateFrameHex: {result.summary.get('candidateFrameHex')}")
+        print(f"ackOutcome: {result.summary.get('ackOutcome')}")
+        print(f"evidence: {result.summary.get('evidence')}")
+        if result.summary.get("warnings"):
+            print(f"warnings: {result.summary['warnings']}")
+        if result.summary.get("refusalReasons"):
+            print(f"refusalReasons: {result.summary['refusalReasons']}")
+
+    if result.state is PriceWriteState.FILLING_COMPLETE_VERIFIED:
+        return 0
+    if result.transmitted:
+        return 1
+    return 2
+
+
+def run(argv: list[str] | None = None) -> int:
+    return asyncio.run(_async_main(argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

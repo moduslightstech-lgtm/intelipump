@@ -191,6 +191,35 @@ def validate_preconditions(
         )
 
 
+def validate_post_write_status(
+    snap: DecodedStatusSnapshot,
+    *,
+    expected_wire_address: int,
+) -> None:
+    """Require DC1 FILLING_COMPLETE after an accepted CD5 price update."""
+    reasons: list[str] = []
+    if not snap.crc_valid:
+        reasons.append("crc_invalid")
+    if snap.wire_address != expected_wire_address:
+        reasons.append(
+            f"address_mismatch got=0x{snap.wire_address:02X} "
+            f"expected=0x{expected_wire_address:02X}"
+        )
+    if snap.dc1_code is None:
+        reasons.append("dc1_missing")
+    elif snap.dc1_code != int(WaynePumpStatus.FILLING_COMPLETED):
+        reasons.append(
+            f"dc1_not_FILLING_COMPLETE got={snap.dc1_name}/{snap.dc1_code}"
+        )
+    if snap.has_dc5_alarm:
+        reasons.append(f"blocking_alarm code={snap.alarm_code}")
+    if reasons:
+        raise StatusPreconditionError(
+            "post-write status verification failed: " + "; ".join(reasons),
+            reasons=reasons,
+        )
+
+
 def _pad_bcd_digits(raw_scaled: object, width: int) -> str | None:
     if raw_scaled is None:
         return None
