@@ -1,0 +1,306 @@
+"""Technician-supervised real-Wayne CD2 + CD1 RESET (single-shot block)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from intelipump_fdc.bench_poll.poll_io import (
+    StatusPollOutcome,
+    send_status_poll_and_read_response,
+)
+from intelipump_fdc.bench_poll.transport import BenchByteTransport
+from intelipump_fdc.controller.price_safety import (
+    ActiveFrameKind,
+    RealWayneActiveCommandRefusedError,
+)
+from intelipump_fdc.protocol.cd2 import CD2Error
+from intelipump_fdc.protocol.cd2_reset import (
+    build_cd2_reset_block,
+    build_cd2_reset_candidate_frame,
+)
+from intelipump_fdc.protocol.dart.application.status import WaynePumpStatus
+from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
+from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
+from intelipump_fdc.real_wayne_price.evidence import (
+    ActiveWriteEvidenceBundle,
+    default_cd2_reset_uncertainties,
+    new_session_id,
+    software_commit,
+    write_active_write_evidence,
+)
+from intelipump_fdc.real_wayne_price.guards import Cd2ResetWriteParams
+from intelipump_fdc.real_wayne_price.session_helpers import (
+    dc1_is,
+    poll_status_until,
+    sequence_stale_status_hint,
+    wait_for_ack_frame,
+)
+from intelipump_fdc.real_wayne_price.states import Cd2ResetWriteState
+from intelipump_fdc.real_wayne_price.status_decode import (
+    StatusPreconditionError,
+    decode_status_frame,
+    validate_cd2_reset_preconditions,
+    validate_post_reset_status,
+)
+
+
+@dataclass
+class Cd2ResetWriteResult:
+    state: Cd2ResetWriteState
+    summary: dict[str, Any]
+    evidence_paths: dict[str, Path]
+    transmitted: bool = False
+    serial_write_called_for_candidate: bool = False
+
+
+class Cd2ResetWriteSession:
+    """Poll FILLING_COMPLETE+OUT → CD2+RESET block → TX once → verify RESET."""
+
+    def __init__(
+        self,
+        transport: BenchByteTransport,
+        params: Cd2ResetWriteParams,
+        *,
+        canonical_port: str | None = None,
+    ) -> None:
+        self.transport = transport
+        self.params = params
+        self.canonical_port = canonical_port or params.port
+        self.logical_address = params.address
+        self.wire_address = encode_wire_address(params.address)
+        self.session_id = new_session_id().replace("price-dry-run", "cd2-reset")
+        self.commit = software_commit()
+
+    async def run(self) -> Cd2ResetWriteResult:
+        refusal_reasons: list[str] = []
+        state = Cd2ResetWriteState.REFUSED
+        decoded_before: dict[str, Any] = {}
+        decoded_after: dict[str, Any] = {}
+        status_tx = build_poll(self.logical_address).hex(" ")
+        status_rx_before = ""
+        status_rx_after = ""
+        payload_hex = ""
+        candidate_hex = ""
+        crc_hex = ""
+        expected_ack = ""
+        ack_rx_hex: list[str] = []
+        ack_outcome = "NOT_ATTEMPTED"
+        serial_cfg: dict[str, Any] = {}
+        transmitted = False
+        serial_write_called = False
+        poll_writes = 0
+        active_writes = 0
+        warnings: list[str] = []
+        allowed = list(self.params.allowed_nozzles)
+
+        try:
+            if not self.transport.is_open:
+                await self.transport.open()
+            snapshot = getattr(self.transport, "serial_config_snapshot", None)
+            if callable(snapshot):
+                serial_cfg = snapshot()
+
+            response = await send_status_poll_and_read_response(
+                self.transport,
+                self.logical_address,
+                self.params.response_timeout_ms,
+            )
+            poll_writes = 1
+            status_tx = response.poll_tx.hex(" ")
+            if response.outcome is not StatusPollOutcome.DATA_RESPONSE:
+                raise StatusPreconditionError(
+                    f"status poll outcome={response.outcome.value}",
+                    reasons=[f"status_outcome_{response.outcome.value}"],
+                )
+            assert response.frame is not None
+            status_rx_before = response.frame.raw_frame.hex(" ")
+            snap = decode_status_frame(
+                response.frame, expected_wire_address=self.wire_address
+            )
+            decoded_before = snap.to_report_dict()
+            validate_cd2_reset_preconditions(
+                snap, expected_wire_address=self.wire_address
+            )
+            state = Cd2ResetWriteState.NOZZLE_OUT
+
+            block = build_cd2_reset_block(allowed)
+            frame, crc, ack = build_cd2_reset_candidate_frame(
+                logical_address=self.logical_address,
+                sequence=self.params.sequence,
+                block=block,
+            )
+            payload_hex = block.payload_hex
+            candidate_hex = frame.hex(" ")
+            crc_hex = f"{crc:04X}"
+            expected_ack = ack.hex(" ")
+            state = Cd2ResetWriteState.CD2_RESET_BLOCK_BUILT
+
+            authorize = getattr(self.transport, "authorize_single_active_write", None)
+            if not callable(authorize):
+                raise StatusPreconditionError(
+                    "transport cannot authorize CD2+RESET",
+                    reasons=["transport_missing_active_authorization"],
+                )
+            authorize(frame, kind=ActiveFrameKind.CD2_AND_CD1_RESET)
+            state = Cd2ResetWriteState.CD2_RESET_AUTHORIZED_FOR_SINGLE_WRITE
+            await self.transport.write(frame)
+            flush = getattr(self.transport, "flush", None)
+            if callable(flush):
+                await flush()
+            transmitted = True
+            serial_write_called = True
+            active_writes = int(getattr(self.transport, "cd2_reset_write_count", 1))
+            state = Cd2ResetWriteState.CD2_RESET_TRANSMITTED
+
+            matched, ack_outcome, ack_rx_hex = await wait_for_ack_frame(
+                self.transport,
+                expected_ack=ack,
+                timeout_ms=self.params.ack_timeout_ms,
+            )
+            if matched:
+                state = Cd2ResetWriteState.ACK_RECEIVED
+            else:
+                state = Cd2ResetWriteState.ACK_TIMEOUT
+                warnings.append(
+                    "ACK not observed within timeout; continuing to status verify"
+                )
+
+            if self.params.confirmations.post_write_status_verification_required:
+                snap_after, frame_after, extra_polls, notes = await poll_status_until(
+                    self.transport,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
+                    response_timeout_ms=self.params.response_timeout_ms,
+                    predicate=dc1_is(WaynePumpStatus.RESET),
+                    settle_ms=self.params.post_write_settle_ms,
+                    max_attempts=self.params.post_write_max_status_polls,
+                    failure_label="post_cd2_reset_RESET",
+                )
+                poll_writes += extra_polls
+                warnings.extend(notes)
+                status_rx_after = frame_after.raw_frame.hex(" ")
+                decoded_after = snap_after.to_report_dict()
+                validate_post_reset_status(
+                    snap_after, expected_wire_address=self.wire_address
+                )
+                state = Cd2ResetWriteState.RESET_VERIFIED
+            else:
+                warnings.append("post-write status verification was not required")
+
+        except (
+            StatusPreconditionError,
+            CD2Error,
+            RealWayneActiveCommandRefusedError,
+        ) as exc:
+            refusal_reasons = list(getattr(exc, "reasons", [str(exc)]))
+            state = (
+                Cd2ResetWriteState.FAULT if transmitted else Cd2ResetWriteState.REFUSED
+            )
+            last_snap = getattr(exc, "last_snap", None)
+            last_frame = getattr(exc, "last_frame", None)
+            extra_polls = int(getattr(exc, "poll_count", 0) or 0)
+            if extra_polls:
+                poll_writes += extra_polls
+            if last_snap is not None:
+                decoded_after = last_snap.to_report_dict()
+            if last_frame is not None:
+                status_rx_after = last_frame.raw_frame.hex(" ")
+            hint = sequence_stale_status_hint(
+                sequence=self.params.sequence,
+                ack_outcome=ack_outcome,
+                refusal_reasons=refusal_reasons,
+            )
+            if hint:
+                warnings.append(hint)
+            clear = getattr(self.transport, "clear_active_write_authorization", None)
+            if callable(clear):
+                clear()
+        except Exception as exc:  # pragma: no cover
+            refusal_reasons = [str(exc)]
+            state = Cd2ResetWriteState.FAULT
+            clear = getattr(self.transport, "clear_active_write_authorization", None)
+            if callable(clear):
+                clear()
+
+        expected_after = {
+            "code": int(WaynePumpStatus.RESET),
+            "name": "RESET",
+            "basis": "DART_DOCUMENTED_STATE_FLOW_CD2_THEN_RESET",
+            "wayneEnum": WaynePumpStatus.RESET.name,
+        }
+        bundle = ActiveWriteEvidenceBundle(
+            session_id=self.session_id,
+            commit=self.commit,
+            target_type=self.params.target_type,
+            command_name="CD2_AND_CD1_RESET",
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
+            serial_config=serial_cfg,
+            status_poll_tx_hex=status_tx,
+            status_response_before_hex=status_rx_before,
+            status_response_after_hex=status_rx_after,
+            decoded_status_before=decoded_before,
+            decoded_status_after=decoded_after,
+            confirmations=self.params.confirmations.to_dict(),
+            candidate_payload_hex=payload_hex,
+            candidate_frame_hex=candidate_hex,
+            crc_hex=crc_hex,
+            sequence=self.params.sequence,
+            expected_ack_hex=expected_ack,
+            ack_outcome=ack_outcome,
+            ack_observed_hex=ack_rx_hex,
+            expected_status_after=expected_after,
+            write_state=state.value,
+            transmitted=transmitted,
+            serial_write_called_for_candidate=serial_write_called,
+            poll_write_count=poll_writes,
+            active_write_count=active_writes,
+            remaining_uncertainties=default_cd2_reset_uncertainties(),
+            refusal_reasons=refusal_reasons,
+            warnings=warnings,
+        )
+        paths = write_active_write_evidence(
+            self.params.evidence_dir, bundle, stem="cd2-reset-write"
+        )
+
+        try:
+            if self.transport.is_open:
+                await self.transport.close()
+        except Exception:
+            pass
+
+        summary = {
+            "sessionId": self.session_id,
+            "command": "CD2_AND_CD1_RESET",
+            "allowedNozzles": allowed,
+            "state": state.value,
+            "transmitted": transmitted,
+            "serialWriteCalledForCandidate": serial_write_called,
+            "activeWriteCount": active_writes,
+            "pollWriteCount": poll_writes,
+            "logicalAddress": self.logical_address,
+            "wireAddress": f"0x{self.wire_address:02X}",
+            "decodedStatusBefore": decoded_before,
+            "decodedStatusAfter": decoded_after,
+            "candidatePayloadHex": payload_hex,
+            "candidateFrameHex": candidate_hex,
+            "crc": crc_hex,
+            "expectedAckHypothesis": expected_ack,
+            "ackOutcome": ack_outcome,
+            "ackObservedHex": ack_rx_hex,
+            "expectedStatusAfter": expected_after,
+            "refusalReasons": refusal_reasons,
+            "warnings": warnings,
+            "evidence": {k: str(v) for k, v in paths.items()},
+            "softwareCommit": self.commit,
+            "targetType": self.params.target_type,
+        }
+        return Cd2ResetWriteResult(
+            state=state,
+            summary=summary,
+            evidence_paths=paths,
+            transmitted=transmitted,
+            serial_write_called_for_candidate=serial_write_called,
+        )

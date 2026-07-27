@@ -173,3 +173,41 @@ Expect DC1 `AUTHORIZED` after verify.
   RESET with the next unused sequence (typically `--sequence 2`).
 - Confirm the physical display before further TX. Do not AUTHORIZE until
   DC1 is `RESET`.
+
+## CD2 + RESET combined block (lab hypothesis)
+
+Lone CD1 RESET ACK'd without DC1 change on this pump (seq 0–3). Next documented
+flow uses **CD2 allowed nozzles then CD1 RESET in one DATA block**. This tool
+**refuses TX unless software sees nozzle OUT**.
+
+```bash
+export INTELIPUMP_CONTROLLER__MODE=LISTEN_ONLY
+
+# Poll first until NOZIO high-nibble is 1 (OUT), then:
+./venv/bin/intelipump-real-wayne-cd2-reset-write \
+  --port /dev/intelipump-controller \
+  --address 1 \
+  --sequence 4 \
+  --allowed-nozzle 1 \
+  --allowed-nozzle 2 \
+  --evidence-dir data/bench/real-wayne/cd2-reset \
+  --logical-nozzle-mapping-confirmed-by-technician \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-no-product-connected \
+  --confirm-motor-isolated \
+  --confirm-valves-isolated \
+  --confirm-emergency-isolation-ready \
+  --confirm-authorization-disabled \
+  --confirm-single-write-plan-reviewed \
+  --confirm-nozzle-out-observed \
+  --confirm-execute-cd2-and-cd1-reset \
+  --confirm-post-write-status-verification-required \
+  --i-understand-this-transmits-to-owned-lab-pump
+```
+
+Example wire (addr 1, seq 4, nozzles 1+2):
+
+```text
+50 34 02 02 01 02 01 01 05 70 ed 03 fa
+```

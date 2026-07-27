@@ -502,11 +502,21 @@ def default_authorize_uncertainties() -> list[str]:
     ]
 
 
+def default_cd2_reset_uncertainties() -> list[str]:
+    return [
+        "Lone CD1 RESET ACK'd without DC1 change on this pump (lab evidence)",
+        "CD2+RESET combined block is a documented flow hypothesis, not yet proven here",
+        "Allowed-nozzle list must match physical/logical mapping confirmed by technician",
+        "Nozzle OUT is required by this tool before TX",
+    ]
+
+
 __all__ = [
     "ActiveWriteEvidenceBundle",
     "DryRunEvidenceBundle",
     "WriteEvidenceBundle",
     "default_authorize_uncertainties",
+    "default_cd2_reset_uncertainties",
     "default_reset_uncertainties",
     "default_uncertainties",
     "default_write_uncertainties",

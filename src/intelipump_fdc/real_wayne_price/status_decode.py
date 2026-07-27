@@ -232,6 +232,31 @@ def validate_reset_preconditions(
     )
 
 
+def validate_cd2_reset_preconditions(
+    snap: DecodedStatusSnapshot,
+    *,
+    expected_wire_address: int,
+) -> None:
+    """Require FILLING_COMPLETE and nozzle OUT before CD2+RESET."""
+    validate_reset_preconditions(
+        snap, expected_wire_address=expected_wire_address
+    )
+    reasons: list[str] = []
+    if snap.nozzle_out is not True:
+        if snap.nozzle_out is False:
+            pos = "IN"
+        elif snap.nozzle_out is True:
+            pos = "OUT"
+        else:
+            pos = "unknown"
+        reasons.append(f"nozzle_not_OUT got={pos}")
+    if reasons:
+        raise StatusPreconditionError(
+            "cd2+reset status preconditions failed: " + "; ".join(reasons),
+            reasons=reasons,
+        )
+
+
 def validate_post_reset_status(
     snap: DecodedStatusSnapshot,
     *,

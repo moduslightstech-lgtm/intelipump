@@ -1,8 +1,8 @@
 """Hard refusal of non-poll frames on real-Wayne serial transports.
 
 Status polls are always allowed. Exactly one pre-approved active DATA frame
-(CD5 price, CD1 RESET, or CD1 AUTHORIZE) may be written when explicitly
-authorized on the transport for a single shot.
+(CD5 price, CD1 RESET, CD1 AUTHORIZE, or CD2+CD1 RESET block) may be written
+when explicitly authorized on the transport for a single shot.
 
 No environment variable may bypass this gate.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from intelipump_fdc.protocol.cd2_reset import is_cd2_reset_application_payload
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
 
@@ -31,23 +32,40 @@ class ActiveFrameKind(StrEnum):
     CD5_PRICE = "CD5_PRICE"
     CD1_RESET = "CD1_RESET"
     CD1_AUTHORIZE = "CD1_AUTHORIZE"
+    CD2_AND_CD1_RESET = "CD2_AND_CD1_RESET"
 
 
 def is_verified_status_poll(frame: bytes) -> bool:
     return frame in {build_poll(1), build_poll(2)}
 
 
+def _application_payload_from_data_frame(frame: bytes) -> bytes | None:
+    """Extract application bytes from a built DATA frame (no DLE in payload).
+
+    Layout: ADR CTRL APP... CRC CRC ETX SF
+    """
+    if len(frame) < 8 or (frame[1] & 0xF0) != 0x30:
+        return None
+    if frame[-1] != 0xFA:
+        return None
+    return frame[2:-4]
+
+
 def classify_active_data_frame(frame: bytes) -> ActiveFrameKind | None:
     """Return kind if frame looks like an allowed active DATA candidate."""
     if len(frame) < 8 or (frame[1] & 0xF0) != 0x30:
         return None
-    # Application starts at index 2: TRANS LNG ...
-    trans = frame[2]
-    lng = frame[3] if len(frame) > 3 else -1
+    app = _application_payload_from_data_frame(frame)
+    if app is None:
+        return None
+    if is_cd2_reset_application_payload(app):
+        return ActiveFrameKind.CD2_AND_CD1_RESET
+    trans = app[0] if app else -1
+    lng = app[1] if len(app) > 1 else -1
     if trans == 0x05 and lng >= 3:
         return ActiveFrameKind.CD5_PRICE
-    if trans == 0x01 and lng == 1 and len(frame) >= 5:
-        dcc = frame[4]
+    if trans == 0x01 and lng == 1 and len(app) >= 3:
+        dcc = app[2]
         if dcc == int(PumpControlCommand.RESET):
             return ActiveFrameKind.CD1_RESET
         if dcc == int(PumpControlCommand.AUTHORIZE):
