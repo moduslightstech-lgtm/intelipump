@@ -1,4 +1,4 @@
-"""CLI: intelipump-real-wayne-price-write — single-shot CD5 transmit."""
+"""CLI: intelipump-real-wayne-reset-write — single-shot CD1 RESET."""
 
 from __future__ import annotations
 
@@ -20,30 +20,27 @@ from intelipump_fdc.bench_poll.transport import (
 )
 from intelipump_fdc.core.config import get_settings
 from intelipump_fdc.real_wayne_price.guards import (
-    PriceWriteConfirmations,
-    PriceWriteParams,
-    validate_price_write_params,
-    validate_price_write_settings,
+    ResetWriteConfirmations,
+    ResetWriteParams,
+    validate_reset_write_params,
+    validate_reset_write_settings,
 )
-from intelipump_fdc.real_wayne_price.states import PriceWriteState
-from intelipump_fdc.real_wayne_price.write_session import PriceWriteSession
+from intelipump_fdc.real_wayne_price.reset_session import ResetWriteSession
+from intelipump_fdc.real_wayne_price.states import ResetWriteState
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="intelipump-real-wayne-price-write",
+        prog="intelipump-real-wayne-reset-write",
         description=(
-            "Technician-supervised real-Wayne CD5 price write. "
-            "Polls status, transmits exactly one pre-built CD5 DATA frame, "
-            "waits for ACK hypothesis, then verifies DC1 FILLING_COMPLETE. "
-            "Does not send RESET or AUTHORIZE."
+            "Technician-supervised real-Wayne CD1 RESET. "
+            "Requires DC1 FILLING_COMPLETE (CLOSED after price), transmits "
+            "exactly one RESET DATA frame, then verifies DC1 RESET. "
+            "Does not send CD5 or AUTHORIZE."
         ),
     )
     p.add_argument("--port", required=True)
     p.add_argument("--address", type=int, required=True, choices=[1, 2])
-    p.add_argument("--logical-nozzle-count", type=int, required=True, choices=[1, 2])
-    p.add_argument("--price-nozzle-1", type=int, required=True)
-    p.add_argument("--price-nozzle-2", type=int, default=None)
     p.add_argument("--evidence-dir", required=True)
     p.add_argument("--baud", type=int, default=9600)
     p.add_argument("--response-timeout-ms", type=int, default=250)
@@ -51,10 +48,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--post-write-settle-ms", type=int, default=400)
     p.add_argument("--post-write-max-status-polls", type=int, default=8)
     p.add_argument("--sequence", type=int, default=0)
-    p.add_argument("--price-scale-confirmed-by-technician", action="store_true")
-    p.add_argument(
-        "--logical-nozzle-mapping-confirmed-by-technician", action="store_true"
-    )
     p.add_argument("--confirm-owned-lab-pump", action="store_true")
     p.add_argument("--confirm-technician-present", action="store_true")
     p.add_argument("--confirm-no-product-connected", action="store_true")
@@ -63,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-emergency-isolation-ready", action="store_true")
     p.add_argument("--confirm-authorization-disabled", action="store_true")
     p.add_argument("--confirm-single-write-plan-reviewed", action="store_true")
-    p.add_argument("--confirm-execute-cd5-write", action="store_true")
+    p.add_argument("--confirm-execute-cd1-reset", action="store_true")
     p.add_argument(
         "--confirm-post-write-status-verification-required", action="store_true"
     )
@@ -78,9 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--payload",
         "--command",
         "--authorize",
-        "--reset",
         "--replay",
         "--send",
+        "--price-nozzle-1",
     }
     for action in p._actions:
         for opt in action.option_strings or []:
@@ -89,8 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _params_from_args(args: argparse.Namespace) -> PriceWriteParams:
-    confirms = PriceWriteConfirmations(
+def _params_from_args(args: argparse.Namespace) -> ResetWriteParams:
+    confirms = ResetWriteConfirmations(
         owned_lab_pump=bool(args.confirm_owned_lab_pump),
         technician_present=bool(args.confirm_technician_present),
         no_product_connected=bool(args.confirm_no_product_connected),
@@ -99,11 +92,7 @@ def _params_from_args(args: argparse.Namespace) -> PriceWriteParams:
         emergency_isolation_ready=bool(args.confirm_emergency_isolation_ready),
         authorization_disabled=bool(args.confirm_authorization_disabled),
         single_write_plan_reviewed=bool(args.confirm_single_write_plan_reviewed),
-        price_scale_confirmed=bool(args.price_scale_confirmed_by_technician),
-        logical_nozzle_mapping_confirmed=bool(
-            args.logical_nozzle_mapping_confirmed_by_technician
-        ),
-        execute_cd5_write=bool(args.confirm_execute_cd5_write),
+        execute_cd1_reset=bool(args.confirm_execute_cd1_reset),
         post_write_status_verification_required=bool(
             args.confirm_post_write_status_verification_required
         ),
@@ -111,12 +100,9 @@ def _params_from_args(args: argparse.Namespace) -> PriceWriteParams:
             args.i_understand_this_transmits_to_owned_lab_pump
         ),
     )
-    return PriceWriteParams(
+    return ResetWriteParams(
         port=args.port,
         address=args.address,
-        logical_nozzle_count=args.logical_nozzle_count,
-        price_nozzle_1=args.price_nozzle_1,
-        price_nozzle_2=args.price_nozzle_2,
         evidence_dir=Path(args.evidence_dir),
         confirmations=confirms,
         baud=args.baud,
@@ -135,10 +121,10 @@ async def _async_main(argv: list[str] | None) -> int:
     params = _params_from_args(args)
     settings = get_settings()
     try:
-        validate_price_write_params(params)
-        validate_price_write_settings(settings)
+        validate_reset_write_params(params)
+        validate_reset_write_settings(settings)
     except PollBenchRefusedError as exc:
-        print(f"PRICE_WRITE_REFUSED: {exc}", file=sys.stderr)
+        print(f"RESET_WRITE_REFUSED: {exc}", file=sys.stderr)
         return 2
 
     poll_params = PollBenchParams(
@@ -166,7 +152,7 @@ async def _async_main(argv: list[str] | None) -> int:
             enforce_poll_only_bench_mode=False,
         )
     except PollBenchRefusedError as exc:
-        print(f"PRICE_WRITE_REFUSED: {exc}", file=sys.stderr)
+        print(f"RESET_WRITE_REFUSED: {exc}", file=sys.stderr)
         return 2
 
     transport = BenchPollSerialTransport(
@@ -177,7 +163,7 @@ async def _async_main(argv: list[str] | None) -> int:
             read_timeout_s=0.015,
         )
     )
-    session = PriceWriteSession(transport, params, canonical_port=canonical)
+    session = ResetWriteSession(transport, params, canonical_port=canonical)
     try:
         result = await session.run()
     finally:
@@ -189,11 +175,6 @@ async def _async_main(argv: list[str] | None) -> int:
     else:
         print(f"state: {result.state.value}")
         print(f"transmitted: {result.transmitted}")
-        print(
-            "serialWriteCalledForCandidate: "
-            f"{result.serial_write_called_for_candidate}"
-        )
-        print(f"cd5PayloadHex: {result.summary.get('cd5PayloadHex')}")
         print(f"candidateFrameHex: {result.summary.get('candidateFrameHex')}")
         print(f"ackOutcome: {result.summary.get('ackOutcome')}")
         print(f"evidence: {result.summary.get('evidence')}")
@@ -202,7 +183,7 @@ async def _async_main(argv: list[str] | None) -> int:
         if result.summary.get("refusalReasons"):
             print(f"refusalReasons: {result.summary['refusalReasons']}")
 
-    if result.state is PriceWriteState.FILLING_COMPLETE_VERIFIED:
+    if result.state is ResetWriteState.RESET_VERIFIED:
         return 0
     if result.transmitted:
         return 1

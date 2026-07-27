@@ -1,7 +1,7 @@
 # Real-Wayne CD5 price programming review
 
-Status: dry-run available; **single-shot write CLI available for owned lab pump
-only** under technician confirmations. RESET/AUTHORIZE remain unavailable.
+Status: dry-run + single-shot CD5 write + single-shot CD1 RESET / AUTHORIZE
+available for owned lab pump only under technician confirmations.
 
 ## Confirmed by DART documentation
 
@@ -14,6 +14,8 @@ only** under technician confirmations. RESET/AUTHORIZE remain unavailable.
 - Price update is separate from RESET and AUTHORIZE
 - Documented expected transition after correct programming + price:
   `PUMP_NOT_PROGRAMMED` → `FILLING_COMPLETE` (status code 5)
+- After `FILLING_COMPLETE` / CLOSED display, CD1 RESET clears to `RESET`
+- CD1 AUTHORIZE (from `RESET`) enables live delivery UI (`AUTHORIZED`)
 
 ## Dry-run (no transmit)
 
@@ -68,16 +70,81 @@ Wire command for this example (sequence 0):
 50 30 05 06 00 11 75 00 11 75 da c7 03 fa
 ```
 
-Safety model:
+Post-write verify retries status polls (default settle 400 ms, up to 8 polls)
+until DC1 is `FILLING_COMPLETE`.
+
+## Clear CLOSED display (single CD1 RESET)
+
+Use after CD5 when the pump shows CLOSED / `FILLING_COMPLETE`:
+
+```bash
+./venv/bin/intelipump-real-wayne-reset-write \
+  --port /dev/intelipump-controller \
+  --address 1 \
+  --evidence-dir data/bench/real-wayne/cd1-reset \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-no-product-connected \
+  --confirm-motor-isolated \
+  --confirm-valves-isolated \
+  --confirm-emergency-isolation-ready \
+  --confirm-authorization-disabled \
+  --confirm-single-write-plan-reviewed \
+  --confirm-execute-cd1-reset \
+  --confirm-post-write-status-verification-required \
+  --i-understand-this-transmits-to-owned-lab-pump
+```
+
+Wire command (address 1, sequence 0):
+
+```text
+50 30 01 01 05 5f 5f 03 fa
+```
+
+Expect DC1 `RESET` after verify.
+
+## Enable live volume/amount UI (single CD1 AUTHORIZE)
+
+High-risk. Only with motor + valves isolated and no product. Requires prior
+RESET. Does not auto-chain from RESET.
+
+```bash
+./venv/bin/intelipump-real-wayne-authorize-write \
+  --port /dev/intelipump-controller \
+  --address 1 \
+  --evidence-dir data/bench/real-wayne/cd1-authorize \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-no-product-connected \
+  --confirm-motor-isolated \
+  --confirm-valves-isolated \
+  --confirm-emergency-isolation-ready \
+  --confirm-single-write-plan-reviewed \
+  --confirm-execute-cd1-authorize \
+  --confirm-post-write-status-verification-required \
+  --i-understand-this-transmits-to-owned-lab-pump \
+  --i-understand-authorize-enables-live-delivery-ui
+```
+
+Wire command (address 1, sequence 0):
+
+```text
+50 30 01 01 06 1f 5e 03 fa
+```
+
+Expect DC1 `AUTHORIZED` after verify.
+
+## Safety model
 
 - Status polls always allowed.
-- CD5 DATA frame allowed only after `authorize_single_cd5_write(exact_frame)` and
-  only once.
-- No raw-hex / replay / RESET / AUTHORIZE path.
-- Evidence records `transmitted` and `cd5WriteCount`.
+- Active DATA frame allowed only after
+  `authorize_single_active_write(exact_frame, kind=...)` and only once.
+- Kinds: `CD5_PRICE`, `CD1_RESET`, `CD1_AUTHORIZE`.
+- No raw-hex / replay / generic send path.
+- Tools do not auto-chain CD5 → RESET → AUTHORIZE.
 
 ## Still unproven / caution
 
-- Exact ACK timing on this pump (tool records ACK match or timeout)
-- Whether other programming transactions are also required
-- Production retry policy (this tool does **not** retry CD5)
+- Lab ACK timing and display lag may vary by pump firmware.
+- AUTHORIZE enables delivery UI even when motor/valves are isolated — treat as
+  live-path enablement for the dispenser controller.

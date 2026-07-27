@@ -334,17 +334,185 @@ def default_write_uncertainties() -> list[str]:
     return [
         *default_uncertainties(),
         "Single CD5 write does not prove full dispenser programming completeness",
-        "RESET and AUTHORIZE remain intentionally unavailable",
+        "CD5 alone does not clear FILLING_COMPLETE/CLOSED display; use RESET",
+        "Live volume/amount UI requires RESET then AUTHORIZE under isolation",
+    ]
+
+
+@dataclass
+class ActiveWriteEvidenceBundle:
+    """Evidence for single-shot CD1 RESET or AUTHORIZE."""
+
+    session_id: str
+    commit: str
+    target_type: str
+    command_name: str
+    logical_address: int
+    wire_address: int
+    serial_config: dict[str, Any]
+    status_poll_tx_hex: str
+    status_response_before_hex: str
+    status_response_after_hex: str
+    decoded_status_before: dict[str, Any]
+    decoded_status_after: dict[str, Any]
+    confirmations: dict[str, bool]
+    candidate_payload_hex: str
+    candidate_frame_hex: str
+    crc_hex: str
+    sequence: int
+    expected_ack_hex: str
+    ack_outcome: str
+    ack_observed_hex: list[str]
+    expected_status_after: dict[str, Any]
+    write_state: str
+    transmitted: bool
+    serial_write_called_for_candidate: bool
+    poll_write_count: int
+    active_write_count: int
+    remaining_uncertainties: list[str]
+    refusal_reasons: list[str]
+    warnings: list[str]
+
+
+def write_active_write_evidence(
+    evidence_dir: Path,
+    bundle: ActiveWriteEvidenceBundle,
+    *,
+    stem: str,
+) -> dict[str, Path]:
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = evidence_dir / f"{stem}.jsonl"
+    md = evidence_dir / f"{stem}.md"
+    review = evidence_dir / f"{stem}-result.json"
+
+    record = {
+        "schemaVersion": 1,
+        "sessionId": bundle.session_id,
+        "timestampUtc": datetime.now(UTC).isoformat(),
+        "softwareCommit": bundle.commit,
+        "targetType": bundle.target_type,
+        "command": bundle.command_name,
+        "candidateOnly": False,
+        "transmitted": bundle.transmitted,
+        "serialWriteCalledForCandidate": bundle.serial_write_called_for_candidate,
+        "pollWriteCount": bundle.poll_write_count,
+        "activeWriteCount": bundle.active_write_count,
+        "logicalAddress": bundle.logical_address,
+        "wireAddress": f"0x{bundle.wire_address:02X}",
+        "serialConfig": bundle.serial_config,
+        "statusPollTxHex": bundle.status_poll_tx_hex,
+        "statusResponseBeforeHex": bundle.status_response_before_hex,
+        "statusResponseAfterHex": bundle.status_response_after_hex,
+        "decodedStatusBefore": bundle.decoded_status_before,
+        "decodedStatusAfter": bundle.decoded_status_after,
+        "confirmations": bundle.confirmations,
+        "candidatePayloadHex": bundle.candidate_payload_hex,
+        "candidateFrameHex": bundle.candidate_frame_hex,
+        "crc": bundle.crc_hex,
+        "sequence": bundle.sequence,
+        "expectedAckHypothesis": bundle.expected_ack_hex,
+        "ackOutcome": bundle.ack_outcome,
+        "ackObservedHex": bundle.ack_observed_hex,
+        "expectedStatusAfter": bundle.expected_status_after,
+        "writeState": bundle.write_state,
+        "remainingUncertainties": bundle.remaining_uncertainties,
+        "refusalReasons": bundle.refusal_reasons,
+        "warnings": bundle.warnings,
+    }
+    jsonl.write_text(json.dumps(record, separators=(",", ":")) + "\n", encoding="utf-8")
+
+    review_obj = {
+        "targetType": bundle.target_type,
+        "command": bundle.command_name,
+        "candidateOnly": False,
+        "transmitted": bundle.transmitted,
+        "serialWriteCalledForCandidate": bundle.serial_write_called_for_candidate,
+        "activeWriteCount": bundle.active_write_count,
+        "wireAddress": f"0x{bundle.wire_address:02X}",
+        "logicalAddress": bundle.logical_address,
+        "statusBefore": {
+            "code": (bundle.decoded_status_before.get("dc1") or {}).get("code"),
+            "name": (bundle.decoded_status_before.get("dc1") or {}).get("name"),
+        },
+        "statusAfter": {
+            "code": (bundle.decoded_status_after.get("dc1") or {}).get("code"),
+            "name": (bundle.decoded_status_after.get("dc1") or {}).get("name"),
+        },
+        "candidatePayloadHex": bundle.candidate_payload_hex,
+        "candidateFrameHex": bundle.candidate_frame_hex,
+        "crc": bundle.crc_hex,
+        "ackOutcome": bundle.ack_outcome,
+        "expectedStatusAfter": bundle.expected_status_after,
+        "motorIsolated": bundle.confirmations.get("motorIsolated", False),
+        "valvesIsolated": bundle.confirmations.get("valvesIsolated", False),
+        "productConnected": not bundle.confirmations.get("noProductConnected", False),
+        "technicianPresent": bundle.confirmations.get("technicianPresent", False),
+        "writeState": bundle.write_state,
+        "softwareCommit": bundle.commit,
+        "warnings": bundle.warnings,
+        "refusalReasons": bundle.refusal_reasons,
+    }
+    review.write_text(json.dumps(review_obj, indent=2) + "\n", encoding="utf-8")
+
+    lines = [
+        f"# Real-Wayne CD1 {bundle.command_name} write",
+        "",
+        f"- Software commit: `{bundle.commit}`",
+        f"- Session: `{bundle.session_id}`",
+        f"- Command: `{bundle.command_name}`",
+        f"- Transmitted: `{bundle.transmitted}`",
+        f"- activeWriteCount: `{bundle.active_write_count}`",
+        f"- Write state: `{bundle.write_state}`",
+        f"- Payload: `{bundle.candidate_payload_hex}`",
+        f"- Candidate frame: `{bundle.candidate_frame_hex}`",
+        f"- ACK outcome: `{bundle.ack_outcome}`",
+        f"- Status before: `{review_obj['statusBefore']}`",
+        f"- Status after: `{review_obj['statusAfter']}`",
+        "",
+        "## Warnings",
+        "",
+    ]
+    for w in bundle.warnings:
+        lines.append(f"- {w}")
+    lines.extend(["", "## Remaining uncertainties", ""])
+    for u in bundle.remaining_uncertainties:
+        lines.append(f"- {u}")
+    if bundle.refusal_reasons:
+        lines.extend(["", "## Refusal / fault reasons", ""])
+        for r in bundle.refusal_reasons:
+            lines.append(f"- {r}")
+    lines.append("")
+    md.write_text("\n".join(lines), encoding="utf-8")
+    return {"jsonl": jsonl, "md": md, "review": review}
+
+
+def default_reset_uncertainties() -> list[str]:
+    return [
+        "Exact ACK timing for CD1 RESET on this pump is lab-specific",
+        "Display clear after RESET may lag status DC1",
+        "RESET does not program prices; prior CD5 must have succeeded",
+    ]
+
+
+def default_authorize_uncertainties() -> list[str]:
+    return [
+        "AUTHORIZE enables delivery UI; motor/valves must stay isolated in lab",
+        "Exact ACK timing for CD1 AUTHORIZE on this pump is lab-specific",
+        "Nozzle lift after AUTHORIZE is not commanded by this tool",
     ]
 
 
 __all__ = [
+    "ActiveWriteEvidenceBundle",
     "DryRunEvidenceBundle",
     "WriteEvidenceBundle",
+    "default_authorize_uncertainties",
+    "default_reset_uncertainties",
     "default_uncertainties",
     "default_write_uncertainties",
     "new_session_id",
     "software_commit",
+    "write_active_write_evidence",
     "write_evidence",
     "write_write_evidence",
 ]

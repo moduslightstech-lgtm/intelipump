@@ -211,6 +211,8 @@ class PriceWriteParams:
     baud: int = 9600
     response_timeout_ms: int = 250
     ack_timeout_ms: int = 250
+    post_write_settle_ms: int = 400
+    post_write_max_status_polls: int = 8
     sequence: int = 0
     skip_service_check: bool = False
     skip_port_check: bool = False
@@ -258,15 +260,210 @@ def validate_price_write_settings(settings: Settings) -> None:
     validate_price_dry_run_settings(settings)
 
 
+@dataclass(frozen=True, slots=True)
+class ResetWriteConfirmations:
+    owned_lab_pump: bool = False
+    technician_present: bool = False
+    no_product_connected: bool = False
+    motor_isolated: bool = False
+    valves_isolated: bool = False
+    emergency_isolation_ready: bool = False
+    authorization_disabled: bool = False
+    single_write_plan_reviewed: bool = False
+    execute_cd1_reset: bool = False
+    post_write_status_verification_required: bool = False
+    understand_transmits_to_owned_lab_pump: bool = False
+
+    def missing_flags(self) -> list[str]:
+        mapping = {
+            "owned_lab_pump": "--confirm-owned-lab-pump",
+            "technician_present": "--confirm-technician-present",
+            "no_product_connected": "--confirm-no-product-connected",
+            "motor_isolated": "--confirm-motor-isolated",
+            "valves_isolated": "--confirm-valves-isolated",
+            "emergency_isolation_ready": "--confirm-emergency-isolation-ready",
+            "authorization_disabled": "--confirm-authorization-disabled",
+            "single_write_plan_reviewed": "--confirm-single-write-plan-reviewed",
+            "execute_cd1_reset": "--confirm-execute-cd1-reset",
+            "post_write_status_verification_required": (
+                "--confirm-post-write-status-verification-required"
+            ),
+            "understand_transmits_to_owned_lab_pump": (
+                "--i-understand-this-transmits-to-owned-lab-pump"
+            ),
+        }
+        return [flag for attr, flag in mapping.items() if not getattr(self, attr)]
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "ownedLabPump": self.owned_lab_pump,
+            "technicianPresent": self.technician_present,
+            "noProductConnected": self.no_product_connected,
+            "motorIsolated": self.motor_isolated,
+            "valvesIsolated": self.valves_isolated,
+            "emergencyIsolationReady": self.emergency_isolation_ready,
+            "authorizationDisabled": self.authorization_disabled,
+            "singleWritePlanReviewed": self.single_write_plan_reviewed,
+            "executeCd1Reset": self.execute_cd1_reset,
+            "postWriteStatusVerificationRequired": (
+                self.post_write_status_verification_required
+            ),
+            "understandTransmitsToOwnedLabPump": (
+                self.understand_transmits_to_owned_lab_pump
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResetWriteParams:
+    port: str
+    address: int
+    evidence_dir: Path
+    confirmations: ResetWriteConfirmations
+    baud: int = 9600
+    response_timeout_ms: int = 250
+    ack_timeout_ms: int = 250
+    post_write_settle_ms: int = 400
+    post_write_max_status_polls: int = 8
+    sequence: int = 0
+    skip_service_check: bool = False
+    skip_port_check: bool = False
+
+    @property
+    def target_type(self) -> str:
+        return TARGET_OWNED_LAB_WAYNE
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizeWriteConfirmations:
+    """AUTHORIZE is high-risk; isolation flags are mandatory."""
+
+    owned_lab_pump: bool = False
+    technician_present: bool = False
+    no_product_connected: bool = False
+    motor_isolated: bool = False
+    valves_isolated: bool = False
+    emergency_isolation_ready: bool = False
+    single_write_plan_reviewed: bool = False
+    execute_cd1_authorize: bool = False
+    post_write_status_verification_required: bool = False
+    understand_transmits_to_owned_lab_pump: bool = False
+    understand_authorize_enables_live_delivery_ui: bool = False
+
+    def missing_flags(self) -> list[str]:
+        mapping = {
+            "owned_lab_pump": "--confirm-owned-lab-pump",
+            "technician_present": "--confirm-technician-present",
+            "no_product_connected": "--confirm-no-product-connected",
+            "motor_isolated": "--confirm-motor-isolated",
+            "valves_isolated": "--confirm-valves-isolated",
+            "emergency_isolation_ready": "--confirm-emergency-isolation-ready",
+            "single_write_plan_reviewed": "--confirm-single-write-plan-reviewed",
+            "execute_cd1_authorize": "--confirm-execute-cd1-authorize",
+            "post_write_status_verification_required": (
+                "--confirm-post-write-status-verification-required"
+            ),
+            "understand_transmits_to_owned_lab_pump": (
+                "--i-understand-this-transmits-to-owned-lab-pump"
+            ),
+            "understand_authorize_enables_live_delivery_ui": (
+                "--i-understand-authorize-enables-live-delivery-ui"
+            ),
+        }
+        return [flag for attr, flag in mapping.items() if not getattr(self, attr)]
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "ownedLabPump": self.owned_lab_pump,
+            "technicianPresent": self.technician_present,
+            "noProductConnected": self.no_product_connected,
+            "motorIsolated": self.motor_isolated,
+            "valvesIsolated": self.valves_isolated,
+            "emergencyIsolationReady": self.emergency_isolation_ready,
+            "singleWritePlanReviewed": self.single_write_plan_reviewed,
+            "executeCd1Authorize": self.execute_cd1_authorize,
+            "postWriteStatusVerificationRequired": (
+                self.post_write_status_verification_required
+            ),
+            "understandTransmitsToOwnedLabPump": (
+                self.understand_transmits_to_owned_lab_pump
+            ),
+            "understandAuthorizeEnablesLiveDeliveryUi": (
+                self.understand_authorize_enables_live_delivery_ui
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizeWriteParams:
+    port: str
+    address: int
+    evidence_dir: Path
+    confirmations: AuthorizeWriteConfirmations
+    baud: int = 9600
+    response_timeout_ms: int = 250
+    ack_timeout_ms: int = 250
+    post_write_settle_ms: int = 400
+    post_write_max_status_polls: int = 8
+    sequence: int = 0
+    skip_service_check: bool = False
+    skip_port_check: bool = False
+
+    @property
+    def target_type(self) -> str:
+        return TARGET_OWNED_LAB_WAYNE
+
+
+def validate_reset_write_params(params: ResetWriteParams) -> None:
+    missing = params.confirmations.missing_flags()
+    if missing:
+        raise PollBenchRefusedError(
+            "missing required confirmations: " + ", ".join(missing)
+        )
+    if params.address not in {1, 2}:
+        raise PollBenchRefusedError("address must be 1 or 2")
+    if not 0 <= params.sequence <= 0x0F:
+        raise PollBenchRefusedError("sequence must be 0..15")
+
+
+def validate_authorize_write_params(params: AuthorizeWriteParams) -> None:
+    missing = params.confirmations.missing_flags()
+    if missing:
+        raise PollBenchRefusedError(
+            "missing required confirmations: " + ", ".join(missing)
+        )
+    if params.address not in {1, 2}:
+        raise PollBenchRefusedError("address must be 1 or 2")
+    if not 0 <= params.sequence <= 0x0F:
+        raise PollBenchRefusedError("sequence must be 0..15")
+
+
+def validate_reset_write_settings(settings: Settings) -> None:
+    validate_price_dry_run_settings(settings)
+
+
+def validate_authorize_write_settings(settings: Settings) -> None:
+    # Same LAB envelope; automatic/remote authorization flags must stay off.
+    validate_price_dry_run_settings(settings)
+
+
 __all__ = [
+    "AuthorizeWriteConfirmations",
+    "AuthorizeWriteParams",
     "PollBenchRefusedError",
     "PriceDryRunConfirmations",
     "PriceDryRunParams",
     "PriceWriteConfirmations",
     "PriceWriteParams",
+    "ResetWriteConfirmations",
+    "ResetWriteParams",
     "software_commit",
+    "validate_authorize_write_params",
+    "validate_authorize_write_settings",
     "validate_price_dry_run_params",
     "validate_price_dry_run_settings",
     "validate_price_write_params",
     "validate_price_write_settings",
+    "validate_reset_write_params",
+    "validate_reset_write_settings",
 ]

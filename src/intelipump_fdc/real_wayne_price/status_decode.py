@@ -197,6 +197,83 @@ def validate_post_write_status(
     expected_wire_address: int,
 ) -> None:
     """Require DC1 FILLING_COMPLETE after an accepted CD5 price update."""
+    _validate_dc1_status(
+        snap,
+        expected_wire_address=expected_wire_address,
+        expected=WaynePumpStatus.FILLING_COMPLETED,
+        label="post-write status verification",
+        expected_name="FILLING_COMPLETE",
+    )
+
+
+def validate_reset_preconditions(
+    snap: DecodedStatusSnapshot,
+    *,
+    expected_wire_address: int,
+) -> None:
+    """Require FILLING_COMPLETE before CD1 RESET (clear CLOSED display)."""
+    _validate_dc1_status(
+        snap,
+        expected_wire_address=expected_wire_address,
+        expected=WaynePumpStatus.FILLING_COMPLETED,
+        label="reset status preconditions",
+        expected_name="FILLING_COMPLETE",
+    )
+
+
+def validate_post_reset_status(
+    snap: DecodedStatusSnapshot,
+    *,
+    expected_wire_address: int,
+) -> None:
+    """Require DC1 RESET after accepted CD1 RESET."""
+    _validate_dc1_status(
+        snap,
+        expected_wire_address=expected_wire_address,
+        expected=WaynePumpStatus.RESET,
+        label="post-reset status verification",
+        expected_name="RESET",
+    )
+
+
+def validate_authorize_preconditions(
+    snap: DecodedStatusSnapshot,
+    *,
+    expected_wire_address: int,
+) -> None:
+    """Require RESET before CD1 AUTHORIZE (live volume/amount path)."""
+    _validate_dc1_status(
+        snap,
+        expected_wire_address=expected_wire_address,
+        expected=WaynePumpStatus.RESET,
+        label="authorize status preconditions",
+        expected_name="RESET",
+    )
+
+
+def validate_post_authorize_status(
+    snap: DecodedStatusSnapshot,
+    *,
+    expected_wire_address: int,
+) -> None:
+    """Require DC1 AUTHORIZED after accepted CD1 AUTHORIZE."""
+    _validate_dc1_status(
+        snap,
+        expected_wire_address=expected_wire_address,
+        expected=WaynePumpStatus.AUTHORIZED,
+        label="post-authorize status verification",
+        expected_name="AUTHORIZED",
+    )
+
+
+def _validate_dc1_status(
+    snap: DecodedStatusSnapshot,
+    *,
+    expected_wire_address: int,
+    expected: WaynePumpStatus,
+    label: str,
+    expected_name: str,
+) -> None:
     reasons: list[str] = []
     if not snap.crc_valid:
         reasons.append("crc_invalid")
@@ -207,15 +284,15 @@ def validate_post_write_status(
         )
     if snap.dc1_code is None:
         reasons.append("dc1_missing")
-    elif snap.dc1_code != int(WaynePumpStatus.FILLING_COMPLETED):
+    elif snap.dc1_code != int(expected):
         reasons.append(
-            f"dc1_not_FILLING_COMPLETE got={snap.dc1_name}/{snap.dc1_code}"
+            f"dc1_not_{expected_name} got={snap.dc1_name}/{snap.dc1_code}"
         )
     if snap.has_dc5_alarm:
         reasons.append(f"blocking_alarm code={snap.alarm_code}")
     if reasons:
         raise StatusPreconditionError(
-            "post-write status verification failed: " + "; ".join(reasons),
+            f"{label} failed: " + "; ".join(reasons),
             reasons=reasons,
         )
 

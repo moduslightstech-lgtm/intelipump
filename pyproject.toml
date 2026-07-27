@@ -44,6 +44,8 @@ intelipump-poll-bench = "intelipump_fdc.bench_poll.cli:run"
 intelipump-continuous-poll-bench = "intelipump_fdc.continuous_poll_bench.cli:run"
 intelipump-real-wayne-price-dry-run = "intelipump_fdc.real_wayne_price.cli:run"
 intelipump-real-wayne-price-write = "intelipump_fdc.real_wayne_price.write_cli:run"
+intelipump-real-wayne-reset-write = "intelipump_fdc.real_wayne_price.reset_cli:run"
+intelipump-real-wayne-authorize-write = "intelipump_fdc.real_wayne_price.authorize_cli:run"
 
 [build-system]
 requires = ["hatchling"]

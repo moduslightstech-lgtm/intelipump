@@ -1,4 +1,4 @@
-"""Technician-supervised real-Wayne CD5 price write (single-shot)."""
+"""Technician-supervised real-Wayne CD1 RESET (single-shot)."""
 
 from __future__ import annotations
 
@@ -11,53 +11,57 @@ from intelipump_fdc.bench_poll.poll_io import (
     send_status_poll_and_read_response,
 )
 from intelipump_fdc.bench_poll.transport import BenchByteTransport
-from intelipump_fdc.controller.price_safety import RealWayneActiveCommandRefusedError
-from intelipump_fdc.protocol.cd5 import (
-    CD5Error,
-    build_cd5_candidate_frame,
-    build_cd5_price_update,
+from intelipump_fdc.controller.price_safety import (
+    ActiveFrameKind,
+    RealWayneActiveCommandRefusedError,
 )
+from intelipump_fdc.protocol.cd1 import (
+    CD1Error,
+    build_cd1_candidate_frame,
+    build_cd1_command,
+)
+from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.application.status import WaynePumpStatus
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
 from intelipump_fdc.real_wayne_price.evidence import (
-    WriteEvidenceBundle,
-    default_write_uncertainties,
+    ActiveWriteEvidenceBundle,
+    default_reset_uncertainties,
     new_session_id,
     software_commit,
-    write_write_evidence,
+    write_active_write_evidence,
 )
-from intelipump_fdc.real_wayne_price.guards import PriceWriteParams
+from intelipump_fdc.real_wayne_price.guards import ResetWriteParams
 from intelipump_fdc.real_wayne_price.session_helpers import (
     dc1_is,
     poll_status_until,
     wait_for_ack_frame,
 )
-from intelipump_fdc.real_wayne_price.states import PriceWriteState
+from intelipump_fdc.real_wayne_price.states import ResetWriteState
 from intelipump_fdc.real_wayne_price.status_decode import (
     StatusPreconditionError,
     decode_status_frame,
-    validate_post_write_status,
-    validate_preconditions,
+    validate_post_reset_status,
+    validate_reset_preconditions,
 )
 
 
 @dataclass
-class PriceWriteResult:
-    state: PriceWriteState
+class ResetWriteResult:
+    state: ResetWriteState
     summary: dict[str, Any]
     evidence_paths: dict[str, Path]
     transmitted: bool = False
     serial_write_called_for_candidate: bool = False
 
 
-class PriceWriteSession:
-    """Poll → build CD5 → authorize one write → TX → ACK → verify status."""
+class ResetWriteSession:
+    """Poll FILLING_COMPLETE → build CD1 RESET → authorize → TX → ACK → verify RESET."""
 
     def __init__(
         self,
         transport: BenchByteTransport,
-        params: PriceWriteParams,
+        params: ResetWriteParams,
         *,
         canonical_port: str | None = None,
     ) -> None:
@@ -66,30 +70,28 @@ class PriceWriteSession:
         self.canonical_port = canonical_port or params.port
         self.logical_address = params.address
         self.wire_address = encode_wire_address(params.address)
-        self.session_id = new_session_id().replace("dry-run", "price-write")
+        self.session_id = new_session_id().replace("price-dry-run", "cd1-reset")
         self.commit = software_commit()
 
-    async def run(self) -> PriceWriteResult:
+    async def run(self) -> ResetWriteResult:
         refusal_reasons: list[str] = []
-        state = PriceWriteState.REFUSED
+        state = ResetWriteState.REFUSED
         decoded_before: dict[str, Any] = {}
         decoded_after: dict[str, Any] = {}
         status_tx = build_poll(self.logical_address).hex(" ")
         status_rx_before = ""
         status_rx_after = ""
-        cd5_payload = ""
+        payload_hex = ""
         candidate_hex = ""
         crc_hex = ""
         expected_ack = ""
         ack_rx_hex: list[str] = []
         ack_outcome = "NOT_ATTEMPTED"
-        prices_report: list[dict[str, Any]] = []
-        cd5_breakdown: dict[str, Any] = {}
         serial_cfg: dict[str, Any] = {}
         transmitted = False
         serial_write_called = False
         poll_writes = 0
-        cd5_writes = 0
+        active_writes = 0
         warnings: list[str] = []
 
         try:
@@ -117,66 +119,39 @@ class PriceWriteSession:
                 response.frame, expected_wire_address=self.wire_address
             )
             decoded_before = snap.to_report_dict()
-            validate_preconditions(
-                snap,
-                expected_wire_address=self.wire_address,
-                authorization_disabled=self.params.confirmations.authorization_disabled,
+            validate_reset_preconditions(
+                snap, expected_wire_address=self.wire_address
             )
-            state = PriceWriteState.PUMP_NOT_PROGRAMMED
+            state = ResetWriteState.FILLING_COMPLETE
 
-            cd5 = build_cd5_price_update(
-                self.params.prices_dict(),
-                logical_nozzle_count=self.params.logical_nozzle_count,
-                logical_nozzle_mapping_confirmed=(
-                    self.params.confirmations.logical_nozzle_mapping_confirmed
-                ),
-                price_scale_confirmed=self.params.confirmations.price_scale_confirmed,
-            )
-            frame, crc, ack = build_cd5_candidate_frame(
+            cd1 = build_cd1_command(PumpControlCommand.RESET)
+            frame, crc, ack = build_cd1_candidate_frame(
                 logical_address=self.logical_address,
                 sequence=self.params.sequence,
-                cd5=cd5,
+                cd1=cd1,
             )
-            cd5_payload = cd5.payload_hex
+            payload_hex = cd1.payload_hex
             candidate_hex = frame.hex(" ")
             crc_hex = f"{crc:04X}"
             expected_ack = ack.hex(" ")
-            prices_report = [
-                {
-                    "logicalNozzle": p.logical_nozzle,
-                    "input": p.input_price,
-                    "packedBcd": p.packed_bcd_hex,
-                }
-                for p in cd5.prices
-            ]
-            cd5_breakdown = {
-                "transactionType": f"0x{cd5.transaction_type:02X}",
-                "payloadLength": cd5.payload_length,
-                "lngHex": f"0x{cd5.payload_length:02X}",
-                "pri1": prices_report[0] if prices_report else None,
-                "pri2": prices_report[1] if len(prices_report) > 1 else None,
-                "applicationPayloadHex": cd5_payload,
-                "sourceReference": cd5.source_reference,
-                "confidence": cd5.confidence,
-            }
-            state = PriceWriteState.PRICE_BLOCK_BUILT
+            state = ResetWriteState.RESET_BLOCK_BUILT
 
-            authorize = getattr(self.transport, "authorize_single_cd5_write", None)
+            authorize = getattr(self.transport, "authorize_single_active_write", None)
             if not callable(authorize):
                 raise StatusPreconditionError(
-                    "transport cannot authorize CD5 write",
-                    reasons=["transport_missing_cd5_authorization"],
+                    "transport cannot authorize CD1 RESET",
+                    reasons=["transport_missing_active_authorization"],
                 )
-            authorize(frame)
-            state = PriceWriteState.CD5_AUTHORIZED_FOR_SINGLE_WRITE
+            authorize(frame, kind=ActiveFrameKind.CD1_RESET)
+            state = ResetWriteState.RESET_AUTHORIZED_FOR_SINGLE_WRITE
             await self.transport.write(frame)
             flush = getattr(self.transport, "flush", None)
             if callable(flush):
                 await flush()
             transmitted = True
             serial_write_called = True
-            cd5_writes = int(getattr(self.transport, "cd5_write_count", 1))
-            state = PriceWriteState.CD5_TRANSMITTED
+            active_writes = int(getattr(self.transport, "cd1_reset_write_count", 1))
+            state = ResetWriteState.RESET_TRANSMITTED
 
             matched, ack_outcome, ack_rx_hex = await wait_for_ack_frame(
                 self.transport,
@@ -184,9 +159,9 @@ class PriceWriteSession:
                 timeout_ms=self.params.ack_timeout_ms,
             )
             if matched:
-                state = PriceWriteState.ACK_RECEIVED
+                state = ResetWriteState.ACK_RECEIVED
             else:
-                state = PriceWriteState.ACK_TIMEOUT
+                state = ResetWriteState.ACK_TIMEOUT
                 warnings.append(
                     "ACK not observed within timeout; continuing to status verify"
                 )
@@ -197,47 +172,46 @@ class PriceWriteSession:
                     logical_address=self.logical_address,
                     wire_address=self.wire_address,
                     response_timeout_ms=self.params.response_timeout_ms,
-                    predicate=dc1_is(WaynePumpStatus.FILLING_COMPLETED),
+                    predicate=dc1_is(WaynePumpStatus.RESET),
                     settle_ms=self.params.post_write_settle_ms,
                     max_attempts=self.params.post_write_max_status_polls,
-                    failure_label="post_cd5_FILLING_COMPLETE",
+                    failure_label="post_reset_RESET",
                 )
                 poll_writes += extra_polls
                 warnings.extend(notes)
                 status_rx_after = frame_after.raw_frame.hex(" ")
                 decoded_after = snap_after.to_report_dict()
-                validate_post_write_status(
+                validate_post_reset_status(
                     snap_after, expected_wire_address=self.wire_address
                 )
-                state = PriceWriteState.FILLING_COMPLETE_VERIFIED
+                state = ResetWriteState.RESET_VERIFIED
             else:
                 warnings.append("post-write status verification was not required")
 
-        except (StatusPreconditionError, CD5Error, RealWayneActiveCommandRefusedError) as exc:
+        except (StatusPreconditionError, CD1Error, RealWayneActiveCommandRefusedError) as exc:
             refusal_reasons = list(getattr(exc, "reasons", [str(exc)]))
-            state = (
-                PriceWriteState.FAULT if transmitted else PriceWriteState.REFUSED
-            )
-            clear = getattr(self.transport, "clear_cd5_write_authorization", None)
+            state = ResetWriteState.FAULT if transmitted else ResetWriteState.REFUSED
+            clear = getattr(self.transport, "clear_active_write_authorization", None)
             if callable(clear):
                 clear()
         except Exception as exc:  # pragma: no cover
             refusal_reasons = [str(exc)]
-            state = PriceWriteState.FAULT
-            clear = getattr(self.transport, "clear_cd5_write_authorization", None)
+            state = ResetWriteState.FAULT
+            clear = getattr(self.transport, "clear_active_write_authorization", None)
             if callable(clear):
                 clear()
 
         expected_after = {
-            "code": int(WaynePumpStatus.FILLING_COMPLETED),
-            "name": "FILLING_COMPLETE",
+            "code": int(WaynePumpStatus.RESET),
+            "name": "RESET",
             "basis": "DART_DOCUMENTED_STATE_FLOW",
-            "wayneEnum": WaynePumpStatus.FILLING_COMPLETED.name,
+            "wayneEnum": WaynePumpStatus.RESET.name,
         }
-        bundle = WriteEvidenceBundle(
+        bundle = ActiveWriteEvidenceBundle(
             session_id=self.session_id,
             commit=self.commit,
             target_type=self.params.target_type,
+            command_name="RESET",
             logical_address=self.logical_address,
             wire_address=self.wire_address,
             serial_config=serial_cfg,
@@ -247,10 +221,7 @@ class PriceWriteSession:
             decoded_status_before=decoded_before,
             decoded_status_after=decoded_after,
             confirmations=self.params.confirmations.to_dict(),
-            logical_nozzle_count=self.params.logical_nozzle_count,
-            prices=prices_report,
-            cd5_payload_hex=cd5_payload,
-            cd5_breakdown=cd5_breakdown,
+            candidate_payload_hex=payload_hex,
             candidate_frame_hex=candidate_hex,
             crc_hex=crc_hex,
             sequence=self.params.sequence,
@@ -262,12 +233,14 @@ class PriceWriteSession:
             transmitted=transmitted,
             serial_write_called_for_candidate=serial_write_called,
             poll_write_count=poll_writes,
-            cd5_write_count=cd5_writes,
-            remaining_uncertainties=default_write_uncertainties(),
+            active_write_count=active_writes,
+            remaining_uncertainties=default_reset_uncertainties(),
             refusal_reasons=refusal_reasons,
             warnings=warnings,
         )
-        paths = write_write_evidence(self.params.evidence_dir, bundle)
+        paths = write_active_write_evidence(
+            self.params.evidence_dir, bundle, stem="cd1-reset-write"
+        )
 
         try:
             if self.transport.is_open:
@@ -277,32 +250,30 @@ class PriceWriteSession:
 
         summary = {
             "sessionId": self.session_id,
+            "command": "RESET",
             "state": state.value,
             "transmitted": transmitted,
             "serialWriteCalledForCandidate": serial_write_called,
-            "cd5WriteCount": cd5_writes,
+            "activeWriteCount": active_writes,
             "pollWriteCount": poll_writes,
             "logicalAddress": self.logical_address,
             "wireAddress": f"0x{self.wire_address:02X}",
             "decodedStatusBefore": decoded_before,
             "decodedStatusAfter": decoded_after,
-            "cd5PayloadHex": cd5_payload,
+            "candidatePayloadHex": payload_hex,
             "candidateFrameHex": candidate_hex,
             "crc": crc_hex,
             "expectedAckHypothesis": expected_ack,
             "ackOutcome": ack_outcome,
             "ackObservedHex": ack_rx_hex,
-            "expectedStatusAfterValidPrice": expected_after,
-            "prices": prices_report,
+            "expectedStatusAfter": expected_after,
             "refusalReasons": refusal_reasons,
             "warnings": warnings,
             "evidence": {k: str(v) for k, v in paths.items()},
             "softwareCommit": self.commit,
             "targetType": self.params.target_type,
-            "authorizationIncluded": False,
-            "resetIncluded": False,
         }
-        return PriceWriteResult(
+        return ResetWriteResult(
             state=state,
             summary=summary,
             evidence_paths=paths,

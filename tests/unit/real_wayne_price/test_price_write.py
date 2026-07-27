@@ -13,15 +13,22 @@ import pytest
 from intelipump_fdc.bench_poll.guards import PollBenchRefusedError
 from intelipump_fdc.bench_poll.serial_reader import SerialChunk
 from intelipump_fdc.controller.price_safety import (
+    ActiveFrameKind,
     RealWayneActiveCommandRefusedError,
     assert_real_wayne_poll_only,
     assert_real_wayne_write_allowed,
+    classify_active_data_frame,
     is_verified_status_poll,
+)
+from intelipump_fdc.protocol.cd1 import (
+    build_cd1_candidate_frame,
+    build_cd1_command,
 )
 from intelipump_fdc.protocol.cd5 import (
     build_cd5_candidate_frame,
     build_cd5_price_update,
 )
+from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.line.frame_builder import build_data_frame, build_poll
 from intelipump_fdc.real_wayne_price.guards import (
     PriceWriteConfirmations,
@@ -58,13 +65,17 @@ class FakeWriteTransport:
     written: list[bytes] = field(default_factory=list)
     write_count: int = 0
     cd5_write_count: int = 0
+    active_write_count: int = 0
     _open: bool = False
     _chunks: list[bytes] = field(default_factory=list)
     _seq: int = 0
-    _approved_cd5_frame: bytes | None = None
-    _cd5_writes_remaining: int = 0
+    _approved_active_frame: bytes | None = None
+    _active_writes_remaining: int = 0
+    _approved_kind: ActiveFrameKind | None = None
     _poll_n: int = 0
     expected_ack: bytes = bytes.fromhex("50 c0 fa")
+    # Extra post-CD5 status payloads before FILLING_COMPLETE (settle retry).
+    post_status_before_complete: list[bytes] = field(default_factory=list)
 
     @property
     def is_open(self) -> bool:
@@ -82,17 +93,26 @@ class FakeWriteTransport:
     def serial_config_snapshot(self) -> dict[str, object]:
         return {"baudrate": 9600, "timeout": 0.015, "open": True}
 
+    def authorize_single_active_write(
+        self, frame: bytes, *, kind: ActiveFrameKind
+    ) -> None:
+        classified = classify_active_data_frame(frame)
+        if classified is None or classified is not kind:
+            raise RealWayneActiveCommandRefusedError(f"not {kind.value}")
+        self._approved_active_frame = bytes(frame)
+        self._active_writes_remaining = 1
+        self._approved_kind = kind
+
     def authorize_single_cd5_write(self, frame: bytes) -> None:
-        if is_verified_status_poll(frame):
-            raise RealWayneActiveCommandRefusedError("poll cannot be CD5 approval")
-        if len(frame) < 8 or (frame[1] & 0xF0) != 0x30 or frame[2] != 0x05:
-            raise RealWayneActiveCommandRefusedError("not CD5")
-        self._approved_cd5_frame = bytes(frame)
-        self._cd5_writes_remaining = 1
+        self.authorize_single_active_write(frame, kind=ActiveFrameKind.CD5_PRICE)
 
     def clear_cd5_write_authorization(self) -> None:
-        self._approved_cd5_frame = None
-        self._cd5_writes_remaining = 0
+        self.clear_active_write_authorization()
+
+    def clear_active_write_authorization(self) -> None:
+        self._approved_active_frame = None
+        self._active_writes_remaining = 0
+        self._approved_kind = None
 
     async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
         import time
@@ -116,21 +136,24 @@ class FakeWriteTransport:
     async def write(self, data: bytes) -> int:
         assert_real_wayne_write_allowed(
             data,
-            approved_cd5_frame=self._approved_cd5_frame,
-            cd5_writes_remaining=self._cd5_writes_remaining,
+            approved_active_frame=self._approved_active_frame,
+            active_writes_remaining=self._active_writes_remaining,
         )
-        is_cd5 = (
-            self._approved_cd5_frame is not None
-            and data == self._approved_cd5_frame
-            and self._cd5_writes_remaining > 0
+        is_active = (
+            self._approved_active_frame is not None
+            and data == self._approved_active_frame
+            and self._active_writes_remaining > 0
         )
-        if is_cd5:
-            self._cd5_writes_remaining -= 1
-            self._approved_cd5_frame = None
-            self.cd5_write_count += 1
+        if is_active:
+            kind = self._approved_kind
+            self._active_writes_remaining -= 1
+            self._approved_active_frame = None
+            self._approved_kind = None
+            self.active_write_count += 1
+            if kind is ActiveFrameKind.CD5_PRICE:
+                self.cd5_write_count += 1
             self.written.append(data)
             self.write_count += 1
-            # ACK then next status poll will request FILLING_COMPLETE.
             self._chunks.append(self.expected_ack)
             return len(data)
 
@@ -140,6 +163,9 @@ class FakeWriteTransport:
         self._poll_n += 1
         if self._poll_n == 1:
             self._chunks.append(_frame(_STATUS_NOT_PROGRAMMED))
+        elif self.post_status_before_complete:
+            payload = self.post_status_before_complete.pop(0)
+            self._chunks.append(_frame(payload, seq=2))
         else:
             self._chunks.append(_frame(_STATUS_FILLING_COMPLETE, seq=2))
         return len(data)
@@ -177,7 +203,7 @@ def test_poll_only_still_refuses_cd5() -> None:
         assert_real_wayne_poll_only(frame)
     with pytest.raises(RealWayneActiveCommandRefusedError):
         assert_real_wayne_write_allowed(
-            frame, approved_cd5_frame=None, cd5_writes_remaining=0
+            frame, approved_active_frame=None, active_writes_remaining=0
         )
 
 
@@ -190,13 +216,26 @@ def test_write_allowed_only_for_exact_approved_cd5() -> None:
     )
     frame, _, _ = build_cd5_candidate_frame(logical_address=1, sequence=0, cd5=cd5)
     assert_real_wayne_write_allowed(
-        frame, approved_cd5_frame=frame, cd5_writes_remaining=1
+        frame, approved_active_frame=frame, active_writes_remaining=1
     )
     other, _, _ = build_cd5_candidate_frame(logical_address=1, sequence=1, cd5=cd5)
     with pytest.raises(RealWayneActiveCommandRefusedError):
         assert_real_wayne_write_allowed(
-            other, approved_cd5_frame=frame, cd5_writes_remaining=1
+            other, approved_active_frame=frame, active_writes_remaining=1
         )
+
+
+def test_classify_cd1_reset_and_authorize() -> None:
+    reset = build_cd1_command(PumpControlCommand.RESET)
+    frame, _, _ = build_cd1_candidate_frame(
+        logical_address=1, sequence=0, cd1=reset
+    )
+    assert classify_active_data_frame(frame) is ActiveFrameKind.CD1_RESET
+    auth = build_cd1_command(PumpControlCommand.AUTHORIZE)
+    frame_a, _, _ = build_cd1_candidate_frame(
+        logical_address=1, sequence=0, cd1=auth
+    )
+    assert classify_active_data_frame(frame_a) is ActiveFrameKind.CD1_AUTHORIZE
 
 
 def test_post_write_requires_filling_complete() -> None:
@@ -228,6 +267,8 @@ async def test_write_session_transmits_cd5_once(tmp_path: Path) -> None:
         price_nozzle_2=1175,
         evidence_dir=tmp_path / "ev",
         confirmations=_write_confirms(),
+        post_write_settle_ms=0,
+        post_write_max_status_polls=3,
     )
     result = await PriceWriteSession(transport, params).run()
     assert result.transmitted is True
@@ -246,6 +287,27 @@ async def test_write_session_transmits_cd5_once(tmp_path: Path) -> None:
     assert review["cd5WriteCount"] == 1
     assert review["authorizationIncluded"] is False
     assert review["resetIncluded"] is False
+
+
+@pytest.mark.asyncio
+async def test_write_session_retries_until_filling_complete(tmp_path: Path) -> None:
+    transport = FakeWriteTransport(
+        post_status_before_complete=[_STATUS_NOT_PROGRAMMED]
+    )
+    params = PriceWriteParams(
+        port="/tmp/fake",
+        address=1,
+        logical_nozzle_count=2,
+        price_nozzle_1=1175,
+        price_nozzle_2=1175,
+        evidence_dir=tmp_path / "ev",
+        confirmations=_write_confirms(),
+        post_write_settle_ms=0,
+        post_write_max_status_polls=4,
+    )
+    result = await PriceWriteSession(transport, params).run()
+    assert result.state is PriceWriteState.FILLING_COMPLETE_VERIFIED
+    assert sum(1 for w in transport.written if w == build_poll(1)) == 3
 
 
 @pytest.mark.asyncio
