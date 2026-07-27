@@ -28,6 +28,7 @@ def app_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "INTELIPUMP_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 's.db'}"
     )
     monkeypatch.setenv("INTELIPUMP_SAFETY__ALLOW_LAB_SIMULATOR_COMMANDS", "true")
+    monkeypatch.setenv("INTELIPUMP_CONTROLLER__MODE", "LISTEN_ONLY")
     app = create_app()
     with TestClient(app) as client:
         yield client, app

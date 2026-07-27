@@ -61,6 +61,46 @@ def test_symlink_and_canonical_treated_as_same_device(tmp_path: Path) -> None:
     assert same_serial_device(str(alias), str(tty))
 
 
+def test_tmp_alias_symlink_resolves_and_service_active_refuses(
+    tmp_path: Path,
+) -> None:
+    """Linux pytest uses /tmp; /tmp paths must not be treated as virtual."""
+    # Force a /tmp-prefixed tree even on macOS (/private/tmp is fine via realpath,
+    # but the requested path must start with /tmp/ to cover the regression).
+    base = Path("/tmp") / f"intelipump-pytest-{os.getpid()}-{tmp_path.name}"
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        tty = base / "ttyUSB0"
+        tty.touch()
+        alias = base / "intelipump-controller"
+        alias.symlink_to(tty)
+        assert str(alias).startswith("/tmp/")
+        assert resolve_canonical_device(str(alias)) == os.path.realpath(str(tty))
+
+        def runner(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                args=["systemctl"], returncode=0, stdout="", stderr=""
+            )
+
+        with pytest.raises(PassiveCaptureRefusedError) as excinfo:
+            run_preflight_guards(
+                port=str(alias),
+                confirm_tx_physically_inhibited=True,
+                confirm_controller_stopped=True,
+                lock_dir=base / "locks",
+                systemctl_runner=runner,
+                holder_finder=lambda _p: [],
+            )
+        assert excinfo.value.reason is PassiveCaptureRefuseReason.SERVICE_ACTIVE
+    finally:
+        for child in sorted(base.rglob("*"), reverse=True):
+            if child.is_symlink() or child.is_file():
+                child.unlink(missing_ok=True)
+            elif child.is_dir():
+                child.rmdir()
+        base.rmdir()
+
+
 def test_holder_on_canonical_refuses_alias_request(tmp_path: Path) -> None:
     tty = tmp_path / "ttyUSB0"
     tty.touch()

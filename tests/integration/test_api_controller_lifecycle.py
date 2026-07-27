@@ -40,6 +40,7 @@ async def test_api_controller_simulator_and_transaction_once(
     get_settings.cache_clear()
     db = tmp_path / "life.db"
     monkeypatch.setenv("INTELIPUMP_DATABASE__URL", f"sqlite+aiosqlite:///{db}")
+    monkeypatch.setenv("INTELIPUMP_CONTROLLER__MODE", "LISTEN_ONLY")
     app = create_app()
     with TestClient(app) as client:
         state = app.state.app_state
@@ -155,6 +156,7 @@ def test_api_shutdown_flushes_worker(
     monkeypatch.setenv(
         "INTELIPUMP_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'shut.db'}"
     )
+    monkeypatch.setenv("INTELIPUMP_CONTROLLER__MODE", "LISTEN_ONLY")
     app = create_app()
     with TestClient(app) as client:
         assert client.get("/api/v1/controller/health").status_code == 200

@@ -18,6 +18,7 @@ def test_no_production_command_endpoint(
     monkeypatch.setenv(
         "INTELIPUMP_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'c.db'}"
     )
+    monkeypatch.setenv("INTELIPUMP_CONTROLLER__MODE", "LISTEN_ONLY")
     with TestClient(create_app()) as client:
         # General production command path must not exist
         r = client.post("/api/v1/pumps/pump-1/commands", json={"command_type": "AUTHORIZE"})

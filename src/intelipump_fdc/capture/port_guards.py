@@ -60,31 +60,55 @@ class PassiveCaptureRefusedError(RuntimeError):
 
 
 def is_virtual_or_test_port(device: str) -> bool:
-    return device in {"memory", "in-memory"} or device.startswith(
-        ("pty:", "/tmp/")
-    )
+    """True only for non-filesystem / synthetic ports.
+
+    Paths under ``/tmp/`` are real filesystem devices (LAB PTY aliases,
+    pytest tmp dirs on Linux) and must go through symlink resolution and
+    ownership preflight — they are not virtual.
+    """
+    return device in {"memory", "in-memory"} or device.startswith("pty:")
 
 
 def resolve_canonical_device(device: str) -> str:
-    """Resolve symlinks (e.g. udev alias → /dev/ttyUSB0)."""
+    """Resolve symlinks (e.g. udev alias → /dev/ttyUSB0 or /tmp/.../ttyUSB0).
+
+    Non-existent ``/tmp/`` lab aliases are allowed (setup may create them
+    later); other missing paths refuse closed.
+    """
     if is_virtual_or_test_port(device):
         return device
     path = Path(device)
     if not path.exists():
+        if device.startswith("/tmp/"):
+            # Preserve non-existent LAB alias paths; still normalize via realpath
+            # so lock identity matches once the node appears.
+            try:
+                return os.path.realpath(device)
+            except OSError:
+                return device
         raise PassiveCaptureRefusedError(
             f"serial device missing: {device}",
             reason=PassiveCaptureRefuseReason.DEVICE_MISSING,
             requested_path=device,
         )
     try:
-        canonical = os.path.realpath(device)
+        return os.path.realpath(device)
     except OSError as exc:
         raise PassiveCaptureRefusedError(
             f"cannot resolve canonical path for {device}: {exc}",
             reason=PassiveCaptureRefuseReason.UNKNOWN_OPEN_FAILURE,
             requested_path=device,
         ) from exc
-    return canonical
+
+
+def same_serial_device(path_a: str, path_b: str) -> bool:
+    """True when two paths resolve to the same canonical device."""
+    if is_virtual_or_test_port(path_a) or is_virtual_or_test_port(path_b):
+        return path_a == path_b
+    try:
+        return resolve_canonical_device(path_a) == resolve_canonical_device(path_b)
+    except PassiveCaptureRefusedError:
+        return os.path.realpath(path_a) == os.path.realpath(path_b)
 
 
 def lock_basename_for_canonical(canonical: str) -> str:
@@ -410,13 +434,3 @@ def run_preflight_guards(
             raise
 
     return port, canonical, app_lock
-
-
-def same_serial_device(path_a: str, path_b: str) -> bool:
-    """True when two paths resolve to the same canonical device."""
-    if is_virtual_or_test_port(path_a) or is_virtual_or_test_port(path_b):
-        return path_a == path_b
-    try:
-        return resolve_canonical_device(path_a) == resolve_canonical_device(path_b)
-    except PassiveCaptureRefusedError:
-        return os.path.realpath(path_a) == os.path.realpath(path_b)

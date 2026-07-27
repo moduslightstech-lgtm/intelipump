@@ -19,6 +19,8 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Test
     monkeypatch.setenv("INTELIPUMP_DATABASE__URL", f"sqlite+aiosqlite:///{db}")
     monkeypatch.setenv("INTELIPUMP_ENVIRONMENT", "LAB")
     monkeypatch.setenv("INTELIPUMP_CONTROLLER__STATION_ID", "InteliPump-US-Lab")
+    # Explicit default: do not inherit bench-host CONTINUOUS_POLL_BENCH / etc.
+    monkeypatch.setenv("INTELIPUMP_CONTROLLER__MODE", "LISTEN_ONLY")
     app = create_app()
     with TestClient(app) as client:
         yield client
