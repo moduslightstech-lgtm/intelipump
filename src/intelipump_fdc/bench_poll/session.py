@@ -18,14 +18,16 @@ from intelipump_fdc.bench_poll.evidence import (
     write_markdown_summary,
 )
 from intelipump_fdc.bench_poll.guards import TARGET_OWNED_LAB_WAYNE
-from intelipump_fdc.bench_poll.transport import BenchByteTransport
+from intelipump_fdc.bench_poll.poll_io import (
+    StatusPollOutcome,
+    send_status_poll_and_read_response,
+)
+from intelipump_fdc.bench_poll.transport import (
+    BenchByteTransport,
+    format_serial_config,
+)
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.captured_classify import CapturedFrameClass
-from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
-from intelipump_fdc.protocol.dart.line.legacy_stream import (
-    AssemblerEventKind,
-    LegacyIgemStreamAssembler,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,6 @@ class PollBenchSession:
         self.session_id = new_session_id()
         self.stats = BenchSessionStats()
         self._stop = asyncio.Event()
-        self._assembler = LegacyIgemStreamAssembler()
         self.command_queue_created = False
         self.authorization_objects_created = 0
         self.result: BenchResult | None = None
@@ -88,6 +89,12 @@ class PollBenchSession:
         try:
             if not self.transport.is_open:
                 await self.transport.open()
+            serial_notes = ""
+            snapshot = getattr(self.transport, "serial_config_snapshot", None)
+            if callable(snapshot):
+                cfg = snapshot()
+                serial_notes = " serial={" + format_serial_config(cfg) + "}"
+                logger.info("poll-bench serial config: %s", format_serial_config(cfg))
             writer.emit_event(
                 BenchEvent.BENCH_STARTED,
                 monotonic_ns=time.monotonic_ns(),
@@ -101,6 +108,7 @@ class PollBenchSession:
                     f"wireAddress=0x{self.wire_address:02X} "
                     f"targetType={self.config.target_type} "
                     f"simulatorValidation={self.config.simulator_validation}"
+                    f"{serial_notes}"
                 ),
             )
             for seq in range(1, self.config.max_polls + 1):
@@ -165,16 +173,19 @@ class PollBenchSession:
 
     async def _one_poll(self, writer: EvidenceWriter, seq: int) -> bool:
         """Return True to stop the bench early (CRC/protocol error)."""
-        poll = build_poll(self.logical_address)
-        t0 = time.monotonic()
-        mono_tx = time.monotonic_ns()
-        await self.transport.write(poll)
+        response = await send_status_poll_and_read_response(
+            self.transport,
+            self.logical_address,
+            self.config.response_timeout_ms,
+            read_size=self.config.read_size,
+            stop_event=self._stop,
+        )
         self.stats.polls_sent += 1
-        self.stats.last_tx_hex = poll.hex(" ")
+        self.stats.last_tx_hex = response.poll_tx.hex(" ")
         writer.emit_frame(
             direction="TX",
-            raw=poll,
-            monotonic_ns=mono_tx,
+            raw=response.poll_tx,
+            monotonic_ns=response.mono_tx_ns,
             pump_address=self.logical_address,
             logical_address=self.logical_address,
             wire_address=self.wire_address,
@@ -187,7 +198,7 @@ class PollBenchSession:
         )
         writer.emit_event(
             BenchEvent.POLL_SENT,
-            monotonic_ns=mono_tx,
+            monotonic_ns=response.mono_tx_ns,
             pump_address=self.logical_address,
             logical_address=self.logical_address,
             wire_address=self.wire_address,
@@ -195,200 +206,198 @@ class PollBenchSession:
             timeout_ms=self.config.response_timeout_ms,
         )
 
-        deadline = t0 + (self.config.response_timeout_ms / 1000.0)
-        # Persistent buffer across reads within this poll; do not hunt mid-frame.
-        while time.monotonic() < deadline and not self._stop.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                chunk = await asyncio.wait_for(
-                    self.transport.read(self.config.read_size),
-                    timeout=min(remaining, 0.05),
-                )
-            except TimeoutError:
-                chunk = b""
-            if not chunk:
-                await asyncio.sleep(0.001)
-                continue
-            for event in self._assembler.feed(chunk):
-                if event.kind is AssemblerEventKind.NOISE:
-                    continue
-                if event.kind is AssemblerEventKind.OVERFLOW:
-                    self.stats.protocol_errors += 1
-                    writer.emit_event(
-                        BenchEvent.PROTOCOL_ERROR,
-                        monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.logical_address,
-                        logical_address=self.logical_address,
-                        wire_address=self.wire_address,
-                        poll_sequence=seq,
-                        notes=event.message or "overflow",
-                        classification="OVERFLOW",
-                    )
-                    return True
-                if event.kind is AssemblerEventKind.PARTIAL:
-                    continue
-                if event.kind is AssemblerEventKind.REJECTED:
-                    self.stats.protocol_errors += 1
-                    writer.emit_frame(
-                        direction="RX",
-                        raw=event.raw,
-                        monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.logical_address,
-                        logical_address=self.logical_address,
-                        wire_address=self.wire_address,
-                        poll_sequence=seq,
-                        timeout_ms=self.config.response_timeout_ms,
-                        classification="REJECTED",
-                        crc_valid=None,
-                        event=BenchEvent.PROTOCOL_ERROR,
-                        notes=event.message,
-                    )
-                    return True
-                frame = event.frame
-                assert frame is not None
-                captured = event.captured
-                latency_ms = (time.monotonic() - t0) * 1000.0
-                self.stats.latencies_ms.append(latency_ms)
-                self.stats.last_rx_hex = frame.raw_frame.hex(" ")
-                classification = (
-                    captured.classification.value
-                    if captured is not None
-                    else frame.control_type.value
-                )
-                crc_valid = frame.crc_valid
-                if (
-                    captured is not None
-                    and captured.classification is CapturedFrameClass.DATA_FRAME
-                    and crc_valid is False
-                ):
-                    self.stats.crc_errors += 1
-                    writer.emit_frame(
-                        direction="RX",
-                        raw=frame.raw_frame,
-                        monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.logical_address,
-                        logical_address=self.logical_address,
-                        wire_address=self.wire_address,
-                        poll_sequence=seq,
-                        timeout_ms=self.config.response_timeout_ms,
-                        classification=classification,
-                        crc_valid=False,
-                        event=BenchEvent.PROTOCOL_ERROR,
-                        notes="crc_invalid_stop",
-                    )
-                    return True
+        if response.outcome is StatusPollOutcome.DISCONNECT:
+            self.stats.protocol_errors += 1
+            writer.emit_event(
+                BenchEvent.PROTOCOL_ERROR,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                notes=response.message or "serial_disconnect",
+                classification="SERIAL_DISCONNECT",
+            )
+            return True
 
-                if frame.address != self.wire_address:
-                    self.stats.protocol_errors += 1
-                    writer.emit_event(
-                        BenchEvent.PROTOCOL_ERROR,
-                        monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.logical_address,
-                        logical_address=self.logical_address,
-                        wire_address=self.wire_address,
-                        poll_sequence=seq,
-                        notes=(
-                            f"address_mismatch got_wire=0x{frame.address:02X} "
-                            f"expected_wire=0x{self.wire_address:02X}"
-                        ),
-                        classification="ADDRESS_MISMATCH",
-                    )
-                    return True
+        if response.outcome is StatusPollOutcome.STOPPED:
+            return True
 
-                if (
-                    captured is not None
-                    and captured.classification not in _VALID_RESPONSE_CLASSES
-                ):
-                    # SEQUENCE_CONTROL_OR_ACK is not a status-poll response itself.
-                    if (
-                        captured.classification
-                        is CapturedFrameClass.SEQUENCE_CONTROL_OR_ACK
-                    ):
-                        self.stats.protocol_errors += 1
-                        writer.emit_event(
-                            BenchEvent.PROTOCOL_ERROR,
-                            monotonic_ns=time.monotonic_ns(),
-                            pump_address=self.logical_address,
-                            logical_address=self.logical_address,
-                            wire_address=self.wire_address,
-                            poll_sequence=seq,
-                            notes=(
-                                f"unexpected_frame {classification}; "
-                                f"sequenceNibble={captured.sequence_nibble}; "
-                                "possibleAcknowledgement=true; not nozzle_lift"
-                            ),
-                            classification=classification,
-                        )
-                        return True
-                    self.stats.protocol_errors += 1
-                    writer.emit_event(
-                        BenchEvent.PROTOCOL_ERROR,
-                        monotonic_ns=time.monotonic_ns(),
-                        pump_address=self.logical_address,
-                        logical_address=self.logical_address,
-                        wire_address=self.wire_address,
-                        poll_sequence=seq,
-                        notes=f"unexpected_frame {classification}",
-                        classification=classification,
-                    )
-                    return True
+        if response.outcome is StatusPollOutcome.OVERFLOW:
+            self.stats.protocol_errors += 1
+            writer.emit_event(
+                BenchEvent.PROTOCOL_ERROR,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                notes=response.message or "overflow",
+                classification="OVERFLOW",
+            )
+            return True
 
-                self.stats.valid_responses += 1
-                writer.emit_frame(
-                    direction="RX",
-                    raw=frame.raw_frame,
-                    monotonic_ns=time.monotonic_ns(),
-                    pump_address=self.logical_address,
-                    logical_address=self.logical_address,
-                    wire_address=self.wire_address,
-                    poll_sequence=seq,
-                    timeout_ms=self.config.response_timeout_ms,
-                    classification=classification,
-                    crc_valid=crc_valid,
-                    event=BenchEvent.RESPONSE_RECEIVED,
-                    notes=f"latency_ms={latency_ms:.2f}",
-                )
-                writer.emit_event(
-                    BenchEvent.RESPONSE_RECEIVED,
-                    monotonic_ns=time.monotonic_ns(),
-                    pump_address=self.logical_address,
-                    logical_address=self.logical_address,
-                    wire_address=self.wire_address,
-                    poll_sequence=seq,
-                    classification=classification,
-                    crc_valid=crc_valid,
-                    notes=f"latency_ms={latency_ms:.2f}",
-                )
-                return False
-
-        # Preserve partial buffer diagnostics on timeout.
-        for event in self._assembler.expire_partial():
+        if response.outcome is StatusPollOutcome.REJECTED:
+            self.stats.protocol_errors += 1
+            event = response.terminal_event
             writer.emit_frame(
                 direction="RX",
-                raw=event.raw,
+                raw=event.raw if event is not None else b"",
                 monotonic_ns=time.monotonic_ns(),
                 pump_address=self.logical_address,
                 logical_address=self.logical_address,
                 wire_address=self.wire_address,
                 poll_sequence=seq,
                 timeout_ms=self.config.response_timeout_ms,
-                classification=CapturedFrameClass.PARTIAL_FRAME.value,
+                classification="REJECTED",
                 crc_valid=None,
-                event=BenchEvent.RESPONSE_TIMEOUT,
-                notes=event.message,
+                event=BenchEvent.PROTOCOL_ERROR,
+                notes=response.message,
             )
+            return True
 
-        self.stats.timeouts += 1
-        writer.emit_event(
-            BenchEvent.RESPONSE_TIMEOUT,
+        if response.outcome is StatusPollOutcome.TIMEOUT:
+            for event in response.partial_events:
+                writer.emit_frame(
+                    direction="RX",
+                    raw=event.raw,
+                    monotonic_ns=time.monotonic_ns(),
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
+                    poll_sequence=seq,
+                    timeout_ms=self.config.response_timeout_ms,
+                    classification=CapturedFrameClass.PARTIAL_FRAME.value,
+                    crc_valid=None,
+                    event=BenchEvent.RESPONSE_TIMEOUT,
+                    notes=event.message,
+                )
+            self.stats.timeouts += 1
+            writer.emit_event(
+                BenchEvent.RESPONSE_TIMEOUT,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                timeout_ms=self.config.response_timeout_ms,
+                notes="no_frame_before_deadline",
+            )
+            return False
+
+        # FRAME
+        frame = response.frame
+        assert frame is not None
+        captured = response.captured
+        latency_ms = response.latency_ms or 0.0
+        self.stats.latencies_ms.append(latency_ms)
+        self.stats.last_rx_hex = frame.raw_frame.hex(" ")
+        classification = (
+            captured.classification.value
+            if captured is not None
+            else frame.control_type.value
+        )
+        crc_valid = frame.crc_valid
+        if (
+            captured is not None
+            and captured.classification is CapturedFrameClass.DATA_FRAME
+            and crc_valid is False
+        ):
+            self.stats.crc_errors += 1
+            writer.emit_frame(
+                direction="RX",
+                raw=frame.raw_frame,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                timeout_ms=self.config.response_timeout_ms,
+                classification=classification,
+                crc_valid=False,
+                event=BenchEvent.PROTOCOL_ERROR,
+                notes="crc_invalid_stop",
+            )
+            return True
+
+        if frame.address != self.wire_address:
+            self.stats.protocol_errors += 1
+            writer.emit_event(
+                BenchEvent.PROTOCOL_ERROR,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                notes=(
+                    f"address_mismatch got_wire=0x{frame.address:02X} "
+                    f"expected_wire=0x{self.wire_address:02X}"
+                ),
+                classification="ADDRESS_MISMATCH",
+            )
+            return True
+
+        if (
+            captured is not None
+            and captured.classification not in _VALID_RESPONSE_CLASSES
+        ):
+            if (
+                captured.classification
+                is CapturedFrameClass.SEQUENCE_CONTROL_OR_ACK
+            ):
+                self.stats.protocol_errors += 1
+                writer.emit_event(
+                    BenchEvent.PROTOCOL_ERROR,
+                    monotonic_ns=time.monotonic_ns(),
+                    pump_address=self.logical_address,
+                    logical_address=self.logical_address,
+                    wire_address=self.wire_address,
+                    poll_sequence=seq,
+                    notes=(
+                        f"unexpected_frame {classification}; "
+                        f"sequenceNibble={captured.sequence_nibble}; "
+                        "possibleAcknowledgement=true; not nozzle_lift"
+                    ),
+                    classification=classification,
+                )
+                return True
+            self.stats.protocol_errors += 1
+            writer.emit_event(
+                BenchEvent.PROTOCOL_ERROR,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                logical_address=self.logical_address,
+                wire_address=self.wire_address,
+                poll_sequence=seq,
+                notes=f"unexpected_frame {classification}",
+                classification=classification,
+            )
+            return True
+
+        self.stats.valid_responses += 1
+        writer.emit_frame(
+            direction="RX",
+            raw=frame.raw_frame,
             monotonic_ns=time.monotonic_ns(),
             pump_address=self.logical_address,
             logical_address=self.logical_address,
             wire_address=self.wire_address,
             poll_sequence=seq,
             timeout_ms=self.config.response_timeout_ms,
-            notes="no_frame_before_deadline",
+            classification=classification,
+            crc_valid=crc_valid,
+            event=BenchEvent.RESPONSE_RECEIVED,
+            notes=f"latency_ms={latency_ms:.2f}",
+        )
+        writer.emit_event(
+            BenchEvent.RESPONSE_RECEIVED,
+            monotonic_ns=time.monotonic_ns(),
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=seq,
+            classification=classification,
+            crc_valid=crc_valid,
+            notes=f"latency_ms={latency_ms:.2f}",
         )
         return False

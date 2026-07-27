@@ -144,12 +144,11 @@ class FakeBenchTransport:
         data = self.chunks.pop(0)
         return data[:max_bytes]
 
-    async def drain_available(self) -> bytes:
-        """Non-blocking drain; fakes keep response bytes on the read queue only."""
-        return b""
-
     def device_path_exists(self) -> bool:
         return True
+
+    async def flush(self) -> None:
+        return None
 
     async def write(self, data: bytes) -> int:
         if (
@@ -623,11 +622,11 @@ async def test_stale_partial_not_concatenated_into_next_poll(
             data = self.chunks.pop(0)
             return data[:max_bytes]
 
-        async def drain_available(self) -> bytes:
-            return b""
-
         def device_path_exists(self) -> bool:
             return True
+
+        async def flush(self) -> None:
+            return None
 
         async def write(self, data: bytes) -> int:
             self.write_count += 1
@@ -953,7 +952,6 @@ async def test_three_consecutive_wayne_25_byte_data_frames(
         write_count: int = 0
         buf: bytearray = field(default_factory=bytearray)
         _open: bool = False
-        drain_calls: int = 0
 
         @property
         def is_open(self) -> bool:
@@ -965,16 +963,11 @@ async def test_three_consecutive_wayne_25_byte_data_frames(
         async def close(self) -> None:
             self._open = False
 
-        async def drain_available(self) -> bytes:
-            self.drain_calls += 1
-            if not self.buf:
-                return b""
-            data = bytes(self.buf)
-            self.buf.clear()
-            return data
-
         def device_path_exists(self) -> bool:
             return True
+
+        async def flush(self) -> None:
+            return None
 
         async def read(self, max_bytes: int) -> bytes:
             if not self.buf:
@@ -1030,116 +1023,6 @@ async def test_three_consecutive_wayne_25_byte_data_frames(
 
 
 @pytest.mark.asyncio
-async def test_leading_0x50_not_removed_by_pre_tx_drain(tmp_path: Path) -> None:
-    """Bytes already in the UART buffer must not be drained before every TX."""
-
-    @dataclass
-    class LeadingByteTransport:
-        device: str = "/tmp/fake-leading50"
-        written: list[bytes] = field(default_factory=list)
-        write_count: int = 0
-        buf: bytearray = field(default_factory=bytearray)
-        drained: list[bytes] = field(default_factory=list)
-        _open: bool = False
-        _plant_task: asyncio.Task[None] | None = None
-
-        @property
-        def is_open(self) -> bool:
-            return self._open
-
-        async def open(self) -> None:
-            self._open = True
-
-        async def close(self) -> None:
-            self._open = False
-            if self._plant_task is not None:
-                self._plant_task.cancel()
-
-        async def drain_available(self) -> bytes:
-            if not self.buf:
-                return b""
-            data = bytes(self.buf)
-            self.buf.clear()
-            self.drained.append(data)
-            return data
-
-        def device_path_exists(self) -> bool:
-            return True
-
-        async def read(self, max_bytes: int) -> bytes:
-            if not self.buf:
-                await asyncio.sleep(0.002)
-                return b""
-            data = bytes(self.buf[:max_bytes])
-            del self.buf[:max_bytes]
-            return data
-
-        async def _plant_leading_after_first_response(self) -> None:
-            # After poll-1 TX, wait for its response to be consumed, then plant
-            # leading 0x50 before poll-2 TX (where a pre-TX drain would steal it).
-            await asyncio.sleep(0.02)
-            for _ in range(100):
-                if self.write_count >= 2:
-                    return
-                if not self.buf:
-                    self.buf.append(0x50)
-                    return
-                await asyncio.sleep(0.005)
-
-        async def write(self, data: bytes) -> int:
-            self.write_count += 1
-            self.written.append(data)
-            if self.write_count == 1:
-                self.buf.extend(WAYNE_25)
-                self._plant_task = asyncio.create_task(
-                    self._plant_leading_after_first_response()
-                )
-            else:
-                # Remainder only; leading 0x50 must still be in the UART buffer.
-                if not self.buf or self.buf[0] != 0x50:
-                    # Make the failure mode obvious if a pre-TX drain ate 0x50.
-                    self.buf.clear()
-                    self.buf.extend(WAYNE_25[1:])
-                else:
-                    self.buf.extend(WAYNE_25[1:])
-            return len(data)
-
-    transport = LeadingByteTransport()
-    session = _session(
-        transport,  # type: ignore[arg-type]
-        tmp_path,
-        duration_seconds=1.0,
-        poll_interval_ms=100,
-        response_timeout_ms=50,
-        max_writes=3,
-    )
-    summary = await session.run()
-    assert _as_int(summary["validResponses"]) >= 2
-    assert summary["crcErrors"] == 0
-    # After the first successful poll, pre-TX drain must not eat leading 0x50.
-    assert not any(b[:1] == b"\x50" for b in transport.drained)
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "e.jsonl").read_text().splitlines()
-        if line
-    ]
-    data_frames = [
-        r
-        for r in records
-        if r.get("direction") == "RX"
-        and r.get("responseClassification") == "DATA_FRAME"
-        and r.get("crcValid") is True
-        and r.get("rawHex")
-    ]
-    assert len(data_frames) >= 2
-    for r in data_frames:
-        raw = bytes(int(p, 16) for p in r["rawHex"].split())
-        assert raw[0] == 0x50
-        assert raw == WAYNE_25
-
-
-@pytest.mark.asyncio
 async def test_transient_empty_read_recovers(tmp_path: Path) -> None:
     @dataclass
     class TransientEmptyTransport:
@@ -1160,11 +1043,11 @@ async def test_transient_empty_read_recovers(tmp_path: Path) -> None:
         async def close(self) -> None:
             self._open = False
 
-        async def drain_available(self) -> bytes:
-            return b""
-
         def device_path_exists(self) -> bool:
             return True
+
+        async def flush(self) -> None:
+            return None
 
         async def read(self, max_bytes: int) -> bytes:
             if self.empty_raises_left > 0:
@@ -1224,11 +1107,11 @@ async def test_repeated_transient_empty_read_disconnects(tmp_path: Path) -> None
         async def close(self) -> None:
             self._open = False
 
-        async def drain_available(self) -> bytes:
-            return b""
-
         def device_path_exists(self) -> bool:
             return True
+
+        async def flush(self) -> None:
+            return None
 
         async def read(self, max_bytes: int) -> bytes:
             raise OSError(

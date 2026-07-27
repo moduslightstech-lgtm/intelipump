@@ -9,6 +9,11 @@ Wayne iGEM POS Communication Lost / Error 30.
 Logical `--address 1` transmits captured `50 20 FA`; `--address 2` transmits
 `51 20 FA`. Evidence includes `logicalAddress` and `wireAddress`.
 
+Every poll cycle uses the shared
+`send_status_poll_and_read_response()` path also used by
+`intelipump-poll-bench` (one writer/reader, TX flush, no second drain path
+during the response window).
+
 This is **not** production polling. No authorization, transactions, presets,
 price changes, resets, MQTT commands, or daemon mode.
 

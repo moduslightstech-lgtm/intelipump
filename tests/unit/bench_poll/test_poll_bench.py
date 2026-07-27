@@ -99,6 +99,9 @@ class FakeBenchTransport:
         data = self.chunks.pop(0)
         return data[:max_bytes]
 
+    async def flush(self) -> None:
+        return None
+
     async def write(self, data: bytes) -> int:
         self.write_count += 1
         self.written.append(data)
