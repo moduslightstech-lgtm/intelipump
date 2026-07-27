@@ -217,17 +217,12 @@ def assert_adapter_holders_allowed(
             )
 
 
-def validate_poll_bench_settings(settings: Settings) -> None:
+def validate_lab_bench_safety_settings(settings: Settings) -> None:
+    """Shared LAB safety envelope (mode-agnostic)."""
     if settings.environment.upper() != "LAB":
         raise PollBenchRefusedError(
             f"environment must be LAB, got {settings.environment!r}",
             reason="non_lab",
-        )
-    if settings.controller.mode is not ControllerMode.POLL_ONLY_BENCH:
-        raise PollBenchRefusedError(
-            "INTELIPUMP_CONTROLLER__MODE must be POLL_ONLY_BENCH "
-            f"(got {settings.controller.mode.value})",
-            reason="wrong_mode",
         )
     if settings.safety.active_commands_enabled:
         raise PollBenchRefusedError(
@@ -253,6 +248,16 @@ def validate_poll_bench_settings(settings: Settings) -> None:
         )
     if settings.mqtt.enabled:
         raise PollBenchRefusedError("MQTT must be disabled", reason="mqtt_enabled")
+
+
+def validate_poll_bench_settings(settings: Settings) -> None:
+    validate_lab_bench_safety_settings(settings)
+    if settings.controller.mode is not ControllerMode.POLL_ONLY_BENCH:
+        raise PollBenchRefusedError(
+            "INTELIPUMP_CONTROLLER__MODE must be POLL_ONLY_BENCH "
+            f"(got {settings.controller.mode.value})",
+            reason="wrong_mode",
+        )
 
 
 def validate_poll_bench_params(params: PollBenchParams) -> None:
@@ -303,9 +308,18 @@ def run_poll_bench_preflight(
     holder_finder: Callable[[str], list[int]] | None = None,
     simulator_checker: Callable[[int], bool] | None = None,
     simulator_pid_finder: Callable[..., list[int]] | None = None,
+    enforce_poll_only_bench_mode: bool = True,
 ) -> tuple[str, AppDeviceLock | None]:
-    """Validate all guards. Returns (canonical_port, app_lock)."""
-    validate_poll_bench_settings(settings)
+    """Validate all guards. Returns (canonical_port, app_lock).
+
+    ``enforce_poll_only_bench_mode`` is required for ``intelipump-poll-bench``.
+    Price dry-run/write tools set it False after applying their own mode allowlist
+    (e.g. LISTEN_ONLY is valid for those CLIs).
+    """
+    if enforce_poll_only_bench_mode:
+        validate_poll_bench_settings(settings)
+    else:
+        validate_lab_bench_safety_settings(settings)
     validate_poll_bench_params(params)
     ensure_evidence_dir_writable(params.evidence_dir)
 

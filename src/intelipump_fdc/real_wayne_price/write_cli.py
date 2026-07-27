@@ -156,7 +156,11 @@ async def _async_main(argv: list[str] | None) -> int:
     )
     app_lock = None
     try:
-        canonical, app_lock = run_poll_bench_preflight(poll_params, settings)
+        canonical, app_lock = run_poll_bench_preflight(
+            poll_params,
+            settings,
+            enforce_poll_only_bench_mode=False,
+        )
     except PollBenchRefusedError as exc:
         print(f"PRICE_WRITE_REFUSED: {exc}", file=sys.stderr)
         return 2
