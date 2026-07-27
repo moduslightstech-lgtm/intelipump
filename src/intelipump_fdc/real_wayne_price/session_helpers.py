@@ -126,3 +126,29 @@ def dc1_is(status: WaynePumpStatus) -> Callable[[DecodedStatusSnapshot], bool]:
         return snap.dc1_code == code and bool(snap.crc_valid)
 
     return _pred
+
+
+def next_sequence_nibble(sequence: int) -> int:
+    if not 0 <= sequence <= 0x0F:
+        raise ValueError(f"sequence out of range: {sequence}")
+    return 0 if sequence == 0x0F else sequence + 1
+
+
+def sequence_stale_status_hint(
+    *,
+    sequence: int,
+    ack_outcome: str,
+    refusal_reasons: list[str],
+) -> str | None:
+    """Hint when L2 ACK'd but DC1 did not change (common duplicate-sequence case)."""
+    if ack_outcome != "ACK_MATCH":
+        return None
+    joined = " ".join(refusal_reasons)
+    if "_not_reached" not in joined and "dc1_not_" not in joined:
+        return None
+    nxt = next_sequence_nibble(sequence)
+    return (
+        "ACK_MATCH with unchanged DC1 often means DART L2 treated this DATA "
+        f"frame as a retransmission of sequence {sequence}; retry once with "
+        f"--sequence {nxt} (advance after each accepted active write)"
+    )

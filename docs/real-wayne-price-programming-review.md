@@ -73,14 +73,31 @@ Wire command for this example (sequence 0):
 Post-write verify retries status polls (default settle 400 ms, up to 8 polls)
 until DC1 is `FILLING_COMPLETE`.
 
+## Sequence nibble (important)
+
+Each accepted active DATA write must use the **next** L2 sequence (`0..F`, wrap).
+Reusing the prior sequence is treated as a **retransmission**: the pump may ACK
+again without applying a new application command.
+
+Lab observation: CD5 with `--sequence 0` then RESET with `--sequence 0` got
+`ACK_MATCH` but DC1 stayed `FILLING_COMPLETED`.
+
+| Step | Example `--sequence` | Control byte |
+|------|----------------------|--------------|
+| CD5 price | `0` | `0x30` |
+| CD1 RESET | `1` | `0x31` |
+| CD1 AUTHORIZE | `2` | `0x32` |
+
 ## Clear CLOSED display (single CD1 RESET)
 
-Use after CD5 when the pump shows CLOSED / `FILLING_COMPLETE`:
+Use after CD5 when the pump shows CLOSED / `FILLING_COMPLETE`. Advance sequence
+after the CD5 write (typically `--sequence 1` if CD5 used `0`):
 
 ```bash
 ./venv/bin/intelipump-real-wayne-reset-write \
   --port /dev/intelipump-controller \
   --address 1 \
+  --sequence 1 \
   --evidence-dir data/bench/real-wayne/cd1-reset \
   --confirm-owned-lab-pump \
   --confirm-technician-present \
@@ -95,10 +112,10 @@ Use after CD5 when the pump shows CLOSED / `FILLING_COMPLETE`:
   --i-understand-this-transmits-to-owned-lab-pump
 ```
 
-Wire command (address 1, sequence 0):
+Wire command (address 1, sequence 1):
 
 ```text
-50 30 01 01 05 5f 5f 03 fa
+50 31 01 01 05 <crc_lo> <crc_hi> 03 fa
 ```
 
 Expect DC1 `RESET` after verify.
@@ -106,12 +123,14 @@ Expect DC1 `RESET` after verify.
 ## Enable live volume/amount UI (single CD1 AUTHORIZE)
 
 High-risk. Only with motor + valves isolated and no product. Requires prior
-RESET. Does not auto-chain from RESET.
+RESET. Does not auto-chain from RESET. Use next sequence after RESET
+(typically `--sequence 2`):
 
 ```bash
 ./venv/bin/intelipump-real-wayne-authorize-write \
   --port /dev/intelipump-controller \
   --address 1 \
+  --sequence 2 \
   --evidence-dir data/bench/real-wayne/cd1-authorize \
   --confirm-owned-lab-pump \
   --confirm-technician-present \
@@ -126,10 +145,10 @@ RESET. Does not auto-chain from RESET.
   --i-understand-authorize-enables-live-delivery-ui
 ```
 
-Wire command (address 1, sequence 0):
+Wire command (address 1, sequence 2):
 
 ```text
-50 30 01 01 06 1f 5e 03 fa
+50 32 01 01 06 <crc_lo> <crc_hi> 03 fa
 ```
 
 Expect DC1 `AUTHORIZED` after verify.
@@ -148,3 +167,4 @@ Expect DC1 `AUTHORIZED` after verify.
 - Lab ACK timing and display lag may vary by pump firmware.
 - AUTHORIZE enables delivery UI even when motor/valves are isolated — treat as
   live-path enablement for the dispenser controller.
+- If ACK matches but DC1 is unchanged, advance `--sequence` once and retry.

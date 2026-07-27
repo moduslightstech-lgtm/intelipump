@@ -229,6 +229,28 @@ def test_cd1_rejects_other_commands() -> None:
         build_cd1_command(PumpControlCommand.STOP)
 
 
+def test_sequence_stale_hint_after_ack() -> None:
+    from intelipump_fdc.real_wayne_price.session_helpers import (
+        sequence_stale_status_hint,
+    )
+
+    hint = sequence_stale_status_hint(
+        sequence=0,
+        ack_outcome="ACK_MATCH",
+        refusal_reasons=["post_reset_RESET_not_reached", "last_dc1=FILLING_COMPLETED/5"],
+    )
+    assert hint is not None
+    assert "--sequence 1" in hint
+    assert (
+        sequence_stale_status_hint(
+            sequence=0,
+            ack_outcome="ACK_TIMEOUT",
+            refusal_reasons=["post_reset_RESET_not_reached"],
+        )
+        is None
+    )
+
+
 @pytest.mark.asyncio
 async def test_reset_session_transmits_once(tmp_path: Path) -> None:
     transport = FakeActiveTransport()

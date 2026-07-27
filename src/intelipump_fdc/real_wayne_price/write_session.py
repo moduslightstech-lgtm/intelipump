@@ -31,6 +31,7 @@ from intelipump_fdc.real_wayne_price.guards import PriceWriteParams
 from intelipump_fdc.real_wayne_price.session_helpers import (
     dc1_is,
     poll_status_until,
+    sequence_stale_status_hint,
     wait_for_ack_frame,
 )
 from intelipump_fdc.real_wayne_price.states import PriceWriteState
@@ -218,6 +219,13 @@ class PriceWriteSession:
             state = (
                 PriceWriteState.FAULT if transmitted else PriceWriteState.REFUSED
             )
+            hint = sequence_stale_status_hint(
+                sequence=self.params.sequence,
+                ack_outcome=ack_outcome,
+                refusal_reasons=refusal_reasons,
+            )
+            if hint:
+                warnings.append(hint)
             clear = getattr(self.transport, "clear_cd5_write_authorization", None)
             if callable(clear):
                 clear()
