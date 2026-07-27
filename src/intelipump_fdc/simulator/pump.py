@@ -362,6 +362,10 @@ class SimulatedPump:
 
     def _handle_cd5_price(self, data: bytes) -> list[ProtocolFault]:
         # Single or multi 3-byte price chunks; nozzle = 1-based ordinal.
+        # Documented DART flow after a complete accepted CD5 on a zeroized pump:
+        # PUMP_NOT_PROGRAMMED → FILLING_COMPLETED (not READY). Transition once
+        # after all nozzle prices in this transaction are applied.
+        was_not_programmed = self.wayne_status is WaynePumpStatus.PUMP_NOT_PROGRAMMED
         faults: list[ProtocolFault] = []
         for i in range(0, len(data), 3):
             nozzle = (i // 3) + 1
@@ -370,6 +374,13 @@ class SimulatedPump:
                 PumpCommand.SET_PRICE, price_raw=price_raw, nozzle=nozzle
             )
             faults.extend(result)
+        if not faults and was_not_programmed and self.price_verified:
+            self.wayne_status = WaynePumpStatus.FILLING_COMPLETED
+            self._apply_event(
+                PumpEvent.FILLING_COMPLETED,
+                raw_wayne_status=int(self.wayne_status),
+            )
+            self.queue_status_and_nozzle()
         return faults
 
     def _execute_guarded(

@@ -17,6 +17,8 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     (PumpState.DISCOVERING, PumpEvent.READY_OBSERVED): PumpState.READY,
     (PumpState.NOT_PROGRAMMED, PumpEvent.RESET_OBSERVED): PumpState.RESET,
     (PumpState.NOT_PROGRAMMED, PumpEvent.READY_OBSERVED): PumpState.READY,
+    # Documented Wayne CD5 price-accept path (DC1 0 → 5): not READY.
+    (PumpState.NOT_PROGRAMMED, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
     (PumpState.RESET, PumpEvent.READY_OBSERVED): PumpState.READY,
     (PumpState.RESET, PumpEvent.CONFIGURATION_MISSING): PumpState.NOT_PROGRAMMED,
     (PumpState.READY, PumpEvent.NOZZLE_LIFTED): PumpState.NOZZLE_UP,

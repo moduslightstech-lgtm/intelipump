@@ -50,11 +50,27 @@ def encode_cd4_preset_amount(amount_raw: int) -> bytes:
     return _tx(0x04, encode_packed_bcd(amount_raw, length=4))
 
 
-def encode_cd5_price_update(*, logical_nozzle: int, price_raw: int) -> bytes:
-    # One grade: 3-byte packed BCD price; nozzle implied by ordering (1-based).
-    # Captures use LNG=3 for single nozzle price without explicit nozzle byte.
-    # For multi-nozzle, repeat 3-byte chunks; nozzle index = chunk ordinal.
-    del logical_nozzle  # ordinal encoded by position for LNG=3 single update
+def encode_cd5_price_update(
+    *,
+    logical_nozzle: int = 1,
+    price_raw: int | None = None,
+    prices_raw: list[int] | None = None,
+) -> bytes:
+    """Documented CD5: TRANS=0x05, LNG=3*N, each price 3-byte packed BCD.
+
+    Single-nozzle: ``encode_cd5_price_update(logical_nozzle=1, price_raw=1175)``.
+    Multi-nozzle: ``encode_cd5_price_update(prices_raw=[1175, 1175])`` (PRI order).
+    """
+    if prices_raw is not None:
+        if price_raw is not None:
+            raise ValueError("pass price_raw or prices_raw, not both")
+        chunks = b"".join(encode_packed_bcd(p, length=3) for p in prices_raw)
+        return _tx(0x05, chunks)
+    if price_raw is None:
+        raise ValueError("price_raw or prices_raw required")
+    # Ordinal encoded by chunk position; single-price helper keeps nozzle arg
+    # for call-site clarity even though the wire has no nozzle byte.
+    del logical_nozzle
     return _tx(0x05, encode_packed_bcd(price_raw, length=3))
 
 

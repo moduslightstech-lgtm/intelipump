@@ -21,6 +21,7 @@ from intelipump_fdc.capture.port_guards import (
     resolve_canonical_device,
     tiocexcl_request,
 )
+from intelipump_fdc.controller.price_safety import assert_real_wayne_poll_only
 from intelipump_fdc.protocol.dart.transport.errors import TransportNotOpenError
 from intelipump_fdc.protocol.dart.transport.serial import (
     SerialParity,
@@ -260,6 +261,8 @@ class BenchPollSerialTransport:
     async def write(self, data: bytes) -> int:
         if not self.is_open or self._ser is None:
             raise TransportNotOpenError("bench poll serial not open")
+        # Hard refusal: only verified status polls may reach serial.write().
+        assert_real_wayne_poll_only(data)
         self.write_count += 1
         written = await asyncio.to_thread(self._ser.write, data)  # type: ignore[attr-defined]
         return int(written or 0)
