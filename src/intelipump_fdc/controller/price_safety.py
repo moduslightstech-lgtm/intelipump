@@ -1,8 +1,9 @@
 """Hard refusal of non-poll frames on real-Wayne serial transports.
 
 Status polls are always allowed. Exactly one pre-approved active DATA frame
-(CD5 price, CD1 RESET, CD1 AUTHORIZE, or CD2+CD1 RESET block) may be written
-when explicitly authorized on the transport for a single shot.
+(CD5 price, CD1 RETURN_STATUS, CD1 RESET, CD1 AUTHORIZE, or CD2+CD1 RESET
+block) may be written when explicitly authorized on the transport for a
+single shot.
 
 No environment variable may bypass this gate.
 """
@@ -30,6 +31,7 @@ class RealWayneActiveCommandRefusedError(RuntimeError):
 
 class ActiveFrameKind(StrEnum):
     CD5_PRICE = "CD5_PRICE"
+    CD1_RETURN_STATUS = "CD1_RETURN_STATUS"
     CD1_RESET = "CD1_RESET"
     CD1_AUTHORIZE = "CD1_AUTHORIZE"
     CD2_AND_CD1_RESET = "CD2_AND_CD1_RESET"
@@ -66,6 +68,8 @@ def classify_active_data_frame(frame: bytes) -> ActiveFrameKind | None:
         return ActiveFrameKind.CD5_PRICE
     if trans == 0x01 and lng == 1 and len(app) >= 3:
         dcc = app[2]
+        if dcc == int(PumpControlCommand.RETURN_STATUS):
+            return ActiveFrameKind.CD1_RETURN_STATUS
         if dcc == int(PumpControlCommand.RESET):
             return ActiveFrameKind.CD1_RESET
         if dcc == int(PumpControlCommand.AUTHORIZE):

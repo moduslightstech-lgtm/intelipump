@@ -35,8 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Technician-supervised real-Wayne CD2 allowed-nozzles + CD1 RESET "
             "in one DATA block. Requires DC1 FILLING_COMPLETE and nozzle OUT "
-            "(software-checked). Lone CD1 RESET previously ACK'd without DC1 "
-            "change on this lab pump. Does not send AUTHORIZE."
+            "(software-checked). Lab note: on the owned Wayne head this block "
+            "has ACK'd without DC1 moving to RESET — unproven; do not spam. "
+            "Does not send AUTHORIZE."
         ),
     )
     p.add_argument("--port", required=True)
@@ -53,10 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--evidence-dir", required=True)
     p.add_argument("--baud", type=int, default=9600)
-    p.add_argument("--response-timeout-ms", type=int, default=250)
-    p.add_argument("--ack-timeout-ms", type=int, default=250)
-    p.add_argument("--post-write-settle-ms", type=int, default=400)
-    p.add_argument("--post-write-max-status-polls", type=int, default=8)
+    p.add_argument("--response-timeout-ms", type=int, default=500)
+    p.add_argument("--ack-timeout-ms", type=int, default=500)
+    p.add_argument("--post-write-settle-ms", type=int, default=1000)
+    p.add_argument("--post-write-max-status-polls", type=int, default=16)
     p.add_argument(
         "--sequence",
         type=int,

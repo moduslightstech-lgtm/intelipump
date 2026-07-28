@@ -34,19 +34,20 @@ def build_parser() -> argparse.ArgumentParser:
         prog="intelipump-real-wayne-authorize-write",
         description=(
             "Technician-supervised real-Wayne CD1 AUTHORIZE. "
-            "Requires DC1 RESET, motor/valves isolated, no product. "
-            "Transmits exactly one AUTHORIZE DATA frame, then verifies "
-            "DC1 AUTHORIZED. Does not send CD5 or RESET. High-risk lab tool."
+            "Requires DC1 RESET (not FILLING_COMPLETE). Motor/valves isolated, "
+            "no product. Lab: do not run until RESET→DC1 1 is proven on this "
+            "head. Transmits exactly one AUTHORIZE DATA frame. "
+            "Does not send CD5 or RESET. High-risk lab tool."
         ),
     )
     p.add_argument("--port", required=True)
     p.add_argument("--address", type=int, required=True, choices=[1, 2])
     p.add_argument("--evidence-dir", required=True)
     p.add_argument("--baud", type=int, default=9600)
-    p.add_argument("--response-timeout-ms", type=int, default=250)
-    p.add_argument("--ack-timeout-ms", type=int, default=250)
-    p.add_argument("--post-write-settle-ms", type=int, default=400)
-    p.add_argument("--post-write-max-status-polls", type=int, default=8)
+    p.add_argument("--response-timeout-ms", type=int, default=500)
+    p.add_argument("--ack-timeout-ms", type=int, default=500)
+    p.add_argument("--post-write-settle-ms", type=int, default=1000)
+    p.add_argument("--post-write-max-status-polls", type=int, default=16)
     p.add_argument("--sequence", type=int, default=0)
     p.add_argument("--confirm-owned-lab-pump", action="store_true")
     p.add_argument("--confirm-technician-present", action="store_true")

@@ -1,4 +1,7 @@
-"""CLI: intelipump-real-wayne-reset-write — single-shot CD1 RESET."""
+"""CLI: intelipump-real-wayne-return-status-reset-write.
+
+Capture-matched path: CD1 RETURN_STATUS then CD1 RESET (two single-shot writes).
+"""
 
 from __future__ import annotations
 
@@ -20,25 +23,26 @@ from intelipump_fdc.bench_poll.transport import (
 )
 from intelipump_fdc.core.config import get_settings
 from intelipump_fdc.real_wayne_price.guards import (
-    ResetWriteConfirmations,
-    ResetWriteParams,
-    validate_reset_write_params,
-    validate_reset_write_settings,
+    ReturnStatusResetWriteConfirmations,
+    ReturnStatusResetWriteParams,
+    validate_return_status_reset_write_params,
+    validate_return_status_reset_write_settings,
 )
-from intelipump_fdc.real_wayne_price.reset_session import ResetWriteSession
-from intelipump_fdc.real_wayne_price.states import ResetWriteState
+from intelipump_fdc.real_wayne_price.return_status_reset_session import (
+    ReturnStatusResetWriteSession,
+)
+from intelipump_fdc.real_wayne_price.states import ReturnStatusResetWriteState
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="intelipump-real-wayne-reset-write",
+        prog="intelipump-real-wayne-return-status-reset-write",
         description=(
-            "Technician-supervised real-Wayne CD1 RESET attempt. "
-            "Requires DC1 FILLING_COMPLETE (CLOSED after price), transmits "
-            "exactly one RESET DATA frame, then verifies DC1 RESET. "
-            "Lab note: on the owned Wayne head, RESET has ACK'd without DC1 "
-            "moving to RESET — treat as unproven; do not spam sequences. "
-            "Does not send CD5 or AUTHORIZE."
+            "Technician-supervised real-Wayne CD1 RETURN_STATUS then CD1 RESET. "
+            "Matches office-capture sequence (RETURN_STATUS → poll → RESET). "
+            "--sequence N is RETURN_STATUS; RESET uses N+1. Try address 1 and 2. "
+            "Requires DC1 FILLING_COMPLETE. Does not send AUTHORIZE. "
+            "Lab: unproven until DC1 RESET observed — do not spam."
         ),
     )
     p.add_argument("--port", required=True)
@@ -49,7 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ack-timeout-ms", type=int, default=500)
     p.add_argument("--post-write-settle-ms", type=int, default=1000)
     p.add_argument("--post-write-max-status-polls", type=int, default=16)
-    p.add_argument("--sequence", type=int, default=0)
+    p.add_argument(
+        "--sequence",
+        type=int,
+        required=True,
+        help="Master DATA sequence for RETURN_STATUS; RESET uses next nibble.",
+    )
     p.add_argument("--confirm-owned-lab-pump", action="store_true")
     p.add_argument("--confirm-technician-present", action="store_true")
     p.add_argument("--confirm-no-product-connected", action="store_true")
@@ -58,7 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-emergency-isolation-ready", action="store_true")
     p.add_argument("--confirm-authorization-disabled", action="store_true")
     p.add_argument("--confirm-single-write-plan-reviewed", action="store_true")
-    p.add_argument("--confirm-execute-cd1-reset", action="store_true")
+    p.add_argument("--confirm-nozzle-out-observed", action="store_true")
+    p.add_argument(
+        "--confirm-execute-cd1-return-status-and-reset", action="store_true"
+    )
     p.add_argument(
         "--confirm-post-write-status-verification-required", action="store_true"
     )
@@ -84,8 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _params_from_args(args: argparse.Namespace) -> ResetWriteParams:
-    confirms = ResetWriteConfirmations(
+def _params_from_args(args: argparse.Namespace) -> ReturnStatusResetWriteParams:
+    confirms = ReturnStatusResetWriteConfirmations(
         owned_lab_pump=bool(args.confirm_owned_lab_pump),
         technician_present=bool(args.confirm_technician_present),
         no_product_connected=bool(args.confirm_no_product_connected),
@@ -94,7 +106,10 @@ def _params_from_args(args: argparse.Namespace) -> ResetWriteParams:
         emergency_isolation_ready=bool(args.confirm_emergency_isolation_ready),
         authorization_disabled=bool(args.confirm_authorization_disabled),
         single_write_plan_reviewed=bool(args.confirm_single_write_plan_reviewed),
-        execute_cd1_reset=bool(args.confirm_execute_cd1_reset),
+        nozzle_out_observed=bool(args.confirm_nozzle_out_observed),
+        execute_cd1_return_status_and_reset=bool(
+            args.confirm_execute_cd1_return_status_and_reset
+        ),
         post_write_status_verification_required=bool(
             args.confirm_post_write_status_verification_required
         ),
@@ -102,7 +117,7 @@ def _params_from_args(args: argparse.Namespace) -> ResetWriteParams:
             args.i_understand_this_transmits_to_owned_lab_pump
         ),
     )
-    return ResetWriteParams(
+    return ReturnStatusResetWriteParams(
         port=args.port,
         address=args.address,
         evidence_dir=Path(args.evidence_dir),
@@ -123,10 +138,10 @@ async def _async_main(argv: list[str] | None) -> int:
     params = _params_from_args(args)
     settings = get_settings()
     try:
-        validate_reset_write_params(params)
-        validate_reset_write_settings(settings)
+        validate_return_status_reset_write_params(params)
+        validate_return_status_reset_write_settings(settings)
     except PollBenchRefusedError as exc:
-        print(f"RESET_WRITE_REFUSED: {exc}", file=sys.stderr)
+        print(f"RETURN_STATUS_RESET_WRITE_REFUSED: {exc}", file=sys.stderr)
         return 2
 
     poll_params = PollBenchParams(
@@ -154,7 +169,7 @@ async def _async_main(argv: list[str] | None) -> int:
             enforce_poll_only_bench_mode=False,
         )
     except PollBenchRefusedError as exc:
-        print(f"RESET_WRITE_REFUSED: {exc}", file=sys.stderr)
+        print(f"RETURN_STATUS_RESET_WRITE_REFUSED: {exc}", file=sys.stderr)
         return 2
 
     transport = BenchPollSerialTransport(
@@ -165,7 +180,9 @@ async def _async_main(argv: list[str] | None) -> int:
             read_timeout_s=0.015,
         )
     )
-    session = ResetWriteSession(transport, params, canonical_port=canonical)
+    session = ReturnStatusResetWriteSession(
+        transport, params, canonical_port=canonical
+    )
     try:
         result = await session.run()
     finally:
@@ -177,7 +194,14 @@ async def _async_main(argv: list[str] | None) -> int:
     else:
         print(f"state: {result.state.value}")
         print(f"transmitted: {result.transmitted}")
+        print(
+            f"returnStatusFrameHex: {result.summary.get('returnStatusFrameHex')}"
+        )
         print(f"candidateFrameHex: {result.summary.get('candidateFrameHex')}")
+        print(
+            f"returnStatusAckOutcome: "
+            f"{result.summary.get('returnStatusAckOutcome')}"
+        )
         print(f"ackOutcome: {result.summary.get('ackOutcome')}")
         print(f"evidence: {result.summary.get('evidence')}")
         if result.summary.get("warnings"):
@@ -185,7 +209,7 @@ async def _async_main(argv: list[str] | None) -> int:
         if result.summary.get("refusalReasons"):
             print(f"refusalReasons: {result.summary['refusalReasons']}")
 
-    if result.state is ResetWriteState.RESET_VERIFIED:
+    if result.state is ReturnStatusResetWriteState.RESET_VERIFIED:
         return 0
     if result.transmitted:
         return 1

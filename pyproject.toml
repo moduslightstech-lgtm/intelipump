@@ -47,6 +47,7 @@ intelipump-real-wayne-price-write = "intelipump_fdc.real_wayne_price.write_cli:r
 intelipump-real-wayne-reset-write = "intelipump_fdc.real_wayne_price.reset_cli:run"
 intelipump-real-wayne-authorize-write = "intelipump_fdc.real_wayne_price.authorize_cli:run"
 intelipump-real-wayne-cd2-reset-write = "intelipump_fdc.real_wayne_price.cd2_reset_cli:run"
+intelipump-real-wayne-return-status-reset-write = "intelipump_fdc.real_wayne_price.return_status_reset_cli:run"
 
 [build-system]
 requires = ["hatchling"]

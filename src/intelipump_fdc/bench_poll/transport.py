@@ -120,6 +120,7 @@ class BenchPollSerialTransport:
         self.active_write_count: int = 0
         # Per-kind counters for evidence.
         self.cd5_write_count: int = 0
+        self.cd1_return_status_write_count: int = 0
         self.cd1_reset_write_count: int = 0
         self.cd1_authorize_write_count: int = 0
         self.cd2_reset_write_count: int = 0
@@ -333,6 +334,8 @@ class BenchPollSerialTransport:
             self.active_write_count += 1
             if kind is ActiveFrameKind.CD5_PRICE:
                 self.cd5_write_count += 1
+            elif kind is ActiveFrameKind.CD1_RETURN_STATUS:
+                self.cd1_return_status_write_count += 1
             elif kind is ActiveFrameKind.CD1_RESET:
                 self.cd1_reset_write_count += 1
             elif kind is ActiveFrameKind.CD1_AUTHORIZE:

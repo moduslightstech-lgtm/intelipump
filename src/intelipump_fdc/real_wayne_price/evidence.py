@@ -334,8 +334,10 @@ def default_write_uncertainties() -> list[str]:
     return [
         *default_uncertainties(),
         "Single CD5 write does not prove full dispenser programming completeness",
-        "CD5 alone does not clear FILLING_COMPLETE/CLOSED display; use RESET",
-        "Live volume/amount UI requires RESET then AUTHORIZE under isolation",
+        "CD5→FILLING_COMPLETE can lag beyond the first status polls (lab)",
+        "CD5 alone does not clear FILLING_COMPLETE/CLOSED display; RESET needed",
+        "RESET→DC1 RESET is unproven on the owned lab Wayne head",
+        "Live volume/amount UI requires proven RESET then AUTHORIZE under isolation",
     ]
 
 
@@ -372,6 +374,15 @@ class ActiveWriteEvidenceBundle:
     remaining_uncertainties: list[str]
     refusal_reasons: list[str]
     warnings: list[str]
+    # Optional prior step (e.g. RETURN_STATUS before RESET).
+    prior_step_name: str = ""
+    prior_payload_hex: str = ""
+    prior_frame_hex: str = ""
+    prior_sequence: int | None = None
+    prior_ack_outcome: str = ""
+    mid_status_hex: str = ""
+    decoded_status_mid: dict[str, Any] | None = None
+    reset_sequence: int | None = None
 
 
 def write_active_write_evidence(
@@ -419,6 +430,20 @@ def write_active_write_evidence(
         "refusalReasons": bundle.refusal_reasons,
         "warnings": bundle.warnings,
     }
+    if bundle.prior_step_name:
+        record["priorStep"] = {
+            "name": bundle.prior_step_name,
+            "payloadHex": bundle.prior_payload_hex,
+            "frameHex": bundle.prior_frame_hex,
+            "sequence": bundle.prior_sequence,
+            "ackOutcome": bundle.prior_ack_outcome,
+        }
+    if bundle.mid_status_hex:
+        record["statusResponseMidHex"] = bundle.mid_status_hex
+    if bundle.decoded_status_mid is not None:
+        record["decodedStatusMid"] = bundle.decoded_status_mid
+    if bundle.reset_sequence is not None:
+        record["resetSequence"] = bundle.reset_sequence
     jsonl.write_text(json.dumps(record, separators=(",", ":")) + "\n", encoding="utf-8")
 
     review_obj = {
@@ -452,6 +477,16 @@ def write_active_write_evidence(
         "warnings": bundle.warnings,
         "refusalReasons": bundle.refusal_reasons,
     }
+    if bundle.prior_step_name:
+        review_obj["priorStep"] = {
+            "name": bundle.prior_step_name,
+            "payloadHex": bundle.prior_payload_hex,
+            "frameHex": bundle.prior_frame_hex,
+            "sequence": bundle.prior_sequence,
+            "ackOutcome": bundle.prior_ack_outcome,
+        }
+    if bundle.reset_sequence is not None:
+        review_obj["resetSequence"] = bundle.reset_sequence
     review.write_text(json.dumps(review_obj, indent=2) + "\n", encoding="utf-8")
 
     lines = [
@@ -488,8 +523,9 @@ def write_active_write_evidence(
 
 def default_reset_uncertainties() -> list[str]:
     return [
-        "Exact ACK timing for CD1 RESET on this pump is lab-specific",
-        "Display clear after RESET may lag status DC1",
+        "Lab: CD1 RESET ACK (or ACK timeout) without DC1 moving to RESET",
+        "Do not spam sequences; RESET transition unproven on this head",
+        "Display clear after RESET may lag status DC1 if RESET ever succeeds",
         "RESET does not program prices; prior CD5 must have succeeded",
     ]
 
@@ -497,6 +533,7 @@ def default_reset_uncertainties() -> list[str]:
 def default_authorize_uncertainties() -> list[str]:
     return [
         "AUTHORIZE enables delivery UI; motor/valves must stay isolated in lab",
+        "Do not AUTHORIZE until DC1 RESET is proven on this head",
         "Exact ACK timing for CD1 AUTHORIZE on this pump is lab-specific",
         "Nozzle lift after AUTHORIZE is not commanded by this tool",
     ]
@@ -504,10 +541,19 @@ def default_authorize_uncertainties() -> list[str]:
 
 def default_cd2_reset_uncertainties() -> list[str]:
     return [
-        "Lone CD1 RESET ACK'd without DC1 change on this pump (lab evidence)",
-        "CD2+RESET combined block is a documented flow hypothesis, not yet proven here",
+        "Lab: CD2+RESET ACK without DC1 moving to RESET (nozzle OUT tested)",
+        "Lone CD1 RESET also failed to move DC1 on this head",
         "Allowed-nozzle list must match physical/logical mapping confirmed by technician",
         "Nozzle OUT is required by this tool before TX",
+    ]
+
+
+def default_return_status_reset_uncertainties() -> list[str]:
+    return [
+        "Office captures: CD1 RETURN_STATUS then lone RESET precedes DC1=RESET",
+        "Successful capture RESETs were on wire 0x51 (logical address 2)",
+        "Lab lone RESET / CD2+RESET did not move DC1; this path is unproven here",
+        "Do not AUTHORIZE until DC1 RESET is verified",
     ]
 
 
@@ -518,6 +564,7 @@ __all__ = [
     "default_authorize_uncertainties",
     "default_cd2_reset_uncertainties",
     "default_reset_uncertainties",
+    "default_return_status_reset_uncertainties",
     "default_uncertainties",
     "default_write_uncertainties",
     "new_session_id",

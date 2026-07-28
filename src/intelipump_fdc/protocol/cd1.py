@@ -1,7 +1,7 @@
 """Documented CD1 pump control commands (Pump Interface Rev 2.11).
 
 TRANS=0x01, LNG=1, DCC=command byte.
-RESET=0x05, AUTHORIZE=0x06.
+RETURN_STATUS=0x00, RESET=0x05, AUTHORIZE=0x06.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from intelipump_fdc.protocol.sequence import WayneSequenceManager
 CD1_TRANS = 0x01
 ALLOWED_ACTIVE_CD1 = frozenset(
     {
+        PumpControlCommand.RETURN_STATUS,
         PumpControlCommand.RESET,
         PumpControlCommand.AUTHORIZE,
     }

@@ -35,7 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Technician-supervised real-Wayne CD5 price write. "
             "Polls status, transmits exactly one pre-built CD5 DATA frame, "
-            "waits for ACK hypothesis, then verifies DC1 FILLING_COMPLETE. "
+            "waits for ACK hypothesis, then verifies DC1 FILLING_COMPLETE "
+            "(retries with settle; lab saw multi-second lag). "
             "Does not send RESET or AUTHORIZE."
         ),
     )
@@ -46,10 +47,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--price-nozzle-2", type=int, default=None)
     p.add_argument("--evidence-dir", required=True)
     p.add_argument("--baud", type=int, default=9600)
-    p.add_argument("--response-timeout-ms", type=int, default=250)
+    p.add_argument("--response-timeout-ms", type=int, default=500)
     p.add_argument("--ack-timeout-ms", type=int, default=250)
-    p.add_argument("--post-write-settle-ms", type=int, default=400)
-    p.add_argument("--post-write-max-status-polls", type=int, default=8)
+    p.add_argument("--post-write-settle-ms", type=int, default=1000)
+    p.add_argument("--post-write-max-status-polls", type=int, default=16)
     p.add_argument("--sequence", type=int, default=0)
     p.add_argument("--price-scale-confirmed-by-technician", action="store_true")
     p.add_argument(
