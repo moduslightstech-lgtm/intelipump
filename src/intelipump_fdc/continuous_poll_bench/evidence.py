@@ -39,6 +39,8 @@ class ContinuousBenchEvent(StrEnum):
     DATA_RESPONSE = "data_response"
     CONTROL_ONLY = "control_only"
     QUIET_GAP_WAIT = "quiet_gap_wait"
+    RETURN_STATUS_SENT = "return_status_sent"
+    RETURN_STATUS_ACK = "return_status_ack"
     BENCH_STOPPED = "bench_stopped"
     SAFETY_REFUSED = "safety_refused"
 
@@ -121,6 +123,9 @@ class ContinuousSessionStats:
     late_chunks: int = 0
     stale_chunks: int = 0
     unowned_frames: int = 0
+    return_status_sent: int = 0
+    return_status_ack_match: int = 0
+    return_status_ack_timeout: int = 0
     latencies_ms: list[float] = field(default_factory=list)
     schedule_lags_ms: list[float] = field(default_factory=list)
     last_tx_hex: str | None = None
@@ -352,6 +357,9 @@ def write_markdown_summary(
         f"- Poll interval (ms): `{poll_interval_ms}`",
         f"- Response timeout (ms): `{response_timeout_ms}`",
         f"- Polls sent / write count: `{stats.polls_sent}` / `{write_count}`",
+        f"- RETURN_STATUS sent / ACK match / ACK timeout: "
+        f"`{stats.return_status_sent}` / `{stats.return_status_ack_match}` / "
+        f"`{stats.return_status_ack_timeout}`",
         (
             f"- Protocol frames received (validResponses alias): "
             f"`{stats.protocol_frames_received}`"

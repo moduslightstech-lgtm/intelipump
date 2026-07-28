@@ -137,6 +137,11 @@ class FakeBenchTransport:
     _open: bool = False
     auto_eot_address: int | None = None
     auto_data: bool = True
+    _approved_active_frame: bytes | None = None
+    _active_writes_remaining: int = 0
+    _approved_kind: object | None = None
+    cd1_return_status_write_count: int = 0
+    auto_ack_return_status: bool = True
 
     @property
     def is_open(self) -> bool:
@@ -172,7 +177,38 @@ class FakeBenchTransport:
     async def flush(self) -> None:
         return None
 
+    def authorize_single_active_write(self, frame: bytes, *, kind: object) -> None:
+        from intelipump_fdc.controller.price_safety import (
+            ActiveFrameKind,
+            classify_active_data_frame,
+        )
+
+        classified = classify_active_data_frame(frame)
+        if classified is None or classified is not kind:
+            raise AssertionError(f"bad authorize kind {kind} vs {classified}")
+        if kind is not ActiveFrameKind.CD1_RETURN_STATUS:
+            raise AssertionError("tests only allow CD1_RETURN_STATUS")
+        self._approved_active_frame = bytes(frame)
+        self._active_writes_remaining = 1
+        self._approved_kind = kind
+
     async def write(self, data: bytes) -> int:
+        from intelipump_fdc.controller.price_safety import (
+            ActiveFrameKind,
+            assert_real_wayne_write_allowed,
+        )
+        from intelipump_fdc.protocol.dart.line.frame_builder import build_ack
+
+        assert_real_wayne_write_allowed(
+            data,
+            approved_active_frame=self._approved_active_frame,
+            active_writes_remaining=self._active_writes_remaining,
+        )
+        is_active = (
+            self._approved_active_frame is not None
+            and data == self._approved_active_frame
+            and self._active_writes_remaining > 0
+        )
         if (
             self.disconnect_after_writes is not None
             and self.write_count >= self.disconnect_after_writes
@@ -182,7 +218,16 @@ class FakeBenchTransport:
             await asyncio.sleep(self.write_delay_s)
         self.write_count += 1
         self.written.append(data)
-        if self.auto_eot_address is not None:
+        if is_active:
+            self._active_writes_remaining -= 1
+            self.cd1_return_status_write_count += 1
+            self._approved_active_frame = None
+            self._approved_kind = None
+            if self.auto_ack_return_status and len(data) >= 2:
+                # ACK uses same sequence nibble as DATA control byte low nibble.
+                seq = data[1] & 0x0F
+                self.chunks.append(build_ack(data[0], seq))
+        elif self.auto_eot_address is not None:
             self.chunks.append(build_eot(encode_wire_address(self.auto_eot_address), 0))
         elif self.auto_data:
             self.chunks.append(WAYNE_25)
@@ -396,6 +441,83 @@ def test_parser_exposes_confirm_extended_watch() -> None:
     )
     assert args.confirm_extended_watch is True
     assert args.duration_seconds == 120.0
+
+
+def test_return_status_cadence_requires_extended_and_no_reset(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="extended-watch"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=60,
+                poll_interval_ms=100,
+                response_timeout_ms=50,
+                simulator_validation=True,
+                confirmations=_confirms(
+                    status_poll_only=False,
+                    extended_watch=False,
+                    return_status_cadence=True,
+                    no_reset_no_authorize=True,
+                ),
+            )
+        )
+    with pytest.raises(ContinuousPollRefusedError, match="no-reset-no-authorize"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=60,
+                poll_interval_ms=100,
+                response_timeout_ms=50,
+                simulator_validation=True,
+                confirmations=_confirms(
+                    status_poll_only=False,
+                    extended_watch=True,
+                    return_status_cadence=True,
+                    no_reset_no_authorize=False,
+                ),
+            )
+        )
+
+
+def test_return_status_conflicts_with_status_poll_only(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="status-poll-only"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=60,
+                poll_interval_ms=100,
+                response_timeout_ms=50,
+                simulator_validation=True,
+                confirmations=_confirms(
+                    status_poll_only=True,
+                    extended_watch=True,
+                    return_status_cadence=True,
+                    no_reset_no_authorize=True,
+                ),
+            )
+        )
+
+
+def test_return_status_cadence_params_ok(tmp_path: Path) -> None:
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=60,
+            poll_interval_ms=100,
+            response_timeout_ms=50,
+            simulator_validation=True,
+            return_status_every_n_polls=2,
+            return_status_sequence=3,
+            ack_timeout_ms=50,
+            confirmations=_confirms(
+                status_poll_only=False,
+                extended_watch=True,
+                return_status_cadence=True,
+                no_reset_no_authorize=True,
+            ),
+        )
+    )
 
 
 def test_real_wayne_min_poll_interval_300ms(tmp_path: Path) -> None:
@@ -998,6 +1120,74 @@ async def test_max_writes_enforced_at_runtime(tmp_path: Path) -> None:
     assert _as_int(summary["writeCount"]) <= 5
     assert summary["stopReason"] == "max_writes"
     assert summary["result"] == ContinuousBenchResult.FAIL.value
+
+
+@pytest.mark.asyncio
+async def test_extended_watch_does_not_clamp_to_50_writes(
+    tmp_path: Path,
+) -> None:
+    """Regression: real-Wayne path must honor config.max_writes > 50."""
+    transport = FakeBenchTransport()
+    # ~1s at 50ms would be ~20 polls; with max_writes=80 must not stop at 50.
+    session = _session(
+        transport,
+        tmp_path,
+        duration_seconds=1.0,
+        poll_interval_ms=50,
+        response_timeout_ms=20,
+        max_writes=80,
+        simulator_validation=False,
+        target_type="OWNED_LAB_WAYNE",
+    )
+    summary = await session.run()
+    assert summary["stopReason"] != "max_writes"
+    assert _as_int(summary["pollsSent"]) > 50 or summary["stopReason"] == (
+        "duration_expired"
+    )
+    # With 50ms interval over 1s, expect ~20 polls — well under 80, not capped at 50.
+    assert 15 <= _as_int(summary["pollsSent"]) <= 25
+    assert summary["stopReason"] == "duration_expired"
+
+
+@pytest.mark.asyncio
+async def test_return_status_cadence_sends_cd1_rs_not_reset(
+    tmp_path: Path,
+) -> None:
+    from intelipump_fdc.controller.price_safety import (
+        ActiveFrameKind,
+        classify_active_data_frame,
+    )
+    from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
+
+    transport = FakeBenchTransport()
+    session = _session(
+        transport,
+        tmp_path,
+        duration_seconds=1.0,
+        poll_interval_ms=100,
+        response_timeout_ms=40,
+        max_writes=50,
+        return_status_cadence=True,
+        return_status_every_n_polls=2,
+        return_status_sequence=0,
+        ack_timeout_ms=40,
+    )
+    summary = await session.run()
+    assert summary["returnStatusCadence"] is True
+    assert _as_int(summary["returnStatusSent"]) >= 1
+    assert _as_int(summary["returnStatusAckMatch"]) >= 1
+    assert all(
+        frame == build_poll(1) or classify_active_data_frame(frame)
+        is ActiveFrameKind.CD1_RETURN_STATUS
+        for frame in transport.written
+    )
+    assert not any(
+        classify_active_data_frame(frame)
+        in {ActiveFrameKind.CD1_RESET, ActiveFrameKind.CD1_AUTHORIZE}
+        for frame in transport.written
+    )
+    assert summary["authorizationObjectsCreated"] == 0
+    assert summary["commandQueueCreated"] is False
 
 
 @pytest.mark.asyncio

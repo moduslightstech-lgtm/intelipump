@@ -89,8 +89,8 @@ Scheduler is monotonic: missed deadlines skip forward (`schedule_lag_ms`);
 never catch up with back-to-back polls. Timeouts do not extend duration.
 SIGINT / SIGTERM stops cleanly (`stopReason=operator_interrupt`).
 
-Still **POLL-only** in all paths: no RETURN STATUS, RESET, AUTHORIZE, price,
-or daemon/indefinite mode.
+Still **no RESET / AUTHORIZE / price / daemon** in any path. Option 2 may
+send gated CD1 RETURN_STATUS only when explicitly confirmed.
 
 ## Extended POLL-only watch (lab)
 
@@ -98,7 +98,7 @@ Use when you need longer observation (e.g. lift nozzle and watch DC3 / NOZIO)
 without raising the short-path default:
 
 ```bash
-intelipump-continuous-poll-bench \
+uv run intelipump-continuous-poll-bench \
   --port /dev/intelipump-controller \
   --address 1 \
   --duration-seconds 120 \
@@ -117,6 +117,37 @@ intelipump-continuous-poll-bench \
 
 Stop early with Ctrl+C. Omit `--simulator-validation` only for the owned lab
 Wayne after the usual stop-service / isolation checks.
+
+## POLL + RETURN_STATUS cadence (option 2, lab)
+
+Closer to ePump: L2 POLL plus gated CD1 RETURN_STATUS (`01 01 00`) every N
+polls. Still **no** RESET / AUTHORIZE. Requires extended watch. Do **not**
+pass `--confirm-status-poll-only`.
+
+```bash
+uv run intelipump-continuous-poll-bench \
+  --port /dev/intelipump-controller \
+  --address 2 \
+  --duration-seconds 120 \
+  --poll-interval-ms 300 \
+  --response-timeout-ms 250 \
+  --return-status-every-n-polls 2 \
+  --sequence 0 \
+  --ack-timeout-ms 200 \
+  --evidence-dir data/bench/continuous-poll \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-emergency-isolation-ready \
+  --confirm-no-fuel-test \
+  --confirm-authorization-disabled \
+  --confirm-bounded-duration \
+  --confirm-extended-watch \
+  --confirm-return-status-cadence \
+  --confirm-no-reset-no-authorize
+```
+
+During the run: nozzle in → start → lift/hold → return → Ctrl+C or wait.
+Then decode NOZIO from the JSONL (look for `01`→`11` OUT).
 
 ## Real Wayne (later approved lab only)
 

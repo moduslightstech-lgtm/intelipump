@@ -52,8 +52,9 @@ Does not start Phase 11D–11H.
 ## Continuous poll bench (CONTINUOUS_POLL_BENCH)
 Bounded status-only polling via `intelipump-continuous-poll-bench`
 (one address; real-Wayne short max 5s / 50 writes; optional extended
-POLL-only watch max 300s with `--confirm-extended-watch`, Ctrl+C stop).
-See `docs/continuous-poll-bench.md`. No authorization / RETURN STATUS.
+watch max 300s with `--confirm-extended-watch`, Ctrl+C stop; optional
+gated CD1 RETURN_STATUS cadence with `--confirm-return-status-cadence`,
+still no RESET/AUTHORIZE). See `docs/continuous-poll-bench.md`.
 Not production polling. Does not start Phase 11D–11H.
 
 ## Captured ePump / Wayne iGEM wire-address profile

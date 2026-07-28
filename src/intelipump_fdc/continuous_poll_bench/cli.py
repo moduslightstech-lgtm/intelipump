@@ -38,7 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
             "one owned lab pump address. Default short path (real-Wayne max 5s). "
             "Optional extended POLL-only watch (max 300s) with "
             "--confirm-extended-watch; Ctrl+C stops early. "
-            "No authorize/preset/price/reset/RETURN_STATUS/daemon. "
+            "Optional POLL+CD1 RETURN_STATUS cadence (ePump-like; no RESET/"
+            "AUTHORIZE) with --confirm-return-status-cadence. "
             "Stop intelipump.service first."
         ),
     )
@@ -106,7 +107,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm-status-poll-only",
         action="store_true",
-        help="Confirm only verified build_poll status polls will be sent",
+        help=(
+            "Confirm only verified build_poll status polls will be sent "
+            "(omit when using --confirm-return-status-cadence)"
+        ),
     )
     parser.add_argument(
         "--confirm-bounded-duration",
@@ -120,6 +124,50 @@ def build_parser() -> argparse.ArgumentParser:
             "Confirm extended POLL-only watch: raise duration cap to 300s "
             "(still bounded; Ctrl+C / SIGTERM stops early). Required when "
             "duration exceeds the short-path max (5s real-Wayne / 30s simulator)."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-return-status-cadence",
+        action="store_true",
+        help=(
+            "Interleave gated CD1 RETURN_STATUS with L2 POLL (ePump-like). "
+            "Requires --confirm-extended-watch and --confirm-no-reset-no-authorize. "
+            "Do not pass --confirm-status-poll-only. Never sends RESET/AUTHORIZE."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-no-reset-no-authorize",
+        action="store_true",
+        help=(
+            "Confirm this session will not transmit CD1 RESET or AUTHORIZE "
+            "(required with --confirm-return-status-cadence)"
+        ),
+    )
+    parser.add_argument(
+        "--return-status-every-n-polls",
+        type=int,
+        default=2,
+        help=(
+            "After every N status polls, send one gated CD1 RETURN_STATUS "
+            "(default 2; only with --confirm-return-status-cadence)"
+        ),
+    )
+    parser.add_argument(
+        "--sequence",
+        type=int,
+        default=0,
+        help=(
+            "Starting DATA sequence nibble for RETURN_STATUS (0-15; "
+            "increments each RS). Only with --confirm-return-status-cadence"
+        ),
+    )
+    parser.add_argument(
+        "--ack-timeout-ms",
+        type=int,
+        default=200,
+        help=(
+            "ACK wait after each RETURN_STATUS (default 200; must be < "
+            "poll-interval-ms). Only with --confirm-return-status-cadence"
         ),
     )
     parser.add_argument(
@@ -182,6 +230,8 @@ async def _async_main(args: argparse.Namespace) -> int:
             status_poll_only=args.confirm_status_poll_only,
             bounded_duration=args.confirm_bounded_duration,
             extended_watch=args.confirm_extended_watch,
+            return_status_cadence=args.confirm_return_status_cadence,
+            no_reset_no_authorize=args.confirm_no_reset_no_authorize,
         ),
         controller_service=args.controller_service,
         lock_dir=Path(args.lock_dir),
@@ -189,6 +239,9 @@ async def _async_main(args: argparse.Namespace) -> int:
         simulator_validation=bool(args.simulator_validation),
         skip_service_check=args.skip_service_check,
         skip_port_check=args.skip_port_check,
+        return_status_every_n_polls=int(args.return_status_every_n_polls),
+        return_status_sequence=int(args.sequence),
+        ack_timeout_ms=int(args.ack_timeout_ms),
     )
 
     app_lock = None
@@ -227,6 +280,10 @@ async def _async_main(args: argparse.Namespace) -> int:
             target_type=params.target_type,
             simulator_validation=params.simulator_validation,
             canonical=canonical,
+            return_status_cadence=params.return_status_cadence,
+            return_status_every_n_polls=params.return_status_every_n_polls,
+            return_status_sequence=params.return_status_sequence,
+            ack_timeout_ms=params.ack_timeout_ms,
         ),
     )
 

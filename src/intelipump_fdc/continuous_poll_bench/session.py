@@ -33,13 +33,22 @@ from intelipump_fdc.continuous_poll_bench.evidence import (
 )
 from intelipump_fdc.continuous_poll_bench.guards import (
     MALFORMED_THRESHOLD,
-    REAL_WAYNE_MAX_WRITES,
     software_commit,
 )
+from intelipump_fdc.controller.price_safety import (
+    ActiveFrameKind,
+    RealWayneActiveCommandRefusedError,
+)
+from intelipump_fdc.protocol.cd1 import build_cd1_candidate_frame, build_cd1_command
+from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.captured_classify import CapturedFrameClass
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.transport.errors import TransportNotOpenError
+from intelipump_fdc.real_wayne_price.session_helpers import (
+    next_sequence_nibble,
+    wait_for_ack_frame,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +71,17 @@ class ContinuousPollSessionConfig:
     target_type: str = TARGET_OWNED_LAB_WAYNE
     simulator_validation: bool = False
     canonical: str | None = None
+    return_status_cadence: bool = False
+    return_status_every_n_polls: int = 2
+    return_status_sequence: int = 0
+    ack_timeout_ms: int = 200
 
 
 class ContinuousPollSession:
-    """Sends only shared status polls on a monotonic schedule; no command queue/auth."""
+    """Sends status polls on a monotonic schedule; optional gated RETURN_STATUS.
+
+    Never builds RESET/AUTHORIZE. No controller command queue.
+    """
 
     def __init__(
         self,
@@ -80,6 +96,11 @@ class ContinuousPollSession:
             raise ValueError("response_timeout_ms must be < poll_interval_ms")
         if config.max_writes < 1:
             raise ValueError("max_writes must be >= 1")
+        if config.return_status_cadence:
+            if not (1 <= config.return_status_every_n_polls <= 20):
+                raise ValueError("return_status_every_n_polls must be 1-20")
+            if not (0 <= config.return_status_sequence <= 15):
+                raise ValueError("return_status_sequence must be 0-15")
         self.transport = transport
         self.config = config
         self.logical_address = config.address
@@ -94,6 +115,7 @@ class ContinuousPollSession:
         self.result: ContinuousBenchResult | None = None
         self._fault = False
         self._commit = software_commit()
+        self._rs_sequence = int(config.return_status_sequence) & 0x0F
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -132,6 +154,8 @@ class ContinuousPollSession:
                     f"interval_ms={self.config.poll_interval_ms} "
                     f"timeout_ms={self.config.response_timeout_ms} "
                     f"max_writes={self.config.max_writes} "
+                    f"return_status_cadence={self.config.return_status_cadence} "
+                    f"return_status_every_n={self.config.return_status_every_n_polls} "
                     f"targetType={self.config.target_type} "
                     f"simulatorValidation={self.config.simulator_validation}"
                     f"{serial_notes}"
@@ -225,6 +249,10 @@ class ContinuousPollSession:
             "unexpectedFrames": self.stats.unexpected_frames,
             "scheduleLagEvents": self.stats.schedule_lag_events,
             "skippedSlotsTotal": self.stats.skipped_slots_total,
+            "returnStatusSent": self.stats.return_status_sent,
+            "returnStatusAckMatch": self.stats.return_status_ack_match,
+            "returnStatusAckTimeout": self.stats.return_status_ack_timeout,
+            "returnStatusCadence": self.config.return_status_cadence,
             "commandQueueCreated": self.command_queue_created,
             "authorizationObjectsCreated": self.authorization_objects_created,
             "targetType": self.config.target_type,
@@ -322,9 +350,10 @@ class ContinuousPollSession:
                 )
 
             write_count = getattr(self.transport, "write_count", self.stats.polls_sent)
+            # Trust preflight-validated config.max_writes (short path 50;
+            # extended watch up to REAL_WAYNE_EXTENDED_MAX_WRITES). Do not
+            # re-clamp to the short-path 50 here — that aborted 120s watches.
             max_writes = self.config.max_writes
-            if not self.config.simulator_validation:
-                max_writes = min(max_writes, REAL_WAYNE_MAX_WRITES)
             if write_count >= max_writes or self.stats.polls_sent >= max_writes:
                 self._fault = True
                 self.stats.stop_reason = StopReason.MAX_WRITES
@@ -347,6 +376,117 @@ class ContinuousPollSession:
             next_ideal += interval_s
             if stop_early:
                 return
+
+            if (
+                self.config.return_status_cadence
+                and seq % self.config.return_status_every_n_polls == 0
+            ):
+                stop_rs, rs_tx = await self._one_return_status(writer, seq)
+                if rs_tx is not None:
+                    previous_tx = rs_tx
+                if stop_rs:
+                    return
+
+    async def _one_return_status(
+        self,
+        writer: EvidenceWriter,
+        poll_seq: int,
+    ) -> tuple[bool, float | None]:
+        """Transmit one gated CD1 RETURN_STATUS; never RESET/AUTHORIZE."""
+        authorize = getattr(self.transport, "authorize_single_active_write", None)
+        if not callable(authorize):
+            self._fault = True
+            self.stats.stop_reason = StopReason.SAFETY_FAULT
+            writer.emit_event(
+                ContinuousBenchEvent.SAFETY_REFUSED,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                notes="transport_missing_active_authorization",
+                stop_reason=StopReason.SAFETY_FAULT.value,
+            )
+            return True, None
+
+        write_count = getattr(self.transport, "write_count", self.stats.polls_sent)
+        if write_count >= self.config.max_writes:
+            self._fault = True
+            self.stats.stop_reason = StopReason.MAX_WRITES
+            return True, None
+
+        cd1 = build_cd1_command(PumpControlCommand.RETURN_STATUS)
+        if cd1.command is not PumpControlCommand.RETURN_STATUS:
+            self._fault = True
+            self.stats.stop_reason = StopReason.SAFETY_FAULT
+            return True, None
+        frame, _crc, expected_ack = build_cd1_candidate_frame(
+            logical_address=self.logical_address,
+            sequence=self._rs_sequence,
+            cd1=cd1,
+        )
+        try:
+            authorize(frame, kind=ActiveFrameKind.CD1_RETURN_STATUS)
+            tx_mono = time.monotonic()
+            mono_ns = time.monotonic_ns()
+            await self.transport.write(frame)
+            flush = getattr(self.transport, "flush", None)
+            if callable(flush):
+                await flush()
+        except (RealWayneActiveCommandRefusedError, OSError, TransportNotOpenError) as exc:
+            self._fault = True
+            self.stats.stop_reason = (
+                StopReason.SERIAL_DISCONNECT
+                if isinstance(exc, (OSError, TransportNotOpenError))
+                else StopReason.SAFETY_FAULT
+            )
+            writer.emit_event(
+                ContinuousBenchEvent.SAFETY_REFUSED,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=self.logical_address,
+                notes=str(exc),
+                stop_reason=self.stats.stop_reason.value,
+            )
+            return True, None
+
+        self.stats.return_status_sent += 1
+        self.stats.last_tx_hex = frame.hex(" ")
+        writer.emit_frame(
+            direction="TX",
+            raw=frame,
+            monotonic_ns=mono_ns,
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=poll_seq,
+            timeout_ms=self.config.ack_timeout_ms,
+            classification=None,
+            crc_valid=None,
+            event=ContinuousBenchEvent.RETURN_STATUS_SENT,
+            notes=(
+                f"CD1_RETURN_STATUS sequence={self._rs_sequence} "
+                f"(no RESET/AUTHORIZE)"
+            ),
+        )
+
+        matched, ack_outcome, observed = await wait_for_ack_frame(
+            self.transport,
+            expected_ack=expected_ack,
+            timeout_ms=self.config.ack_timeout_ms,
+        )
+        if matched:
+            self.stats.return_status_ack_match += 1
+        else:
+            self.stats.return_status_ack_timeout += 1
+        writer.emit_event(
+            ContinuousBenchEvent.RETURN_STATUS_ACK,
+            monotonic_ns=time.monotonic_ns(),
+            pump_address=self.logical_address,
+            logical_address=self.logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=poll_seq,
+            notes=f"ack={ack_outcome}; observed={observed[:3]}",
+        )
+        self._rs_sequence = next_sequence_nibble(self._rs_sequence)
+        # ACK timeout is non-fatal (mirrors office path continuing after RS).
+        return False, tx_mono
 
     async def _wait_quiet_gap(
         self,

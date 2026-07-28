@@ -77,6 +77,9 @@ class ContinuousPollConfirmations:
     bounded_duration: bool = False
     # Optional: required only when duration exceeds the short-path max.
     extended_watch: bool = False
+    # Option 2: interleave gated CD1 RETURN_STATUS (no RESET/AUTHORIZE).
+    return_status_cadence: bool = False
+    no_reset_no_authorize: bool = False
 
     def missing_flags(self) -> list[str]:
         missing: list[str] = []
@@ -86,12 +89,16 @@ class ContinuousPollConfirmations:
             (self.emergency_isolation_ready, "--confirm-emergency-isolation-ready"),
             (self.no_fuel_test, "--confirm-no-fuel-test"),
             (self.authorization_disabled, "--confirm-authorization-disabled"),
-            (self.status_poll_only, "--confirm-status-poll-only"),
             (self.bounded_duration, "--confirm-bounded-duration"),
         )
         for ok, flag in mapping:
             if not ok:
                 missing.append(flag)
+        if self.return_status_cadence:
+            if not self.no_reset_no_authorize:
+                missing.append("--confirm-no-reset-no-authorize")
+        elif not self.status_poll_only:
+            missing.append("--confirm-status-poll-only")
         return missing
 
 
@@ -111,6 +118,9 @@ class ContinuousPollBenchParams:
     simulator_validation: bool = False
     skip_service_check: bool = False
     skip_port_check: bool = False
+    return_status_every_n_polls: int = 2
+    return_status_sequence: int = 0
+    ack_timeout_ms: int = 200
 
     @property
     def target_type(self) -> str:
@@ -119,6 +129,10 @@ class ContinuousPollBenchParams:
     @property
     def extended_watch(self) -> bool:
         return self.confirmations.extended_watch
+
+    @property
+    def return_status_cadence(self) -> bool:
+        return self.confirmations.return_status_cadence
 
     @property
     def max_duration_s(self) -> int:
@@ -137,7 +151,11 @@ class ContinuousPollBenchParams:
     @property
     def max_writes(self) -> int:
         # Bound by duration/interval (+2 for edge) but never unbounded.
-        approx = int(self.duration_seconds * 1000 / self.poll_interval_ms) + 2
+        # RETURN_STATUS cadence can roughly double TX count → use 2x when enabled.
+        factor = 2 if self.return_status_cadence else 1
+        approx = (
+            int(self.duration_seconds * 1000 / self.poll_interval_ms) + 2
+        ) * factor
         if self.simulator_validation:
             cap = (
                 REAL_WAYNE_EXTENDED_MAX_WRITES
@@ -250,6 +268,38 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
         raise ContinuousPollRefusedError(
             f"baud must be 9600 or 19200, got {params.baud}", reason="bad_baud"
         )
+    if (
+        params.confirmations.return_status_cadence
+        and params.confirmations.status_poll_only
+    ):
+        raise ContinuousPollRefusedError(
+            "cannot combine --confirm-status-poll-only with "
+            "--confirm-return-status-cadence; omit status-poll-only for "
+            "POLL+RETURN_STATUS watch",
+            reason="conflicting_confirmations",
+        )
+    if params.confirmations.return_status_cadence:
+        if not params.confirmations.extended_watch:
+            raise ContinuousPollRefusedError(
+                "return-status-cadence requires --confirm-extended-watch "
+                "(bounded longer watch; Ctrl+C to stop early)",
+                reason="return_status_requires_extended",
+            )
+        if not (1 <= params.return_status_every_n_polls <= 20):
+            raise ContinuousPollRefusedError(
+                "return-status-every-n-polls must be 1-20",
+                reason="bad_return_status_every_n",
+            )
+        if not (0 <= params.return_status_sequence <= 15):
+            raise ContinuousPollRefusedError(
+                "sequence must be 0-15 (DATA sequence nibble)",
+                reason="bad_sequence",
+            )
+        if not (50 <= params.ack_timeout_ms < params.poll_interval_ms):
+            raise ContinuousPollRefusedError(
+                "ack-timeout-ms must be >= 50 and < poll-interval-ms",
+                reason="bad_ack_timeout",
+            )
     if not params.simulator_validation:
         if params.poll_interval_ms < REAL_WAYNE_MIN_POLL_INTERVAL_MS:
             raise ContinuousPollRefusedError(
@@ -257,9 +307,11 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
                 f"{REAL_WAYNE_MIN_POLL_INTERVAL_MS} (got {params.poll_interval_ms})",
                 reason="real_wayne_poll_interval",
             )
-        # Real-Wayne: hard-cap computed writes (polls at t=0, interval, ... < duration).
+        # Real-Wayne: hard-cap computed writes (polls + optional RETURN_STATUS).
         duration_ms = params.duration_seconds * 1000.0
-        approx = int((duration_ms - 1e-9) // params.poll_interval_ms) + 1
+        approx_polls = int((duration_ms - 1e-9) // params.poll_interval_ms) + 1
+        factor = 2 if params.return_status_cadence else 1
+        approx = approx_polls * factor
         write_cap = (
             REAL_WAYNE_EXTENDED_MAX_WRITES
             if params.extended_watch
@@ -267,8 +319,9 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
         )
         if approx > write_cap:
             raise ContinuousPollRefusedError(
-                f"computed poll count {approx} exceeds real-Wayne max "
-                f"{write_cap}; reduce duration or increase interval",
+                f"computed write count {approx} exceeds real-Wayne max "
+                f"{write_cap}; reduce duration, increase interval, or "
+                f"raise return-status-every-n-polls",
                 reason="max_writes_exceeded",
             )
 
