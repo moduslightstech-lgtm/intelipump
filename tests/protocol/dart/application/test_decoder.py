@@ -108,3 +108,5 @@ def test_dc3_nozzle_and_price() -> None:
     assert tx.decoded_body["price"]["value"] == "11.75"
     assert tx.decoded_body["selected_logical_nozzle"] == 1
     assert tx.decoded_body["nozzle_out"] is True
+    assert tx.decoded_body["nozio"]["nozioRawHex"] == "11"
+    assert tx.decoded_body["nozio"]["positionMask"] == "0x10"

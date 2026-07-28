@@ -25,6 +25,7 @@ from intelipump_fdc.protocol.dart.application.models import (
     DecodeBundle,
     RawTransaction,
 )
+from intelipump_fdc.protocol.dart.application.nozio import decode_nozio
 from intelipump_fdc.protocol.dart.application.splitter import split_transactions
 from intelipump_fdc.protocol.dart.application.status import describe_wayne_status
 
@@ -326,9 +327,8 @@ def _decode_dc3_preferred(
             source_frame_raw_hex=source_frame_raw_hex,
         )
 
-    nozio = raw_tx.data[3]
-    nozzle = nozio & 0x0F
-    nozzle_out = bool(nozio & 0x10)
+    nozio_dec = decode_nozio(raw_tx.data[3])
+    warnings.extend(nozio_dec.warnings)
     if price_decimals is None:
         warnings.append(
             "Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) "
@@ -343,11 +343,12 @@ def _decode_dc3_preferred(
 
     body = {
         "price": price.as_report_dict(),
-        "nozio_raw": nozio,
-        "selected_logical_nozzle": nozzle,
-        "nozzle_out": nozzle_out,
+        "nozio_raw": nozio_dec.nozio_raw,
+        "selected_logical_nozzle": nozio_dec.selected_logical_nozzle,
+        "nozzle_out": nozio_dec.nozzle_out,
+        "nozio": nozio_dec.to_evidence_dict(),
         "alternate_cd3_volume_view": alt_volume,
-        "spec_ref": "Pump Interface Rev 2.11, page 21, DC3",
+        "spec_ref": nozio_dec.documentation_source,
     }
     return _envelope(
         raw_tx,

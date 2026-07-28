@@ -48,11 +48,28 @@ class DecodedStatusSnapshot:
     filling_price_raw_bcd_hex: str | None = None
     selected_logical_nozzle: int | None = None
     nozzle_out: bool | None = None
+    nozio_evidence: dict[str, Any] | None = None
     has_dc5_alarm: bool = False
     alarm_code: int | None = None
     raw_frame_hex: str = ""
 
     def to_report_dict(self) -> dict[str, Any]:
+        dc3: dict[str, Any] = {
+            "fillingPriceRawScaled": self.filling_price_raw_scaled,
+            "fillingPriceRawBcd": self.filling_price_raw_bcd_hex,
+            "selectedLogicalNozzle": self.selected_logical_nozzle,
+            "nozzlePosition": (
+                "OUT"
+                if self.nozzle_out is True
+                else ("IN" if self.nozzle_out is False else None)
+            ),
+            "note": (
+                "selectedLogicalNozzle is evidence only; "
+                "does not prove configured nozzle count"
+            ),
+        }
+        if self.nozio_evidence is not None:
+            dc3.update(self.nozio_evidence)
         return {
             "wireAddress": f"0x{self.wire_address:02X}",
             "crcValid": self.crc_valid,
@@ -64,20 +81,7 @@ class DecodedStatusSnapshot:
                 "filledVolumeRawBcd": self.volume_raw_bcd_hex,
                 "filledAmountRawBcd": self.amount_raw_bcd_hex,
             },
-            "dc3": {
-                "fillingPriceRawScaled": self.filling_price_raw_scaled,
-                "fillingPriceRawBcd": self.filling_price_raw_bcd_hex,
-                "selectedLogicalNozzle": self.selected_logical_nozzle,
-                "nozzlePosition": (
-                    "OUT"
-                    if self.nozzle_out is True
-                    else ("IN" if self.nozzle_out is False else None)
-                ),
-                "note": (
-                    "selectedLogicalNozzle is evidence only; "
-                    "does not prove configured nozzle count"
-                ),
-            },
+            "dc3": dc3,
             "dc5Alarm": {
                 "present": self.has_dc5_alarm,
                 "alarmCode": self.alarm_code,
@@ -142,6 +146,9 @@ def decode_status_frame(
             snap.filling_price_raw_bcd_hex = price.get("raw_bcd_hex")
             snap.selected_logical_nozzle = body.get("selected_logical_nozzle")
             snap.nozzle_out = body.get("nozzle_out")
+            nozio_ev = body.get("nozio")
+            if isinstance(nozio_ev, dict):
+                snap.nozio_evidence = dict(nozio_ev)
             entry.update(
                 {
                     "type": "DC3",
@@ -150,6 +157,8 @@ def decode_status_frame(
                     "nozzlePosition": "OUT" if snap.nozzle_out else "IN",
                 }
             )
+            if snap.nozio_evidence is not None:
+                entry.update(snap.nozio_evidence)
         elif tx.transaction_type is TransactionType.DC5_ALARM:
             snap.has_dc5_alarm = True
             snap.alarm_code = body.get("alarm_code")
