@@ -74,6 +74,7 @@ class FakeWriteTransport:
     _approved_kind: ActiveFrameKind | None = None
     _poll_n: int = 0
     expected_ack: bytes = bytes.fromhex("50 c0 fa")
+    initial_status: bytes = _STATUS_NOT_PROGRAMMED
     # Extra post-CD5 status payloads before FILLING_COMPLETE (settle retry).
     post_status_before_complete: list[bytes] = field(default_factory=list)
 
@@ -162,7 +163,7 @@ class FakeWriteTransport:
         self.written.append(data)
         self._poll_n += 1
         if self._poll_n == 1:
-            self._chunks.append(_frame(_STATUS_NOT_PROGRAMMED))
+            self._chunks.append(_frame(self.initial_status))
         elif self.post_status_before_complete:
             payload = self.post_status_before_complete.pop(0)
             self._chunks.append(_frame(payload, seq=2))
@@ -254,6 +255,27 @@ def test_post_write_requires_filling_complete() -> None:
     )
     with pytest.raises(StatusPreconditionError):
         validate_post_write_status(bad, expected_wire_address=0x50)
+
+
+@pytest.mark.asyncio
+async def test_write_session_reprices_from_filling_complete(tmp_path: Path) -> None:
+    transport = FakeWriteTransport(initial_status=_STATUS_FILLING_COMPLETE)
+    params = PriceWriteParams(
+        port="/tmp/fake",
+        address=1,
+        logical_nozzle_count=2,
+        price_nozzle_1=1175,
+        price_nozzle_2=1175,
+        evidence_dir=tmp_path / "ev",
+        confirmations=_write_confirms(),
+        sequence=1,
+        post_write_settle_ms=0,
+        post_write_max_status_polls=3,
+    )
+    result = await PriceWriteSession(transport, params).run()
+    assert result.transmitted is True
+    assert result.state is PriceWriteState.FILLING_COMPLETE_VERIFIED
+    assert transport.cd5_write_count == 1
 
 
 @pytest.mark.asyncio

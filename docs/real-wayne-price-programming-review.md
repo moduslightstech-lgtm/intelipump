@@ -27,6 +27,8 @@ Controller mode: price/reset/authorize CLIs use `LISTEN_ONLY`. Poll-bench uses
 |-------------|--------|
 | CD5 two-nozzle `1175`/`1175` | Works. DC1 → `FILLING_COMPLETED/5`; DC3 price `00 11 75` |
 | Glass after CD5 | Price + `0.00` may flash, then **CLOSED** (matches DC1 `5`) |
+| Glass scale | `1175` wire → **1.175** when DPUNP=3; need DPUNP=0 for glass `1175` |
+| CD5 from `FILLING_COMPLETE` | Tool now allows re-price (Pump Interface ex. 4.3); does not fix RESET |
 | Post-CD5 verify lag | Tool may `FAULT` while still seeing DC1 `0`; a later poll shows `5` |
 | Lone CD1 RESET | TX + often `ACK_MATCH` (sometimes `ACK_TIMEOUT`); **DC1 stays `5`** |
 | CD2+RESET (nozzle OUT) | TX + `ACK_MATCH`; **DC1 stays `5`** |

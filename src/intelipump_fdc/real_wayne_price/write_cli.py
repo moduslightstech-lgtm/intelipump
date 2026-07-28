@@ -34,10 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="intelipump-real-wayne-price-write",
         description=(
             "Technician-supervised real-Wayne CD5 price write. "
-            "Polls status, transmits exactly one pre-built CD5 DATA frame, "
-            "waits for ACK hypothesis, then verifies DC1 FILLING_COMPLETE "
+            "Requires DC1 PUMP_NOT_PROGRAMMED (initial) or FILLING_COMPLETE "
+            "(re-price; Pump Interface example 4.3). Transmits exactly one CD5 "
+            "DATA frame, waits for ACK, then verifies DC1 FILLING_COMPLETE "
             "(retries with settle; lab saw multi-second lag). "
-            "Does not send RESET or AUTHORIZE."
+            "Does not send RESET or AUTHORIZE. Does not change unit-price "
+            "decimals (DPUNP); glass 1.175 vs 1175 is a DPUNP issue."
         ),
     )
     p.add_argument("--port", required=True)

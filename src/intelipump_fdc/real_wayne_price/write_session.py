@@ -123,7 +123,10 @@ class PriceWriteSession:
                 expected_wire_address=self.wire_address,
                 authorization_disabled=self.params.confirmations.authorization_disabled,
             )
-            state = PriceWriteState.PUMP_NOT_PROGRAMMED
+            if snap.dc1_code == int(WaynePumpStatus.FILLING_COMPLETED):
+                state = PriceWriteState.FILLING_COMPLETE
+            else:
+                state = PriceWriteState.PUMP_NOT_PROGRAMMED
 
             cd5 = build_cd5_price_update(
                 self.params.prices_dict(),

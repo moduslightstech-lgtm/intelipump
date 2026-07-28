@@ -200,6 +200,20 @@ def test_status_preconditions() -> None:
         ok, expected_wire_address=0x50, authorization_disabled=True
     )
 
+    ok_fc = DecodedStatusSnapshot(
+        wire_address=0x50,
+        crc_valid=True,
+        dc1_code=5,
+        dc1_name="FILLING_COMPLETED",
+        volume_raw_scaled=0,
+        amount_raw_scaled=0,
+        selected_logical_nozzle=1,
+        nozzle_out=False,
+    )
+    validate_preconditions(
+        ok_fc, expected_wire_address=0x50, authorization_disabled=True
+    )
+
     bad = DecodedStatusSnapshot(
         wire_address=0x50,
         crc_valid=True,

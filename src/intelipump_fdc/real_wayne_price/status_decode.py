@@ -160,12 +160,25 @@ def decode_status_frame(
     return snap
 
 
+_CD5_ELIGIBLE_DC1 = frozenset(
+    {
+        int(WaynePumpStatus.PUMP_NOT_PROGRAMMED),
+        int(WaynePumpStatus.FILLING_COMPLETED),
+    }
+)
+
+
 def validate_preconditions(
     snap: DecodedStatusSnapshot,
     *,
     expected_wire_address: int,
     authorization_disabled: bool,
 ) -> None:
+    """CD5 eligibility: idle not-programmed, or re-price from FILLING_COMPLETE.
+
+    Pump Interface: initial price from PUMP NOT PROGRAMMED; example 4.3 also
+    sends CD5 while FILLING COMPLETE. Refuse active FILLING / AUTHORIZED / etc.
+    """
     reasons: list[str] = []
     if not snap.crc_valid:
         reasons.append("crc_invalid")
@@ -176,9 +189,11 @@ def validate_preconditions(
         )
     if snap.dc1_code is None:
         reasons.append("dc1_missing")
-    elif snap.dc1_code != int(WaynePumpStatus.PUMP_NOT_PROGRAMMED):
+    elif snap.dc1_code not in _CD5_ELIGIBLE_DC1:
         reasons.append(
-            f"dc1_not_PUMP_NOT_PROGRAMMED got={snap.dc1_name}/{snap.dc1_code}"
+            "dc1_not_CD5_eligible "
+            f"got={snap.dc1_name}/{snap.dc1_code} "
+            "allowed=PUMP_NOT_PROGRAMMED|FILLING_COMPLETED"
         )
     if snap.volume_raw_scaled is None or snap.amount_raw_scaled is None:
         reasons.append("dc2_missing_or_incomplete")
