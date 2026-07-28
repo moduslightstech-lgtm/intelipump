@@ -129,7 +129,7 @@ class ContinuousPollConfirmations:
 @dataclass(frozen=True, slots=True)
 class ContinuousPollBenchParams:
     port: str
-    address: int
+    addresses: tuple[int, ...]
     duration_seconds: float
     poll_interval_ms: int
     response_timeout_ms: int
@@ -145,6 +145,11 @@ class ContinuousPollBenchParams:
     return_status_every_n_polls: int = 2
     return_status_sequence: int = 0
     ack_timeout_ms: int = 200
+
+    @property
+    def address(self) -> int:
+        """Primary / first logical address (compat)."""
+        return self.addresses[0]
 
     @property
     def target_type(self) -> str:
@@ -247,12 +252,27 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
             "missing confirmation flags: " + ", ".join(missing),
             reason="missing_confirmations",
         )
-    if params.address not in {1, 2}:
+    if not params.addresses:
         raise ContinuousPollRefusedError(
-            f"logical address must be 1 or 2 for captured legacy iGEM profile; "
-            f"got {params.address}",
+            "at least one --address is required", reason="bad_address"
+        )
+    if len(params.addresses) > 2:
+        raise ContinuousPollRefusedError(
+            "at most two addresses (1 and/or 2) on one RS-485 adapter",
             reason="bad_address",
         )
+    if len(set(params.addresses)) != len(params.addresses):
+        raise ContinuousPollRefusedError(
+            f"duplicate addresses not allowed: {params.addresses}",
+            reason="bad_address",
+        )
+    for addr in params.addresses:
+        if addr not in {1, 2}:
+            raise ContinuousPollRefusedError(
+                f"logical address must be 1 or 2 for captured legacy iGEM "
+                f"profile; got {addr}",
+                reason="bad_address",
+            )
     if (
         params.confirmations.until_ctrl_c
         and params.confirmations.bounded_duration

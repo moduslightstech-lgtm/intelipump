@@ -34,17 +34,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="intelipump-continuous-poll-bench",
         description=(
-            "CONTINUOUS_POLL_BENCH: bounded or until-Ctrl+C status polls against "
-            "one owned lab pump address. Optional gated CD1 RETURN_STATUS "
-            "cadence (no RESET/AUTHORIZE). Stop intelipump.service first."
+            "CONTINUOUS_POLL_BENCH: bounded or until-Ctrl+C status polls on one "
+            "RS-485 adapter. Pass --address once or twice (--address 1 "
+            "--address 2) to round-robin both sides. Optional gated CD1 "
+            "RETURN_STATUS (no RESET/AUTHORIZE). Stop intelipump.service first."
         ),
     )
     parser.add_argument("--port", required=True)
     parser.add_argument(
         "--address",
         type=int,
+        action="append",
         required=True,
-        help="Exactly one pump address (1-255)",
+        help=(
+            "Logical pump address 1 and/or 2. Repeat for dual-side interleave "
+            "on one adapter: --address 1 --address 2"
+        ),
     )
     parser.add_argument(
         "--duration-seconds",
@@ -224,7 +229,7 @@ async def _async_main(args: argparse.Namespace) -> int:
     settings = get_settings()
     params = ContinuousPollBenchParams(
         port=args.port,
-        address=args.address,
+        addresses=tuple(int(a) for a in args.address),
         duration_seconds=float(args.duration_seconds),
         poll_interval_ms=args.poll_interval_ms,
         response_timeout_ms=args.response_timeout_ms,
@@ -279,7 +284,7 @@ async def _async_main(args: argparse.Namespace) -> int:
         transport,
         ContinuousPollSessionConfig(
             port=params.port,
-            address=params.address,
+            addresses=params.addresses,
             baud=params.baud,
             duration_seconds=params.duration_seconds,
             poll_interval_ms=params.poll_interval_ms,

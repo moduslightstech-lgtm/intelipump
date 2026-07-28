@@ -112,7 +112,7 @@ def _lab_settings(**kwargs: object) -> Settings:
 def _params(tmp_path: Path, **overrides: object) -> ContinuousPollBenchParams:
     base: dict[str, object] = dict(
         port="/tmp/fake-cpb",
-        address=1,
+        addresses=(1,),
         duration_seconds=3.0,
         poll_interval_ms=100,
         response_timeout_ms=50,
@@ -122,6 +122,9 @@ def _params(tmp_path: Path, **overrides: object) -> ContinuousPollBenchParams:
         skip_service_check=True,
         skip_port_check=True,
     )
+    if "address" in overrides and "addresses" not in overrides:
+        addr = overrides.pop("address")
+        overrides["addresses"] = (int(addr),)  # type: ignore[arg-type]
     base.update(overrides)
     return ContinuousPollBenchParams(**base)  # type: ignore[arg-type]
 
@@ -230,7 +233,15 @@ class FakeBenchTransport:
         elif self.auto_eot_address is not None:
             self.chunks.append(build_eot(encode_wire_address(self.auto_eot_address), 0))
         elif self.auto_data:
-            self.chunks.append(WAYNE_25)
+            # Reply with a CRC-valid DATA frame for the polled wire address.
+            wire = data[0] if data else 0x50
+            if wire == 0x50:
+                self.chunks.append(WAYNE_25)
+            else:
+                logical = 2 if wire == 0x51 else 1
+                self.chunks.append(
+                    build_data_frame(wire, 0, encode_dc1_status(logical))
+                )
         return len(data)
 
 
@@ -241,7 +252,7 @@ def _session(
 ) -> ContinuousPollSession:
     cfg_kwargs: dict[str, object] = dict(
         port="/tmp/fake",
-        address=1,
+        addresses=(1,),
         baud=9600,
         duration_seconds=3.0,
         poll_interval_ms=100,
@@ -252,6 +263,9 @@ def _session(
         target_type="SIMULATOR",
         simulator_validation=True,
     )
+    if "address" in overrides and "addresses" not in overrides:
+        addr = overrides.pop("address")
+        overrides["addresses"] = (int(addr),)  # type: ignore[arg-type]
     cfg_kwargs.update(overrides)
     return ContinuousPollSession(
         transport, ContinuousPollSessionConfig(**cfg_kwargs)  # type: ignore[arg-type]
@@ -315,6 +329,50 @@ def test_one_address_only_cli() -> None:
                 "--evidence-dir",
                 "/tmp/ev",
             ]
+        )
+
+
+def test_dual_address_cli_parses() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--port",
+            "/tmp/x",
+            "--address",
+            "1",
+            "--address",
+            "2",
+            "--evidence-dir",
+            "/tmp/ev",
+            "--confirm-until-ctrl-c",
+        ]
+    )
+    assert args.address == [1, 2]
+
+
+def test_dual_address_params_ok(tmp_path: Path) -> None:
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            addresses=(1, 2),
+            poll_interval_ms=300,
+            response_timeout_ms=250,
+            simulator_validation=False,
+            confirmations=_confirms(
+                status_poll_only=False,
+                bounded_duration=False,
+                until_ctrl_c=True,
+                return_status_cadence=True,
+                no_reset_no_authorize=True,
+            ),
+        )
+    )
+
+
+def test_duplicate_address_refused(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="duplicate"):
+        validate_continuous_params(
+            _params(tmp_path, addresses=(1, 1), simulator_validation=True)
         )
 
 
@@ -1235,6 +1293,30 @@ async def test_extended_watch_does_not_clamp_to_50_writes(
     # With 50ms interval over 1s, expect ~20 polls — well under 80, not capped at 50.
     assert 15 <= _as_int(summary["pollsSent"]) <= 25
     assert summary["stopReason"] == "duration_expired"
+
+
+@pytest.mark.asyncio
+async def test_dual_address_round_robin_polls(tmp_path: Path) -> None:
+    from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
+
+    transport = FakeBenchTransport()
+    session = _session(
+        transport,
+        tmp_path,
+        addresses=(1, 2),
+        duration_seconds=1.0,
+        poll_interval_ms=100,
+        response_timeout_ms=40,
+        max_writes=50,
+    )
+    summary = await session.run()
+    assert summary["logicalAddresses"] == [1, 2]
+    polls = [w for w in transport.written if w in {build_poll(1), build_poll(2)}]
+    assert len(polls) >= 4
+    assert polls[0] == build_poll(1)
+    assert polls[1] == build_poll(2)
+    assert polls[2] == build_poll(1)
+    assert _as_int(summary["dataResponses"]) >= 1
 
 
 @pytest.mark.asyncio

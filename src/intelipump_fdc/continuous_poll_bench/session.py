@@ -59,7 +59,7 @@ _INTERIM_CONTROL_CLASSES = frozenset({CapturedFrameClass.SHORT_CONTROL_70})
 @dataclass(frozen=True, slots=True)
 class ContinuousPollSessionConfig:
     port: str
-    address: int
+    addresses: tuple[int, ...]
     baud: int
     duration_seconds: float
     poll_interval_ms: int
@@ -77,10 +77,15 @@ class ContinuousPollSessionConfig:
     ack_timeout_ms: int = 200
     until_ctrl_c: bool = False
 
+    @property
+    def address(self) -> int:
+        return self.addresses[0]
+
 
 class ContinuousPollSession:
     """Sends status polls on a monotonic schedule; optional gated RETURN_STATUS.
 
+    One or two logical addresses on a single adapter (round-robin).
     Never builds RESET/AUTHORIZE. No controller command queue.
     """
 
@@ -89,6 +94,15 @@ class ContinuousPollSession:
         transport: BenchByteTransport,
         config: ContinuousPollSessionConfig,
     ) -> None:
+        if not config.addresses:
+            raise ValueError("addresses must be non-empty")
+        if len(config.addresses) > 2:
+            raise ValueError("at most two addresses")
+        if len(set(config.addresses)) != len(config.addresses):
+            raise ValueError("duplicate addresses")
+        for addr in config.addresses:
+            if addr not in {1, 2}:
+                raise ValueError(f"address must be 1 or 2, got {addr}")
         if config.until_ctrl_c:
             pass
         elif config.duration_seconds < 1:
@@ -108,8 +122,9 @@ class ContinuousPollSession:
                 raise ValueError("return_status_sequence must be 0-15")
         self.transport = transport
         self.config = config
-        self.logical_address = config.address
-        self.wire_address = encode_wire_address(config.address)
+        self.addresses = config.addresses
+        self.logical_address = config.addresses[0]
+        self.wire_address = encode_wire_address(self.logical_address)
         self.session_id = new_session_id()
         self.stats = ContinuousSessionStats(
             requested_duration_s=(
@@ -122,7 +137,11 @@ class ContinuousPollSession:
         self.result: ContinuousBenchResult | None = None
         self._fault = False
         self._commit = software_commit()
-        self._rs_sequence = int(config.return_status_sequence) & 0x0F
+        start_seq = int(config.return_status_sequence) & 0x0F
+        self._rs_sequence: dict[int, int] = {
+            addr: start_seq for addr in config.addresses
+        }
+        self._rr_index = 0
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -223,7 +242,7 @@ class ContinuousPollSession:
                 port=self.config.port,
                 canonical=self.config.canonical or self.config.port,
                 baud=self.config.baud,
-                address=self.config.address,
+                address=",".join(str(a) for a in self.addresses),
                 poll_interval_ms=self.config.poll_interval_ms,
                 response_timeout_ms=self.config.response_timeout_ms,
                 stats=self.stats,
@@ -280,7 +299,9 @@ class ContinuousPollSession:
             ),
             "softwareCommit": self._commit,
             "logicalAddress": self.logical_address,
+            "logicalAddresses": list(self.addresses),
             "wireAddress": self.wire_address,
+            "wireAddresses": [encode_wire_address(a) for a in self.addresses],
         }
 
     async def _run_scheduler(
@@ -385,8 +406,12 @@ class ContinuousPollSession:
                 return
 
             seq += 1
+            logical = self.addresses[self._rr_index % len(self.addresses)]
+            self._rr_index += 1
+            self.logical_address = logical
+            self.wire_address = encode_wire_address(logical)
             stop_early, tx_monotonic = await self._one_poll(
-                writer, seq, lag_ms=lag_ms
+                writer, seq, lag_ms=lag_ms, logical_address=logical
             )
             previous_tx = (
                 tx_monotonic if tx_monotonic is not None else time.monotonic()
@@ -399,7 +424,9 @@ class ContinuousPollSession:
                 self.config.return_status_cadence
                 and seq % self.config.return_status_every_n_polls == 0
             ):
-                stop_rs, rs_tx = await self._one_return_status(writer, seq)
+                stop_rs, rs_tx = await self._one_return_status(
+                    writer, seq, logical_address=logical
+                )
                 if rs_tx is not None:
                     previous_tx = rs_tx
                 if stop_rs:
@@ -409,8 +436,12 @@ class ContinuousPollSession:
         self,
         writer: EvidenceWriter,
         poll_seq: int,
+        *,
+        logical_address: int,
     ) -> tuple[bool, float | None]:
         """Transmit one gated CD1 RETURN_STATUS; never RESET/AUTHORIZE."""
+        self.logical_address = logical_address
+        self.wire_address = encode_wire_address(logical_address)
         authorize = getattr(self.transport, "authorize_single_active_write", None)
         if not callable(authorize):
             self._fault = True
@@ -418,7 +449,7 @@ class ContinuousPollSession:
             writer.emit_event(
                 ContinuousBenchEvent.SAFETY_REFUSED,
                 monotonic_ns=time.monotonic_ns(),
-                pump_address=self.logical_address,
+                pump_address=logical_address,
                 notes="transport_missing_active_authorization",
                 stop_reason=StopReason.SAFETY_FAULT.value,
             )
@@ -435,9 +466,10 @@ class ContinuousPollSession:
             self._fault = True
             self.stats.stop_reason = StopReason.SAFETY_FAULT
             return True, None
+        rs_seq = self._rs_sequence[logical_address]
         frame, _crc, expected_ack = build_cd1_candidate_frame(
-            logical_address=self.logical_address,
-            sequence=self._rs_sequence,
+            logical_address=logical_address,
+            sequence=rs_seq,
             cd1=cd1,
         )
         try:
@@ -458,7 +490,7 @@ class ContinuousPollSession:
             writer.emit_event(
                 ContinuousBenchEvent.SAFETY_REFUSED,
                 monotonic_ns=time.monotonic_ns(),
-                pump_address=self.logical_address,
+                pump_address=logical_address,
                 notes=str(exc),
                 stop_reason=self.stats.stop_reason.value,
             )
@@ -470,8 +502,8 @@ class ContinuousPollSession:
             direction="TX",
             raw=frame,
             monotonic_ns=mono_ns,
-            pump_address=self.logical_address,
-            logical_address=self.logical_address,
+            pump_address=logical_address,
+            logical_address=logical_address,
             wire_address=self.wire_address,
             poll_sequence=poll_seq,
             timeout_ms=self.config.ack_timeout_ms,
@@ -479,8 +511,8 @@ class ContinuousPollSession:
             crc_valid=None,
             event=ContinuousBenchEvent.RETURN_STATUS_SENT,
             notes=(
-                f"CD1_RETURN_STATUS sequence={self._rs_sequence} "
-                f"(no RESET/AUTHORIZE)"
+                f"CD1_RETURN_STATUS address={logical_address} "
+                f"sequence={rs_seq} (no RESET/AUTHORIZE)"
             ),
         )
 
@@ -496,13 +528,13 @@ class ContinuousPollSession:
         writer.emit_event(
             ContinuousBenchEvent.RETURN_STATUS_ACK,
             monotonic_ns=time.monotonic_ns(),
-            pump_address=self.logical_address,
-            logical_address=self.logical_address,
+            pump_address=logical_address,
+            logical_address=logical_address,
             wire_address=self.wire_address,
             poll_sequence=poll_seq,
             notes=f"ack={ack_outcome}; observed={observed[:3]}",
         )
-        self._rs_sequence = next_sequence_nibble(self._rs_sequence)
+        self._rs_sequence[logical_address] = next_sequence_nibble(rs_seq)
         # ACK timeout is non-fatal (mirrors office path continuing after RS).
         return False, tx_mono
 
@@ -575,8 +607,11 @@ class ContinuousPollSession:
         seq: int,
         *,
         lag_ms: float,
+        logical_address: int,
     ) -> tuple[bool, float | None]:
         """Return ``(stop_early, tx_monotonic)`` for schedule spacing."""
+        self.logical_address = logical_address
+        self.wire_address = encode_wire_address(logical_address)
 
         def _on_chunk(chunk: SerialChunk, ownership: ChunkOwnership) -> None:
             if ownership is ChunkOwnership.STALE:

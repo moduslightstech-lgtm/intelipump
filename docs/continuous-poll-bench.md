@@ -2,11 +2,11 @@
 
 **Tool:** `intelipump-continuous-poll-bench`
 
-Bounded **status-only** DART polls against **exactly one** confirmed pump
-address. Default is a short session; optional extended POLL-only watch
-(up to 300 s, Ctrl+C to stop early) for catching nozzle / DC3 transitions.
-Intended to help determine whether regular status polling prevents
-Wayne iGEM POS Communication Lost / Error 30.
+Bounded **status-only** DART polls against **one or two** confirmed pump
+addresses on a **single** RS-485 adapter (`--address 1` and/or `--address 2`).
+Dual-address mode round-robins both sides in one process (cannot open the
+same adapter twice). Default is a short session; optional extended / until-
+Ctrl+C watch for catching nozzle / DC3 transitions.
 
 Logical `--address 1` transmits captured `50 20 FA`; `--address 2` transmits
 `51 20 FA`. Evidence includes `logicalAddress` and `wireAddress`.
@@ -159,6 +159,7 @@ Omit `--confirm-bounded-duration` and `--duration-seconds` (ignored).
 ```bash
 uv run intelipump-continuous-poll-bench \
   --port /dev/intelipump-controller \
+  --address 1 \
   --address 2 \
   --poll-interval-ms 300 \
   --response-timeout-ms 250 \
