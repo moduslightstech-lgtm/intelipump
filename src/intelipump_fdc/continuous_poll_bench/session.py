@@ -75,6 +75,7 @@ class ContinuousPollSessionConfig:
     return_status_every_n_polls: int = 2
     return_status_sequence: int = 0
     ack_timeout_ms: int = 200
+    until_ctrl_c: bool = False
 
 
 class ContinuousPollSession:
@@ -88,14 +89,18 @@ class ContinuousPollSession:
         transport: BenchByteTransport,
         config: ContinuousPollSessionConfig,
     ) -> None:
-        if config.duration_seconds < 1:
+        if config.until_ctrl_c:
+            pass
+        elif config.duration_seconds < 1:
             raise ValueError("duration_seconds must be >= 1")
         if not (50 <= config.poll_interval_ms <= 1000):
             raise ValueError("poll_interval_ms must be 50-1000")
         if config.response_timeout_ms >= config.poll_interval_ms:
             raise ValueError("response_timeout_ms must be < poll_interval_ms")
-        if config.max_writes < 1:
-            raise ValueError("max_writes must be >= 1")
+        if config.max_writes < 0:
+            raise ValueError("max_writes must be >= 0 (0=unlimited)")
+        if not config.until_ctrl_c and config.max_writes < 1:
+            raise ValueError("max_writes must be >= 1 unless until_ctrl_c")
         if config.return_status_cadence:
             if not (1 <= config.return_status_every_n_polls <= 20):
                 raise ValueError("return_status_every_n_polls must be 1-20")
@@ -107,7 +112,9 @@ class ContinuousPollSession:
         self.wire_address = encode_wire_address(config.address)
         self.session_id = new_session_id()
         self.stats = ContinuousSessionStats(
-            requested_duration_s=config.duration_seconds
+            requested_duration_s=(
+                0.0 if config.until_ctrl_c else config.duration_seconds
+            )
         )
         self._stop = asyncio.Event()
         self.command_queue_created = False
@@ -156,6 +163,7 @@ class ContinuousPollSession:
                     f"max_writes={self.config.max_writes} "
                     f"return_status_cadence={self.config.return_status_cadence} "
                     f"return_status_every_n={self.config.return_status_every_n_polls} "
+                    f"until_ctrl_c={self.config.until_ctrl_c} "
                     f"targetType={self.config.target_type} "
                     f"simulatorValidation={self.config.simulator_validation}"
                     f"{serial_notes}"
@@ -175,8 +183,10 @@ class ContinuousPollSession:
         finally:
             self.stats.actual_duration_s = time.monotonic() - t_start
             if self._stop.is_set() and self.stats.stop_reason is None:
-                self._fault = True
                 self.stats.stop_reason = StopReason.OPERATOR_INTERRUPT
+                # Intentional stop for until-ctrl-c; fault only for bounded early stop.
+                if not self.config.until_ctrl_c:
+                    self._fault = True
             if self.stats.stop_reason is None:
                 self.stats.stop_reason = StopReason.DURATION_EXPIRED
             if (
@@ -253,6 +263,7 @@ class ContinuousPollSession:
             "returnStatusAckMatch": self.stats.return_status_ack_match,
             "returnStatusAckTimeout": self.stats.return_status_ack_timeout,
             "returnStatusCadence": self.config.return_status_cadence,
+            "untilCtrlC": self.config.until_ctrl_c,
             "commandQueueCreated": self.command_queue_created,
             "authorizationObjectsCreated": self.authorization_objects_created,
             "targetType": self.config.target_type,
@@ -281,19 +292,24 @@ class ContinuousPollSession:
         bursts. Spacing is always measured from the previous actual TX time.
         """
         interval_s = self.config.poll_interval_ms / 1000.0
-        end = t_start + self.config.duration_seconds
+        end: float | None = (
+            None
+            if self.config.until_ctrl_c
+            else t_start + self.config.duration_seconds
+        )
         next_ideal = t_start
         previous_tx: float | None = None
         seq = 0
 
         while True:
             if self._stop.is_set():
-                self._fault = True
                 self.stats.stop_reason = StopReason.OPERATOR_INTERRUPT
+                if not self.config.until_ctrl_c:
+                    self._fault = True
                 return
 
             now = time.monotonic()
-            if now >= end:
+            if end is not None and now >= end:
                 self.stats.stop_reason = StopReason.DURATION_EXPIRED
                 return
 
@@ -314,20 +330,23 @@ class ContinuousPollSession:
                 skipped += 1
 
             next_tx = max(next_ideal, min_next)
-            if next_tx >= end:
+            if end is not None and next_tx >= end:
                 self.stats.stop_reason = StopReason.DURATION_EXPIRED
                 return
 
             if now < next_tx:
-                wait = min(next_tx - now, end - now)
+                wait = next_tx - now
+                if end is not None:
+                    wait = min(wait, end - now)
                 if wait > 0:
                     try:
                         await asyncio.wait_for(self._stop.wait(), timeout=wait)
                     except TimeoutError:
                         pass
                     else:
-                        self._fault = True
                         self.stats.stop_reason = StopReason.OPERATOR_INTERRUPT
+                        if not self.config.until_ctrl_c:
+                            self._fault = True
                         return
                 # Recompute with fresh monotonic time after the wait.
                 continue
@@ -350,11 +369,10 @@ class ContinuousPollSession:
                 )
 
             write_count = getattr(self.transport, "write_count", self.stats.polls_sent)
-            # Trust preflight-validated config.max_writes (short path 50;
-            # extended watch up to REAL_WAYNE_EXTENDED_MAX_WRITES). Do not
-            # re-clamp to the short-path 50 here — that aborted 120s watches.
             max_writes = self.config.max_writes
-            if write_count >= max_writes or self.stats.polls_sent >= max_writes:
+            if max_writes > 0 and (
+                write_count >= max_writes or self.stats.polls_sent >= max_writes
+            ):
                 self._fault = True
                 self.stats.stop_reason = StopReason.MAX_WRITES
                 writer.emit_event(
@@ -407,7 +425,7 @@ class ContinuousPollSession:
             return True, None
 
         write_count = getattr(self.transport, "write_count", self.stats.polls_sent)
-        if write_count >= self.config.max_writes:
+        if self.config.max_writes > 0 and write_count >= self.config.max_writes:
             self._fault = True
             self.stats.stop_reason = StopReason.MAX_WRITES
             return True, None

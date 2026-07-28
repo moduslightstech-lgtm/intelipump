@@ -34,13 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="intelipump-continuous-poll-bench",
         description=(
-            "CONTINUOUS_POLL_BENCH: bounded status-only DART polls against "
-            "one owned lab pump address. Default short path (real-Wayne max 5s). "
-            "Optional extended POLL-only watch (max 300s) with "
-            "--confirm-extended-watch; Ctrl+C stops early. "
-            "Optional POLL+CD1 RETURN_STATUS cadence (ePump-like; no RESET/"
-            "AUTHORIZE) with --confirm-return-status-cadence. "
-            "Stop intelipump.service first."
+            "CONTINUOUS_POLL_BENCH: bounded or until-Ctrl+C status polls against "
+            "one owned lab pump address. Optional gated CD1 RETURN_STATUS "
+            "cadence (no RESET/AUTHORIZE). Stop intelipump.service first."
         ),
     )
     parser.add_argument("--port", required=True)
@@ -57,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Bounded duration (default 3; real-Wayne short max 5; "
             "simulator short max 30; with --confirm-extended-watch max 300). "
-            "SIGINT/SIGTERM stops early."
+            "Ignored when --confirm-until-ctrl-c is set."
         ),
     )
     parser.add_argument(
@@ -115,7 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm-bounded-duration",
         action="store_true",
-        help="Confirm this session is time-bounded (no daemon/indefinite mode)",
+        help=(
+            "Confirm this session is time-bounded (omit when using "
+            "--confirm-until-ctrl-c)"
+        ),
     )
     parser.add_argument(
         "--confirm-extended-watch",
@@ -127,12 +126,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--confirm-until-ctrl-c",
+        action="store_true",
+        help=(
+            "Poll continuously until SIGINT/SIGTERM (Ctrl+C). No wall-clock "
+            "duration stop and no max-writes cap. Omit --confirm-bounded-duration. "
+            "Still not a systemd daemon."
+        ),
+    )
+    parser.add_argument(
         "--confirm-return-status-cadence",
         action="store_true",
         help=(
             "Interleave gated CD1 RETURN_STATUS with L2 POLL (ePump-like). "
-            "Requires --confirm-extended-watch and --confirm-no-reset-no-authorize. "
-            "Do not pass --confirm-status-poll-only. Never sends RESET/AUTHORIZE."
+            "Requires --confirm-extended-watch or --confirm-until-ctrl-c, and "
+            "--confirm-no-reset-no-authorize. Do not pass --confirm-status-poll-only. "
+            "Never sends RESET/AUTHORIZE."
         ),
     )
     parser.add_argument(
@@ -230,6 +239,7 @@ async def _async_main(args: argparse.Namespace) -> int:
             status_poll_only=args.confirm_status_poll_only,
             bounded_duration=args.confirm_bounded_duration,
             extended_watch=args.confirm_extended_watch,
+            until_ctrl_c=args.confirm_until_ctrl_c,
             return_status_cadence=args.confirm_return_status_cadence,
             no_reset_no_authorize=args.confirm_no_reset_no_authorize,
         ),
@@ -284,6 +294,7 @@ async def _async_main(args: argparse.Namespace) -> int:
             return_status_every_n_polls=params.return_status_every_n_polls,
             return_status_sequence=params.return_status_sequence,
             ack_timeout_ms=params.ack_timeout_ms,
+            until_ctrl_c=params.until_ctrl_c,
         ),
     )
 

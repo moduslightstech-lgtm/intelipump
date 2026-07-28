@@ -408,7 +408,27 @@ def test_extended_watch_raises_write_cap(tmp_path: Path) -> None:
     validate_continuous_params(params)
     assert params.max_writes <= REAL_WAYNE_EXTENDED_MAX_WRITES
     assert params.max_writes > REAL_WAYNE_MAX_WRITES
-    assert REAL_WAYNE_EXTENDED_MAX_WRITES == 1000
+    assert REAL_WAYNE_EXTENDED_MAX_WRITES == 2000
+
+
+def test_five_minute_return_status_watch_within_write_cap(tmp_path: Path) -> None:
+    params = _params(
+        tmp_path,
+        duration_seconds=300,
+        poll_interval_ms=300,
+        response_timeout_ms=250,
+        simulator_validation=False,
+        return_status_every_n_polls=2,
+        confirmations=_confirms(
+            status_poll_only=False,
+            extended_watch=True,
+            return_status_cadence=True,
+            no_reset_no_authorize=True,
+        ),
+    )
+    validate_continuous_params(params)
+    assert params.max_writes <= REAL_WAYNE_EXTENDED_MAX_WRITES
+    assert params.max_writes >= 1500  # ~1000 polls + ~500 RS
 
 
 def test_extended_watch_simulator_allows_beyond_30s(tmp_path: Path) -> None:
@@ -446,7 +466,7 @@ def test_parser_exposes_confirm_extended_watch() -> None:
 def test_return_status_cadence_requires_extended_and_no_reset(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(ContinuousPollRefusedError, match="extended-watch"):
+    with pytest.raises(ContinuousPollRefusedError, match="extended-watch|until-ctrl-c"):
         validate_continuous_params(
             _params(
                 tmp_path,
@@ -475,6 +495,42 @@ def test_return_status_cadence_requires_extended_and_no_reset(
                     extended_watch=True,
                     return_status_cadence=True,
                     no_reset_no_authorize=False,
+                ),
+            )
+        )
+
+
+def test_until_ctrl_c_params_ok(tmp_path: Path) -> None:
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=3,
+            poll_interval_ms=300,
+            response_timeout_ms=250,
+            simulator_validation=False,
+            confirmations=_confirms(
+                status_poll_only=False,
+                bounded_duration=False,
+                until_ctrl_c=True,
+                return_status_cadence=True,
+                no_reset_no_authorize=True,
+            ),
+        )
+    )
+
+
+def test_until_ctrl_c_conflicts_with_bounded(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="bounded-duration"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                poll_interval_ms=300,
+                response_timeout_ms=250,
+                simulator_validation=False,
+                confirmations=_confirms(
+                    status_poll_only=True,
+                    bounded_duration=True,
+                    until_ctrl_c=True,
                 ),
             )
         )
@@ -1029,6 +1085,38 @@ async def test_ctrl_c_bounded_clean_stop(tmp_path: Path) -> None:
     assert not transport.is_open
     assert summary["commandQueueCreated"] is False
     assert summary["authorizationObjectsCreated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_until_ctrl_c_stops_without_duration_or_max_writes(
+    tmp_path: Path,
+) -> None:
+    transport = FakeBenchTransport()
+    session = _session(
+        transport,
+        tmp_path,
+        duration_seconds=9999.0,
+        poll_interval_ms=50,
+        response_timeout_ms=20,
+        max_writes=0,
+        until_ctrl_c=True,
+        return_status_cadence=True,
+        return_status_every_n_polls=2,
+        return_status_sequence=0,
+        ack_timeout_ms=20,
+    )
+
+    async def _intr() -> None:
+        await asyncio.sleep(0.35)
+        session.request_stop()
+
+    summary, _ = await asyncio.gather(session.run(), _intr())
+    assert summary["untilCtrlC"] is True
+    assert summary["stopReason"] == "operator_interrupt"
+    assert summary["result"] == ContinuousBenchResult.PASS.value
+    assert _as_int(summary["pollsSent"]) >= 1
+    assert summary["stopReason"] != "max_writes"
+    assert summary["stopReason"] != "duration_expired"
 
 
 @pytest.mark.asyncio

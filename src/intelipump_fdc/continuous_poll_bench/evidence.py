@@ -295,12 +295,12 @@ def suggest_result(
         StopReason.SERIAL_DISCONNECT,
         StopReason.MAX_WRITES,
         StopReason.SAFETY_FAULT,
-        StopReason.OPERATOR_INTERRUPT,
     }:
         return ContinuousBenchResult.FAIL
     if stats.polls_sent == 0:
         return ContinuousBenchResult.FAIL
     # Status-data collection PASS requires at least one DATA_FRAME cycle.
+    # operator_interrupt without fault (until-ctrl-c) can still PASS.
     if (
         stats.data_responses >= 1
         and stats.crc_errors == 0

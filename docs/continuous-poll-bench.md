@@ -82,7 +82,7 @@ Results:
 | Duration | 1–5 s (default 3) | 1–300 s | 1–30 s | 1–300 s |
 | Poll interval | 300–1000 ms (default 300) | same | 50–1000 ms | same |
 | Response timeout | default 250 ms; must be &lt; interval | same | same | same |
-| Max writes | 50 | derived, cap 1000 | derived (cap 600) | derived (cap 1000) |
+| Max writes | 50 | derived, cap 2000 | derived (cap 600) | derived (cap 2000) |
 | Addresses | exactly one | exactly one | exactly one | exactly one |
 
 Scheduler is monotonic: missed deadlines skip forward (`schedule_lag_ms`);
@@ -149,6 +149,33 @@ uv run intelipump-continuous-poll-bench \
 During the run: nozzle in → start → lift/hold → return → Ctrl+C or wait.
 Then decode NOZIO from the JSONL (look for `01`→`11` OUT).
 
+## Continuous until Ctrl+C (lab)
+
+Polls forever (no duration / max-writes stop) until SIGINT/SIGTERM. Not a
+systemd daemon — technician must stay present and stop with Ctrl+C.
+
+Omit `--confirm-bounded-duration` and `--duration-seconds` (ignored).
+
+```bash
+uv run intelipump-continuous-poll-bench \
+  --port /dev/intelipump-controller \
+  --address 2 \
+  --poll-interval-ms 300 \
+  --response-timeout-ms 250 \
+  --return-status-every-n-polls 2 \
+  --sequence 0 \
+  --ack-timeout-ms 200 \
+  --evidence-dir data/bench/continuous-poll \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-emergency-isolation-ready \
+  --confirm-no-fuel-test \
+  --confirm-authorization-disabled \
+  --confirm-until-ctrl-c \
+  --confirm-return-status-cadence \
+  --confirm-no-reset-no-authorize
+```
+
 ## Real Wayne (later approved lab only)
 
 Without `--simulator-validation`:
@@ -157,7 +184,7 @@ Without `--simulator-validation`:
 - refuses simulator ownership of adapters
 - `targetType=OWNED_LAB_WAYNE`
 - short path: max duration 5 s / max 50 writes
-- extended watch: max 300 s / writes derived (cap 1000); requires
+- extended watch: max 300 s / writes derived (cap 2000); requires
   `--confirm-extended-watch`
 
 Do not run against the real dispenser until explicitly approved.
