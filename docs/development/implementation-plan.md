@@ -50,10 +50,11 @@ lab dispenser. See `docs/poll-bench-real-wayne.md`. No authorization.
 Does not start Phase 11D–11H.
 
 ## Continuous poll bench (CONTINUOUS_POLL_BENCH)
-Short bounded status-only polling via `intelipump-continuous-poll-bench`
-(one address; real-Wayne max 5s / 50 writes). See
-`docs/continuous-poll-bench.md`. No authorization. Not production polling.
-Does not start Phase 11D–11H.
+Bounded status-only polling via `intelipump-continuous-poll-bench`
+(one address; real-Wayne short max 5s / 50 writes; optional extended
+POLL-only watch max 300s with `--confirm-extended-watch`, Ctrl+C stop).
+See `docs/continuous-poll-bench.md`. No authorization / RETURN STATUS.
+Not production polling. Does not start Phase 11D–11H.
 
 ## Captured ePump / Wayne iGEM wire-address profile
 Logical sides 1/2 map to wire ADR `0x50`/`0x51`; status polls are

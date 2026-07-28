@@ -20,6 +20,8 @@ from intelipump_fdc.continuous_poll_bench.cli import build_parser
 from intelipump_fdc.continuous_poll_bench.cli import run as continuous_run
 from intelipump_fdc.continuous_poll_bench.evidence import ContinuousBenchResult
 from intelipump_fdc.continuous_poll_bench.guards import (
+    REAL_WAYNE_EXTENDED_MAX_DURATION_S,
+    REAL_WAYNE_EXTENDED_MAX_WRITES,
     REAL_WAYNE_MAX_DURATION_S,
     REAL_WAYNE_MAX_WRITES,
     ContinuousPollBenchParams,
@@ -293,7 +295,7 @@ def test_duration_maximum_enforced(tmp_path: Path) -> None:
         )
 
 
-def test_real_wayne_max_5_seconds(tmp_path: Path) -> None:
+def test_real_wayne_max_5_seconds_without_extended(tmp_path: Path) -> None:
     validate_continuous_params(
         _params(
             tmp_path,
@@ -303,7 +305,7 @@ def test_real_wayne_max_5_seconds(tmp_path: Path) -> None:
             simulator_validation=False,
         )
     )
-    with pytest.raises(ContinuousPollRefusedError, match="5"):
+    with pytest.raises(ContinuousPollRefusedError, match="confirm-extended-watch"):
         validate_continuous_params(
             _params(
                 tmp_path,
@@ -313,6 +315,87 @@ def test_real_wayne_max_5_seconds(tmp_path: Path) -> None:
                 simulator_validation=False,
             )
         )
+
+
+def test_extended_watch_allows_real_wayne_up_to_300s(tmp_path: Path) -> None:
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=120,
+            poll_interval_ms=300,
+            response_timeout_ms=250,
+            simulator_validation=False,
+            confirmations=_confirms(extended_watch=True),
+        )
+    )
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=REAL_WAYNE_EXTENDED_MAX_DURATION_S,
+            poll_interval_ms=300,
+            response_timeout_ms=250,
+            simulator_validation=False,
+            confirmations=_confirms(extended_watch=True),
+        )
+    )
+    with pytest.raises(ContinuousPollRefusedError, match="300"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=REAL_WAYNE_EXTENDED_MAX_DURATION_S + 1,
+                poll_interval_ms=300,
+                response_timeout_ms=250,
+                simulator_validation=False,
+                confirmations=_confirms(extended_watch=True),
+            )
+        )
+
+
+def test_extended_watch_raises_write_cap(tmp_path: Path) -> None:
+    params = _params(
+        tmp_path,
+        duration_seconds=120,
+        poll_interval_ms=300,
+        response_timeout_ms=250,
+        simulator_validation=False,
+        confirmations=_confirms(extended_watch=True),
+    )
+    validate_continuous_params(params)
+    assert params.max_writes <= REAL_WAYNE_EXTENDED_MAX_WRITES
+    assert params.max_writes > REAL_WAYNE_MAX_WRITES
+    assert REAL_WAYNE_EXTENDED_MAX_WRITES == 1000
+
+
+def test_extended_watch_simulator_allows_beyond_30s(tmp_path: Path) -> None:
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=60,
+            poll_interval_ms=100,
+            response_timeout_ms=50,
+            simulator_validation=True,
+            confirmations=_confirms(extended_watch=True),
+        )
+    )
+
+
+def test_parser_exposes_confirm_extended_watch() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--port",
+            "/tmp/x",
+            "--address",
+            "1",
+            "--duration-seconds",
+            "120",
+            "--evidence-dir",
+            "/tmp/ev",
+            "--confirm-extended-watch",
+        ]
+    )
+    assert args.confirm_extended_watch is True
+    assert args.duration_seconds == 120.0
 
 
 def test_real_wayne_min_poll_interval_300ms(tmp_path: Path) -> None:

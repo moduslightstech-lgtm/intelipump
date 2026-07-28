@@ -34,8 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="intelipump-continuous-poll-bench",
         description=(
-            "CONTINUOUS_POLL_BENCH: short bounded status-only DART polls against "
-            "one owned lab pump address. No authorize/preset/price/reset/daemon. "
+            "CONTINUOUS_POLL_BENCH: bounded status-only DART polls against "
+            "one owned lab pump address. Default short path (real-Wayne max 5s). "
+            "Optional extended POLL-only watch (max 300s) with "
+            "--confirm-extended-watch; Ctrl+C stops early. "
+            "No authorize/preset/price/reset/RETURN_STATUS/daemon. "
             "Stop intelipump.service first."
         ),
     )
@@ -50,7 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--duration-seconds",
         type=float,
         default=3,
-        help="Bounded duration (default 3; real-Wayne max 5; simulator max 30)",
+        help=(
+            "Bounded duration (default 3; real-Wayne short max 5; "
+            "simulator short max 30; with --confirm-extended-watch max 300). "
+            "SIGINT/SIGTERM stops early."
+        ),
     )
     parser.add_argument(
         "--poll-interval-ms",
@@ -104,7 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm-bounded-duration",
         action="store_true",
-        help="Confirm this session is short-bounded (no daemon/indefinite mode)",
+        help="Confirm this session is time-bounded (no daemon/indefinite mode)",
+    )
+    parser.add_argument(
+        "--confirm-extended-watch",
+        action="store_true",
+        help=(
+            "Confirm extended POLL-only watch: raise duration cap to 300s "
+            "(still bounded; Ctrl+C / SIGTERM stops early). Required when "
+            "duration exceeds the short-path max (5s real-Wayne / 30s simulator)."
+        ),
     )
     parser.add_argument(
         "--controller-service",
@@ -165,6 +181,7 @@ async def _async_main(args: argparse.Namespace) -> int:
             authorization_disabled=args.confirm_authorization_disabled,
             status_poll_only=args.confirm_status_poll_only,
             bounded_duration=args.confirm_bounded_duration,
+            extended_watch=args.confirm_extended_watch,
         ),
         controller_service=args.controller_service,
         lock_dir=Path(args.lock_dir),

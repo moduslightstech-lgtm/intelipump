@@ -33,9 +33,12 @@ from intelipump_fdc.core.config import ControllerMode, Settings
 # Re-export for callers/tests.
 __all__ = [
     "REAL_WAYNE_DEFAULT_RESPONSE_TIMEOUT_MS",
+    "REAL_WAYNE_EXTENDED_MAX_DURATION_S",
+    "REAL_WAYNE_EXTENDED_MAX_WRITES",
     "REAL_WAYNE_MAX_DURATION_S",
     "REAL_WAYNE_MAX_WRITES",
     "REAL_WAYNE_MIN_POLL_INTERVAL_MS",
+    "SIMULATOR_EXTENDED_MAX_DURATION_S",
     "SIMULATOR_MAX_DURATION_S",
     "ContinuousPollBenchParams",
     "ContinuousPollConfirmations",
@@ -44,9 +47,15 @@ __all__ = [
     "software_commit",
 ]
 
+# Short default path (no --confirm-extended-watch).
 REAL_WAYNE_MAX_DURATION_S = 5
 SIMULATOR_MAX_DURATION_S = 30
 REAL_WAYNE_MAX_WRITES = 50
+# Extended POLL-only watch (requires --confirm-extended-watch). Still bounded;
+# Ctrl+C / SIGTERM stops early. Not a daemon / indefinite mode.
+REAL_WAYNE_EXTENDED_MAX_DURATION_S = 300
+SIMULATOR_EXTENDED_MAX_DURATION_S = 300
+REAL_WAYNE_EXTENDED_MAX_WRITES = 1000
 REAL_WAYNE_MIN_POLL_INTERVAL_MS = 300
 REAL_WAYNE_DEFAULT_RESPONSE_TIMEOUT_MS = 250
 MALFORMED_THRESHOLD = 3
@@ -66,6 +75,8 @@ class ContinuousPollConfirmations:
     authorization_disabled: bool = False
     status_poll_only: bool = False
     bounded_duration: bool = False
+    # Optional: required only when duration exceeds the short-path max.
+    extended_watch: bool = False
 
     def missing_flags(self) -> list[str]:
         missing: list[str] = []
@@ -106,7 +117,17 @@ class ContinuousPollBenchParams:
         return TARGET_SIMULATOR if self.simulator_validation else TARGET_OWNED_LAB_WAYNE
 
     @property
+    def extended_watch(self) -> bool:
+        return self.confirmations.extended_watch
+
+    @property
     def max_duration_s(self) -> int:
+        if self.extended_watch:
+            return (
+                SIMULATOR_EXTENDED_MAX_DURATION_S
+                if self.simulator_validation
+                else REAL_WAYNE_EXTENDED_MAX_DURATION_S
+            )
         return (
             SIMULATOR_MAX_DURATION_S
             if self.simulator_validation
@@ -115,10 +136,17 @@ class ContinuousPollBenchParams:
 
     @property
     def max_writes(self) -> int:
+        # Bound by duration/interval (+2 for edge) but never unbounded.
+        approx = int(self.duration_seconds * 1000 / self.poll_interval_ms) + 2
         if self.simulator_validation:
-            # Bound by duration/interval (+1 for edge) but never unbounded.
-            approx = int(self.duration_seconds * 1000 / self.poll_interval_ms) + 2
-            return min(approx, 600)
+            cap = (
+                REAL_WAYNE_EXTENDED_MAX_WRITES
+                if self.extended_watch
+                else 600
+            )
+            return min(approx, cap)
+        if self.extended_watch:
+            return min(approx, REAL_WAYNE_EXTENDED_MAX_WRITES)
         return REAL_WAYNE_MAX_WRITES
 
 
@@ -177,10 +205,30 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
         raise ContinuousPollRefusedError(
             "duration-seconds must be >= 1", reason="bad_duration"
         )
+    short_max = (
+        SIMULATOR_MAX_DURATION_S
+        if params.simulator_validation
+        else REAL_WAYNE_MAX_DURATION_S
+    )
+    if (
+        params.duration_seconds > short_max
+        and not params.confirmations.extended_watch
+    ):
+        raise ContinuousPollRefusedError(
+            f"duration-seconds max is {short_max} without "
+            f"--confirm-extended-watch "
+            f"({'simulator' if params.simulator_validation else 'real-Wayne'} "
+            f"short path); got {params.duration_seconds}. "
+            f"For a longer POLL-only watch (max "
+            f"{REAL_WAYNE_EXTENDED_MAX_DURATION_S if not params.simulator_validation else SIMULATOR_EXTENDED_MAX_DURATION_S}s, "
+            f"Ctrl+C to stop early), pass --confirm-extended-watch.",
+            reason="duration_exceeded",
+        )
     if params.duration_seconds > params.max_duration_s:
         raise ContinuousPollRefusedError(
             f"duration-seconds max is {params.max_duration_s} "
-            f"({'simulator' if params.simulator_validation else 'real-Wayne'} mode); "
+            f"({'simulator' if params.simulator_validation else 'real-Wayne'}"
+            f"{' extended-watch' if params.extended_watch else ''} mode); "
             f"got {params.duration_seconds}",
             reason="duration_exceeded",
         )
@@ -212,10 +260,15 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
         # Real-Wayne: hard-cap computed writes (polls at t=0, interval, ... < duration).
         duration_ms = params.duration_seconds * 1000.0
         approx = int((duration_ms - 1e-9) // params.poll_interval_ms) + 1
-        if approx > REAL_WAYNE_MAX_WRITES:
+        write_cap = (
+            REAL_WAYNE_EXTENDED_MAX_WRITES
+            if params.extended_watch
+            else REAL_WAYNE_MAX_WRITES
+        )
+        if approx > write_cap:
             raise ContinuousPollRefusedError(
                 f"computed poll count {approx} exceeds real-Wayne max "
-                f"{REAL_WAYNE_MAX_WRITES}; reduce duration or increase interval",
+                f"{write_cap}; reduce duration or increase interval",
                 reason="max_writes_exceeded",
             )
 

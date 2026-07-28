@@ -2,8 +2,10 @@
 
 **Tool:** `intelipump-continuous-poll-bench`
 
-Short, bounded **status-only** DART polls against **exactly one** confirmed pump
-address. Intended to help determine whether regular status polling prevents
+Bounded **status-only** DART polls against **exactly one** confirmed pump
+address. Default is a short session; optional extended POLL-only watch
+(up to 300 s, Ctrl+C to stop early) for catching nozzle / DC3 transitions.
+Intended to help determine whether regular status polling prevents
 Wayne iGEM POS Communication Lost / Error 30.
 
 Logical `--address 1` transmits captured `50 20 FA`; `--address 2` transmits
@@ -75,16 +77,46 @@ Results:
 
 ## Hard limits
 
-| Limit | Real Wayne | Simulator (`--simulator-validation`) |
-| --- | --- | --- |
-| Duration | 1–5 s (default 3) | 1–30 s |
-| Poll interval | 300–1000 ms (default 300) | 50–1000 ms (default 300) |
-| Response timeout | default 250 ms; must be &lt; interval | same |
-| Max writes | 50 | derived from duration/interval |
-| Addresses | exactly one | exactly one |
+| Limit | Real Wayne (short) | Real Wayne (`--confirm-extended-watch`) | Simulator short | Simulator extended |
+| --- | --- | --- | --- | --- |
+| Duration | 1–5 s (default 3) | 1–300 s | 1–30 s | 1–300 s |
+| Poll interval | 300–1000 ms (default 300) | same | 50–1000 ms | same |
+| Response timeout | default 250 ms; must be &lt; interval | same | same | same |
+| Max writes | 50 | derived, cap 1000 | derived (cap 600) | derived (cap 1000) |
+| Addresses | exactly one | exactly one | exactly one | exactly one |
 
 Scheduler is monotonic: missed deadlines skip forward (`schedule_lag_ms`);
 never catch up with back-to-back polls. Timeouts do not extend duration.
+SIGINT / SIGTERM stops cleanly (`stopReason=operator_interrupt`).
+
+Still **POLL-only** in all paths: no RETURN STATUS, RESET, AUTHORIZE, price,
+or daemon/indefinite mode.
+
+## Extended POLL-only watch (lab)
+
+Use when you need longer observation (e.g. lift nozzle and watch DC3 / NOZIO)
+without raising the short-path default:
+
+```bash
+intelipump-continuous-poll-bench \
+  --port /dev/intelipump-controller \
+  --address 1 \
+  --duration-seconds 120 \
+  --poll-interval-ms 300 \
+  --response-timeout-ms 250 \
+  --evidence-dir data/bench/continuous-poll \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-emergency-isolation-ready \
+  --confirm-no-fuel-test \
+  --confirm-authorization-disabled \
+  --confirm-status-poll-only \
+  --confirm-bounded-duration \
+  --confirm-extended-watch
+```
+
+Stop early with Ctrl+C. Omit `--simulator-validation` only for the owned lab
+Wayne after the usual stop-service / isolation checks.
 
 ## Real Wayne (later approved lab only)
 
@@ -93,7 +125,9 @@ Without `--simulator-validation`:
 - refuses any running simulator process
 - refuses simulator ownership of adapters
 - `targetType=OWNED_LAB_WAYNE`
-- max duration 5 s / max 50 writes
+- short path: max duration 5 s / max 50 writes
+- extended watch: max 300 s / writes derived (cap 1000); requires
+  `--confirm-extended-watch`
 
 Do not run against the real dispenser until explicitly approved.
 
