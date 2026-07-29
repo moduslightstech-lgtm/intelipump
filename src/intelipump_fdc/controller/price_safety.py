@@ -1,9 +1,9 @@
 """Hard refusal of non-poll frames on real-Wayne serial transports.
 
 Status polls are always allowed. Exactly one pre-approved active DATA frame
-(CD5 price, CD1 RETURN_STATUS, CD1 RESET, CD1 AUTHORIZE, or CD2+CD1 RESET
-block) may be written when explicitly authorized on the transport for a
-single shot.
+(CD5 price, CD1 RETURN_STATUS, CD1 RESET, CD1 AUTHORIZE, CD2+CD1 RESET
+block, or CD101 request totals) may be written when explicitly authorized
+on the transport for a single shot.
 
 No environment variable may bypass this gate.
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from intelipump_fdc.protocol.cd101 import is_cd101_application_payload
 from intelipump_fdc.protocol.cd2_reset import is_cd2_reset_application_payload
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
@@ -35,6 +36,7 @@ class ActiveFrameKind(StrEnum):
     CD1_RESET = "CD1_RESET"
     CD1_AUTHORIZE = "CD1_AUTHORIZE"
     CD2_AND_CD1_RESET = "CD2_AND_CD1_RESET"
+    CD101_REQUEST_TOTALS = "CD101_REQUEST_TOTALS"
 
 
 def is_verified_status_poll(frame: bytes) -> bool:
@@ -62,6 +64,8 @@ def classify_active_data_frame(frame: bytes) -> ActiveFrameKind | None:
         return None
     if is_cd2_reset_application_payload(app):
         return ActiveFrameKind.CD2_AND_CD1_RESET
+    if is_cd101_application_payload(app):
+        return ActiveFrameKind.CD101_REQUEST_TOTALS
     trans = app[0] if app else -1
     lng = app[1] if len(app) > 1 else -1
     if trans == 0x05 and lng >= 3:

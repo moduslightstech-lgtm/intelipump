@@ -656,9 +656,97 @@ def validate_return_status_reset_write_settings(settings: Settings) -> None:
     validate_price_dry_run_settings(settings)
 
 
+@dataclass(frozen=True, slots=True)
+class Cd101WriteConfirmations:
+    owned_lab_pump: bool = False
+    technician_present: bool = False
+    no_product_connected: bool = False
+    motor_isolated: bool = False
+    valves_isolated: bool = False
+    emergency_isolation_ready: bool = False
+    authorization_disabled: bool = False
+    single_write_plan_reviewed: bool = False
+    execute_cd101_request: bool = False
+    understand_transmits_to_owned_lab_pump: bool = False
+
+    def missing_flags(self) -> list[str]:
+        mapping = {
+            "owned_lab_pump": "--confirm-owned-lab-pump",
+            "technician_present": "--confirm-technician-present",
+            "no_product_connected": "--confirm-no-product-connected",
+            "motor_isolated": "--confirm-motor-isolated",
+            "valves_isolated": "--confirm-valves-isolated",
+            "emergency_isolation_ready": "--confirm-emergency-isolation-ready",
+            "authorization_disabled": "--confirm-authorization-disabled",
+            "single_write_plan_reviewed": "--confirm-single-write-plan-reviewed",
+            "execute_cd101_request": "--confirm-execute-cd101-request",
+            "understand_transmits_to_owned_lab_pump": (
+                "--i-understand-this-transmits-to-owned-lab-pump"
+            ),
+        }
+        return [flag for attr, flag in mapping.items() if not getattr(self, attr)]
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "ownedLabPump": self.owned_lab_pump,
+            "technicianPresent": self.technician_present,
+            "noProductConnected": self.no_product_connected,
+            "motorIsolated": self.motor_isolated,
+            "valvesIsolated": self.valves_isolated,
+            "emergencyIsolationReady": self.emergency_isolation_ready,
+            "authorizationDisabled": self.authorization_disabled,
+            "singleWritePlanReviewed": self.single_write_plan_reviewed,
+            "executeCd101Request": self.execute_cd101_request,
+            "understandTransmitsToOwnedLabPump": (
+                self.understand_transmits_to_owned_lab_pump
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Cd101WriteParams:
+    port: str
+    address: int
+    evidence_dir: Path
+    confirmations: Cd101WriteConfirmations
+    baud: int = 9600
+    response_timeout_ms: int = 500
+    ack_timeout_ms: int = 1000
+    post_write_settle_ms: int = 200
+    post_write_max_status_polls: int = 8
+    sequence: int = 0
+    counter_select: int = 1
+    skip_service_check: bool = False
+    skip_port_check: bool = False
+
+    @property
+    def target_type(self) -> str:
+        return TARGET_OWNED_LAB_WAYNE
+
+
+def validate_cd101_write_params(params: Cd101WriteParams) -> None:
+    missing = params.confirmations.missing_flags()
+    if missing:
+        raise PollBenchRefusedError(
+            "missing required confirmations: " + ", ".join(missing)
+        )
+    if params.address not in {1, 2}:
+        raise PollBenchRefusedError("address must be 1 or 2")
+    if not 0 <= params.sequence <= 0x0F:
+        raise PollBenchRefusedError("sequence must be 0..15")
+    if not 0 <= params.counter_select <= 0xFF:
+        raise PollBenchRefusedError("counter-select must be 0..255")
+
+
+def validate_cd101_write_settings(settings: Settings) -> None:
+    validate_price_dry_run_settings(settings)
+
+
 __all__ = [
     "AuthorizeWriteConfirmations",
     "AuthorizeWriteParams",
+    "Cd101WriteConfirmations",
+    "Cd101WriteParams",
     "Cd2ResetWriteConfirmations",
     "Cd2ResetWriteParams",
     "PollBenchRefusedError",
@@ -673,6 +761,8 @@ __all__ = [
     "software_commit",
     "validate_authorize_write_params",
     "validate_authorize_write_settings",
+    "validate_cd101_write_params",
+    "validate_cd101_write_settings",
     "validate_cd2_reset_write_params",
     "validate_cd2_reset_write_settings",
     "validate_price_dry_run_params",

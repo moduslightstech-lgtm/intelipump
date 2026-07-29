@@ -548,6 +548,15 @@ def default_cd2_reset_uncertainties() -> list[str]:
     ]
 
 
+def default_cd101_uncertainties() -> list[str]:
+    return [
+        "CD101 is a read-only totals request; it does not authorize delivery",
+        "ePump sent CD101 on addr2 shortly before first NOZIO OUT — causal link unproven",
+        "Use next L2 sequence after last DATA TX to this address (RS burns nibbles)",
+        "DC101 reply may arrive on a later poll, not immediately after ACK",
+    ]
+
+
 def default_return_status_reset_uncertainties() -> list[str]:
     return [
         "Office captures: CD1 RETURN_STATUS then lone RESET precedes DC1=RESET",
@@ -562,6 +571,7 @@ __all__ = [
     "DryRunEvidenceBundle",
     "WriteEvidenceBundle",
     "default_authorize_uncertainties",
+    "default_cd101_uncertainties",
     "default_cd2_reset_uncertainties",
     "default_reset_uncertainties",
     "default_return_status_reset_uncertainties",

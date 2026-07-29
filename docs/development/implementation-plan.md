@@ -57,6 +57,11 @@ gated CD1 RETURN_STATUS cadence with `--confirm-return-status-cadence`,
 still no RESET/AUTHORIZE). See `docs/continuous-poll-bench.md`.
 Not production polling. Does not start Phase 11D–11H.
 
+## Real-Wayne CD101 request (lab, gated)
+Single-shot `intelipump-real-wayne-cd101-request` mirrors ePump pre-OUT
+CD101 request-totals (`65 01 01`). Read-only; no RESET/AUTHORIZE.
+Does not start Phase 11D–11H.
+
 ## Captured ePump / Wayne iGEM wire-address profile
 Logical sides 1/2 map to wire ADR `0x50`/`0x51`; status polls are
 `50 20 FA` / `51 20 FA`. See `docs/protocol-notes/dart-line-summary.md`.

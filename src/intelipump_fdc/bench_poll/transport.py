@@ -124,6 +124,7 @@ class BenchPollSerialTransport:
         self.cd1_reset_write_count: int = 0
         self.cd1_authorize_write_count: int = 0
         self.cd2_reset_write_count: int = 0
+        self.cd101_write_count: int = 0
 
     def authorize_single_active_write(
         self,
@@ -342,6 +343,8 @@ class BenchPollSerialTransport:
                 self.cd1_authorize_write_count += 1
             elif kind is ActiveFrameKind.CD2_AND_CD1_RESET:
                 self.cd2_reset_write_count += 1
+            elif kind is ActiveFrameKind.CD101_REQUEST_TOTALS:
+                self.cd101_write_count += 1
         self.write_count += 1
         written = await asyncio.to_thread(self._ser.write, data)  # type: ignore[attr-defined]
         return int(written or 0)

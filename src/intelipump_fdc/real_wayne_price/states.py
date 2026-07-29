@@ -69,6 +69,20 @@ class Cd2ResetWriteState(StrEnum):
     FAULT = "FAULT"
 
 
+class Cd101WriteState(StrEnum):
+    """Single-shot CD101 request totals (no AUTHORIZE)."""
+
+    STATUS_OBSERVED = "STATUS_OBSERVED"
+    CD101_BLOCK_BUILT = "CD101_BLOCK_BUILT"
+    CD101_AUTHORIZED_FOR_SINGLE_WRITE = "CD101_AUTHORIZED_FOR_SINGLE_WRITE"
+    CD101_TRANSMITTED = "CD101_TRANSMITTED"
+    ACK_RECEIVED = "ACK_RECEIVED"
+    ACK_TIMEOUT = "ACK_TIMEOUT"
+    DC101_OBSERVED = "DC101_OBSERVED"
+    REFUSED = "REFUSED"
+    FAULT = "FAULT"
+
+
 class ReturnStatusResetWriteState(StrEnum):
     """Office-capture path: CD1 RETURN_STATUS then CD1 RESET."""
 
