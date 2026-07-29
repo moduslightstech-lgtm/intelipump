@@ -31,12 +31,25 @@ Controller mode: price/reset/authorize CLIs use `LISTEN_ONLY`. Poll-bench uses
 | CD5 from `FILLING_COMPLETE` | Tool now allows re-price (Pump Interface ex. 4.3); does not fix RESET |
 | Post-CD5 verify lag | Tool may `FAULT` while still seeing DC1 `0`; a later poll shows `5` |
 | Lone CD1 RESET | TX + often `ACK_MATCH` (sometimes `ACK_TIMEOUT`); **DC1 stays `5`** |
-| CD2+RESET (nozzle OUT) | TX + `ACK_MATCH`; **DC1 stays `5`** |
+| CD2+RESET (nozzle OUT) | TX + `ACK_MATCH`; **DC1 stays `5`** (when OUT was available earlier) |
 | Hang / time | Can leave `5` back to `PUMP_NOT_PROGRAMMED/0` while DC3 may still show price |
 | AUTHORIZE | Not attempted while DC1 ≠ `RESET` |
 
-**Do not keep bumping `--sequence` for RESET** without a new protocol theory or a
-capture of a working controller RESET on this head.
+### Lab notes 2026-07-29 (nozzle OUT / CD101)
+
+| Observation | Result |
+|-------------|--------|
+| Both logical sides CD5 → `DC1=5` | Yes (addr2 needs correct next L2 sequence + longer `--ack-timeout-ms`) |
+| Dual POLL + RETURN_STATUS alone | Usually **NOZIO=`01` IN** even when glass reacts |
+| ePump first OUT (private capture) | **`0x51`**: `DC1=5` + `NOZIO=11`; preceded by **CD101** (`65 01 01`), not CD2/RESET |
+| Gated CD101 tool | `intelipump-real-wayne-cd101-request` — ACK proven on addr2 |
+| Lab OUT after CD101 | **Once** on addr2 during dual poll (`…183634…`, hundreds of `11`); **not reliably repeatable** the same day |
+| CD2+RESET while chasing OUT | Often `REFUSED` (`nozzle_not_OUT`) if hose hung or OUT not currently reported |
+| Offline DC1 analysis | Require `crc_valid` + wire ADR `0x50`/`0x51`; bare `01 01 ..` / mid-frame slices false-flag `RESET` |
+
+**Do not keep bumping `--sequence` for RESET** without live wire **NOZIO OUT** and a plan to verify DC1→`1`. Park AUTHORIZE.
+
+Working hypothesis: CD101 (and/or ePump-like timing) can precede OUT reporting on addr2, but OUT is intermittent; need poll-until-OUT then immediate CD2+RESET without releasing the hose between observe and TX.
 
 ### Status grep (avoid false positives)
 
@@ -260,7 +273,7 @@ High-risk. Requires DC1 `RESET` first. Do **not** run from `FILLING_COMPLETED`.
 - Active DATA frame allowed only after
   `authorize_single_active_write(exact_frame, kind=...)` and only once.
 - Kinds: `CD5_PRICE`, `CD1_RETURN_STATUS`, `CD1_RESET`, `CD1_AUTHORIZE`,
-  `CD2_AND_CD1_RESET`.
+  `CD2_AND_CD1_RESET`, `CD101_REQUEST_TOTALS`.
 - RETURN_STATUS→RESET tool uses two sequential single-shot approvals.
 - No raw-hex / replay / generic send path.
 - Tools do not auto-chain CD5 → RESET → AUTHORIZE.
@@ -268,7 +281,8 @@ High-risk. Requires DC1 `RESET` first. Do **not** run from `FILLING_COMPLETED`.
 
 ## Open questions
 
-1. Why this firmware ACKs CD1 RESET / CD2+RESET without DC1 → `RESET`.
+1. Why this firmware ACKs CD1 RESET / CD2+RESET without DC1 → `RESET` (when OUT was present).
 2. Whether RETURN_STATUS before RESET (office capture path) clears CLOSED here.
-3. Whether lab side is address 2 (`0x51`) vs address 1.
-4. Exact timing bounds for CD5 → DC1 `5` (lab saw multi-second lag).
+3. Exact conditions for reliable **NOZIO OUT** on addr2 after CD101 (timing, hose, dual vs single poll).
+4. Exact timing bounds for CD5 → DC1 `5` (lab saw multi-second lag; use next sequence after RS burns nibbles).
+5. Whether a poll-until-OUT then single CD2+RESET tool would clear CLOSED on this head.
