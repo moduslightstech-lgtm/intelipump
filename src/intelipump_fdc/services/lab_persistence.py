@@ -19,7 +19,6 @@ from intelipump_fdc.persistence.migrations import init_schema
 from intelipump_fdc.services.persistence_bridge import PersistenceBridge
 from intelipump_fdc.services.persistence_worker import PersistenceWorker
 from intelipump_fdc.services.recovery_service import RecoveryReport, RecoveryService
-from intelipump_fdc.state_machine.machine import PumpStateMachine
 from intelipump_fdc.state_machine.models import PumpContext
 
 
@@ -85,12 +84,14 @@ async def start_persistence(
 def apply_recovered_contexts(
     loop: ControllerLoop, contexts: dict[str, PumpContext]
 ) -> None:
-    """Seed session state machines from recovery without claiming live health."""
+    """Seed session state machines from recovery without claiming live health.
+
+    Arms restart reconciliation so the first live DC1/DC2/DC3 observation
+    runs ``reconcile_after_restart`` (never auto-authorizes).
+    """
     by_address = {ctx.dart_address: ctx for ctx in contexts.values()}
     for address, session in loop.sessions.items():
         ctx = by_address.get(address)
         if ctx is None:
             continue
-        seeded = ctx.with_updates(communication_healthy=False)
-        session.machine = PumpStateMachine(seeded)
-        session.state.last_state = seeded.current_state
+        session.seed_recovered_context(ctx)

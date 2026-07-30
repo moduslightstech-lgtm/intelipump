@@ -39,3 +39,5 @@ class CompleteTransactionRequest:
     raw_amount: int
     source_frame_ref: str | None = None
     completed_at: datetime | None = None
+    completion_inferred: bool = False
+    completion_warnings: tuple[str, ...] = ()

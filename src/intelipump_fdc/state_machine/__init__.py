@@ -1,6 +1,8 @@
 """Pure InteliPump pump state machine (no I/O, no command execution)."""
 
 from intelipump_fdc.state_machine.completion_timeout import (
+    DEFAULT_AWAITING_FILLING_COMPLETE_TIMEOUT,
+    DEFAULT_DC2_STABILITY_WINDOW,
     CompletionTimeoutDecision,
     evaluate_awaiting_filling_complete_timeout,
 )
@@ -28,6 +30,8 @@ from intelipump_fdc.state_machine.wayne_mapper import (
 )
 
 __all__ = [
+    "DEFAULT_AWAITING_FILLING_COMPLETE_TIMEOUT",
+    "DEFAULT_DC2_STABILITY_WINDOW",
     "CommandEligibilityResult",
     "CompletionTimeoutDecision",
     "LiveObservationSummary",

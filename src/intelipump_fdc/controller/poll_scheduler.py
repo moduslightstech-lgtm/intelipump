@@ -24,3 +24,6 @@ class PollSchedulerConfig:
     reconnect_max_delay_s: float = 15.0
     reconnect_jitter: float = 0.0
     faulted_after_protocol_errors: int = 3
+    # Hang-up: wait for DC1 FILLING_COMPLETE before inferred close.
+    awaiting_filling_complete_timeout_s: float = 30.0
+    dc2_stability_window_s: float = 2.0

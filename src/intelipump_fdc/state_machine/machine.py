@@ -473,8 +473,9 @@ class PumpStateMachine:
         if event is PumpEvent.FILLING_COMPLETED:
             new_ctx = new_ctx.with_updates(awaiting_filling_complete=False)
 
-        # Clear active transaction on reset/disconnect paths (keep on completion
-        # for investigation until an explicit reset).
+        # Clear active transaction on reset/idle paths (keep on completion
+        # for investigation until an explicit reset). Communication loss must
+        # preserve unresolved sale identity for restart/reconnect reconciliation.
         if (
             target
             in {
@@ -493,11 +494,54 @@ class PumpStateMachine:
                 PumpEvent.NOZZLE_RETURNED,
             }
         ):
-            new_ctx = new_ctx.with_updates(
-                active_transaction_id=None,
-                fueling_session_uuid=None,
-                has_unresolved_transaction=False,
-            )
+            if event is PumpEvent.COMMUNICATION_LOST and (
+                ctx.active_transaction_id is not None
+                or ctx.has_unresolved_transaction
+                or ctx.awaiting_filling_complete
+            ):
+                new_ctx = new_ctx.with_updates(
+                    has_unresolved_transaction=True,
+                    active_transaction_id=(
+                        ctx.active_transaction_id or new_ctx.active_transaction_id
+                    ),
+                    fueling_session_uuid=ctx.fueling_session_uuid,
+                )
+            elif (
+                event is PumpEvent.RESET_OBSERVED
+                and (
+                    ctx.has_unresolved_transaction
+                    or ctx.awaiting_filling_complete
+                    or (
+                        ctx.active_transaction_id is not None
+                        and ctx.current_state
+                        in {
+                            PumpState.FILLING,
+                            PumpState.FILLING_COMPLETE,
+                            PumpState.LIMIT_REACHED,
+                            PumpState.SUSPENDED,
+                        }
+                    )
+                )
+            ):
+                # Case C/D: do not silently discard sale evidence on RESET.
+                new_ctx = new_ctx.with_updates(
+                    has_unresolved_transaction=True,
+                    active_transaction_id=ctx.active_transaction_id,
+                    fueling_session_uuid=ctx.fueling_session_uuid,
+                    warnings=tuple(
+                        [
+                            *new_ctx.warnings,
+                            "RESET observed with unresolved transaction; "
+                            "preserving sale identity (no auto READY).",
+                        ]
+                    ),
+                )
+            else:
+                new_ctx = new_ctx.with_updates(
+                    active_transaction_id=None,
+                    fueling_session_uuid=None,
+                    has_unresolved_transaction=False,
+                )
 
         new_ctx = self._finalize_readiness(new_ctx)
         self._context = new_ctx

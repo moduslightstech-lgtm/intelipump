@@ -22,6 +22,12 @@ class ControllerSettings(BaseModel):
     mode: ControllerMode = ControllerMode.LISTEN_ONLY
     device_id: str = "InteliPump-Lab-pi-001"
     station_id: str = "InteliPump-US-Lab"
+    # After nozzle hang-up, wait this long for DC1 FILLING_COMPLETE before
+    # evaluating inferred completion (never auto-authorizes).
+    awaiting_filling_complete_timeout_s: float = Field(
+        default=30.0, ge=1.0, le=600.0
+    )
+    dc2_stability_window_s: float = Field(default=2.0, ge=0.0, le=60.0)
 
 
 class DartSettings(BaseModel):

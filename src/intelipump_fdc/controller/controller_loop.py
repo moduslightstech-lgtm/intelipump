@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from intelipump_fdc.controller.comm_health import (
     HealthThresholds,
@@ -104,6 +104,12 @@ class ControllerLoop:
                 sequence_policy=runtime.config.sequence_policy,
                 thresholds=thresholds,
                 transitions=runtime.health_transitions,
+                awaiting_filling_complete_timeout=timedelta(
+                    seconds=runtime.config.awaiting_filling_complete_timeout_s
+                ),
+                dc2_stability_window=timedelta(
+                    seconds=runtime.config.dc2_stability_window_s
+                ),
             )
             for addr in runtime.config.addresses
         }
@@ -327,17 +333,20 @@ class ControllerLoop:
         )
         if frame is None:
             await self._handle_timeout_with_retries(session)
+            session.tick_awaiting_completion()
             self._refresh_totals()
             return
 
         if frame.address != encode_wire_address(address):
             session.handle_response_frame(frame)  # records address_mismatch/FAULTED
+            session.tick_awaiting_completion()
             self._refresh_totals()
             return
 
         ack = session.handle_response_frame(frame)
         if ack is not None:
             await self._write_frame(ack, address=address, note="ACK")
+        session.tick_awaiting_completion()
         self.runtime.liveness.mark_successful_poll()
         self._refresh_totals()
 

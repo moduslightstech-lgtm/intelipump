@@ -15,6 +15,7 @@ from intelipump_fdc.controller.session_events import (
     EventBus,
 )
 from intelipump_fdc.domain.pump_command import PumpCommand
+from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
 from intelipump_fdc.events.broker import EventBroker
 from intelipump_fdc.events.models import LiveEventType
@@ -249,6 +250,9 @@ class PersistenceBridge:
         state_version = int(detail_payload.get("state_version") or 0)
         active_tx = detail_payload.get("active_transaction_id")
         active_tx_s = str(active_tx) if active_tx else None
+        if active_tx_s:
+            # Keep in-memory mapping across restart/reconcile without new begin.
+            self._tx_by_address[address] = active_tx_s
         completion_key = detail_payload.get("completion_evidence_key")
         completion_key_s = str(completion_key) if completion_key else None
 
@@ -280,35 +284,94 @@ class PersistenceBridge:
             if new_state is PumpState.FILLING and prev_state is not PumpState.FILLING:
                 tx_uuid = active_tx_s or self._tx_by_address.get(address) or str(uuid4())
                 self._tx_by_address[address] = tx_uuid
-                nozzle = detail_payload.get("selected_nozzle")
-                nozzle_id = nozzle if isinstance(nozzle, int) else None
-                await TransactionService(uow, fill_book=self._fill_book).begin(
-                    BeginTransactionRequest(
-                        station_id=self._station_id,
-                        pump_db_id=pump_db,
-                        transaction_uuid=tx_uuid,
-                        nozzle_id=nozzle_id,
-                        raw_price=None,
-                        price_decimals=None,
-                        volume_decimals=None,
-                        amount_decimals=None,
-                        simulated=self._simulated,
-                        environment=self._environment,
+                # Restore mapping for restart without creating a duplicate when
+                # the active transaction id was already persisted.
+                existing = await uow.transactions.get_by_uuid(tx_uuid)
+                if existing is None:
+                    nozzle = detail_payload.get("selected_nozzle")
+                    nozzle_id = nozzle if isinstance(nozzle, int) else None
+                    await TransactionService(uow, fill_book=self._fill_book).begin(
+                        BeginTransactionRequest(
+                            station_id=self._station_id,
+                            pump_db_id=pump_db,
+                            transaction_uuid=tx_uuid,
+                            nozzle_id=nozzle_id,
+                            raw_price=None,
+                            price_decimals=None,
+                            volume_decimals=None,
+                            amount_decimals=None,
+                            simulated=self._simulated,
+                            environment=self._environment,
+                        )
                     )
+                    if self._live is not None:
+                        self._live.publish_typed(
+                            LiveEventType.TRANSACTION_CREATED,
+                            station_id=self._station_id,
+                            environment=self._environment,
+                            simulated=self._simulated,
+                            pump_id=logical,
+                            transaction_id=tx_uuid,
+                        )
+
+            event_name = str(detail_payload.get("event") or "")
+            awaiting = bool(detail_payload.get("awaiting_filling_complete"))
+            completion_inferred = bool(detail_payload.get("completion_inferred"))
+            audit_only = bool(detail_payload.get("audit_only"))
+            warn_list = detail_payload.get("warnings")
+            warn_tuple = (
+                tuple(str(w) for w in warn_list)
+                if isinstance(warn_list, list)
+                else ()
+            )
+
+            if audit_only or event_name == "RECONCILIATION_WARNING":
+                await uow.audit.append(
+                    actor="controller",
+                    source="reconciliation",
+                    action="RECONCILIATION_WARNING",
+                    station_id=self._station_id,
+                    pump_id=pump_db,
+                    previous_state=str(prev_state_s) if prev_state_s else None,
+                    resulting_state=new_state_s,
+                    result="WARNING",
+                    details={
+                        "warnings": list(warn_tuple),
+                        "inferences": detail_payload.get("inferences"),
+                        "active_transaction_id": active_tx_s,
+                        "awaiting_filling_complete": awaiting,
+                        "completion_inferred": completion_inferred,
+                    },
                 )
-                if self._live is not None:
-                    self._live.publish_typed(
-                        LiveEventType.TRANSACTION_CREATED,
-                        station_id=self._station_id,
-                        environment=self._environment,
-                        simulated=self._simulated,
-                        pump_id=logical,
-                        transaction_id=tx_uuid,
-                    )
+                return
+
+            # Hang-up enters FILLING_COMPLETE while awaiting DC1 — do not
+            # finalize the sale yet; keep accepting final DC2 updates.
+            if (
+                new_state in {PumpState.FILLING_COMPLETE, PumpState.LIMIT_REACHED}
+                and awaiting
+                and event_name == PumpEvent.NOZZLE_RETURNED.value
+            ):
+                await uow.audit.append(
+                    actor="controller",
+                    source="state_machine",
+                    action="AWAITING_FILLING_COMPLETE",
+                    station_id=self._station_id,
+                    pump_id=pump_db,
+                    previous_state=str(prev_state_s) if prev_state_s else None,
+                    resulting_state=new_state_s,
+                    result="PENDING",
+                    details={
+                        "active_transaction_id": active_tx_s,
+                        "completion_evidence_key": completion_key_s,
+                        "warnings": list(warn_tuple),
+                    },
+                )
+                return
 
             if new_state in {PumpState.FILLING_COMPLETE, PumpState.LIMIT_REACHED}:
                 complete_uuid = active_tx_s or self._tx_by_address.get(address)
-                if complete_uuid:
+                if complete_uuid and not awaiting:
                     key = (
                         completion_key_s
                         or f"complete:{complete_uuid}:{new_state.value}"
@@ -322,10 +385,33 @@ class PersistenceBridge:
                             raw_volume=0,
                             raw_amount=0,
                             source_frame_ref=detail_payload.get("source_frame_ref"),
+                            completion_inferred=completion_inferred,
+                            completion_warnings=warn_tuple,
                         )
                     )
                     # Keep mapping for duplicate DATA handling until new sale.
                     self._tx_by_address[address] = complete_uuid
+                    if newly:
+                        await uow.audit.append(
+                            actor="controller",
+                            source="state_machine",
+                            action=(
+                                "TRANSACTION_COMPLETED_INFERRED"
+                                if completion_inferred
+                                else "TRANSACTION_COMPLETED"
+                            ),
+                            station_id=self._station_id,
+                            pump_id=pump_db,
+                            previous_state=str(prev_state_s) if prev_state_s else None,
+                            resulting_state=new_state_s,
+                            result="OK",
+                            details={
+                                "transaction_uuid": complete_uuid,
+                                "source_completion_key": key,
+                                "completion_inferred": completion_inferred,
+                                "warnings": list(warn_tuple),
+                            },
+                        )
                     if newly and self._live is not None:
                         self._live.publish_typed(
                             LiveEventType.TRANSACTION_COMPLETED,
@@ -334,7 +420,10 @@ class PersistenceBridge:
                             simulated=self._simulated,
                             pump_id=logical,
                             transaction_id=complete_uuid,
-                            payload={"source_completion_key": key},
+                            payload={
+                                "source_completion_key": key,
+                                "completion_inferred": completion_inferred,
+                            },
                         )
 
     async def _handle_app_decoded(self, payload: dict[str, Any]) -> None:

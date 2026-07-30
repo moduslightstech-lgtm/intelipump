@@ -169,6 +169,10 @@ def run(argv: list[str] | None = None) -> None:
             config=PollSchedulerConfig(
                 addresses=addresses,
                 response_timeout_ms=args.response_timeout_ms,
+                awaiting_filling_complete_timeout_s=(
+                    settings.controller.awaiting_filling_complete_timeout_s
+                ),
+                dc2_stability_window_s=settings.controller.dc2_stability_window_s,
             ),
             log_frames=args.log_frames,
             liveness=liveness,

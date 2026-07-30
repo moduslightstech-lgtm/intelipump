@@ -20,6 +20,8 @@ class LiveObservationSummary:
     normalized_hint: PumpState | None = None
     observed_at: datetime | None = None
     selected_nozzle: int | None = None
+    nozzle_out: bool | None = None
+    dispensed_volume_raw: int | None = None
     raw_source_hex: str | None = None
 
 
@@ -111,8 +113,19 @@ def reconcile_after_restart(
             last_transition_at=live.observed_at,
             last_raw_wayne_status=live.wayne_status,
             selected_nozzle=live.selected_nozzle or persisted.selected_nozzle,
+            nozzle_out=(
+                live.nozzle_out
+                if live.nozzle_out is not None
+                else persisted.nozzle_out
+            ),
+            dispensed_volume_raw=(
+                live.dispensed_volume_raw
+                if live.dispensed_volume_raw is not None
+                else persisted.dispensed_volume_raw
+            ),
             warnings=tuple([*persisted.warnings, *warnings]),
             active_transaction_id=unresolved,
+            has_unresolved_transaction=unresolved is not None,
             price_verified=False,  # never assume price after restart
         )
         warnings.append(
@@ -132,11 +145,13 @@ def reconcile_after_restart(
     if live_state is PumpState.FILLING:
         warnings.append(
             "Live state indicates FILLING; recovered into FILLING with warning "
-            "(prefer live over persisted)."
+            "(prefer live over persisted; restore existing transaction, "
+            "do not create a duplicate)."
         )
     if live_state is PumpState.FILLING_COMPLETE:
         warnings.append(
-            "Live state indicates FILLING_COMPLETE; recovered into FILLING_COMPLETE."
+            "Live state indicates FILLING_COMPLETE; recovered into "
+            "FILLING_COMPLETE (finalize existing unresolved transaction once)."
         )
     if persisted.current_state is PumpState.FILLING and live_state is not PumpState.FILLING:
         warnings.append(
@@ -151,6 +166,37 @@ def reconcile_after_restart(
             "evidence only (not from persisted pending AUTHORIZE)."
         )
 
+    # Case C/D: RESET must not derive READY before transaction reconciliation.
+    if live_state is PumpState.RESET and unresolved is not None:
+        if live.nozzle_out is False:
+            warnings.append(
+                "RESET + nozzle IN with unresolved transaction: retain "
+                "unresolved/auditable state; do not derive READY until "
+                "transaction reconciliation completes."
+            )
+        elif live.nozzle_out is True:
+            warnings.append(
+                "RESET + nozzle OUT with unresolved transaction: retain "
+                "recovery state; do not derive READY; wait for more DC1/DC2/DC3."
+            )
+        else:
+            warnings.append(
+                "RESET with unresolved transaction: retain unresolved state; "
+                "do not derive READY."
+            )
+
+    keep_unresolved = unresolved is not None and live_state not in {
+        PumpState.FILLING_COMPLETE,
+        PumpState.LIMIT_REACHED,
+    }
+    # FILLING_COMPLETE still keeps the id until publish/complete; mark resolved
+    # only after the persistence bridge finalizes.
+    awaiting = (
+        live_state is PumpState.FILLING_COMPLETE
+        and unresolved is not None
+        and persisted.awaiting_filling_complete
+    )
+
     ctx = persisted.with_updates(
         previous_state=persisted.current_state,
         current_state=live_state,
@@ -160,8 +206,18 @@ def reconcile_after_restart(
         last_transition_at=live.observed_at,
         last_raw_wayne_status=live.wayne_status,
         selected_nozzle=live.selected_nozzle or persisted.selected_nozzle,
+        nozzle_out=(
+            live.nozzle_out if live.nozzle_out is not None else persisted.nozzle_out
+        ),
+        dispensed_volume_raw=(
+            live.dispensed_volume_raw
+            if live.dispensed_volume_raw is not None
+            else persisted.dispensed_volume_raw
+        ),
         warnings=tuple([*persisted.warnings, *warnings]),
         active_transaction_id=unresolved,
+        has_unresolved_transaction=keep_unresolved or (unresolved is not None),
+        awaiting_filling_complete=awaiting,
         price_verified=False,
         fault_code=(
             persisted.fault_code if live_state is PumpState.FAULTED else None

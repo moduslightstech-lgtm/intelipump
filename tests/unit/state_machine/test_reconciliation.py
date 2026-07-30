@@ -91,3 +91,22 @@ def test_restart_live_filling_recovers_with_warning() -> None:
     )
     assert result.recovered_state is PumpState.FILLING
     assert any("FILLING" in w for w in result.warnings)
+
+
+def test_restart_reset_nozzle_in_keeps_unresolved_no_ready() -> None:
+    result = reconcile_after_restart(
+        _persisted(
+            current_state=PumpState.FILLING,
+            active_transaction_id="tx-open",
+        ),
+        LiveObservationSummary(
+            communication_healthy=True,
+            wayne_status=WaynePumpStatus.RESET,
+            nozzle_out=False,
+        ),
+        had_active_transaction_persisted=True,
+    )
+    assert result.recovered_state is PumpState.RESET
+    assert result.context.current_state is not PumpState.READY
+    assert result.context.active_transaction_id == "tx-open"
+    assert result.context.has_unresolved_transaction is True

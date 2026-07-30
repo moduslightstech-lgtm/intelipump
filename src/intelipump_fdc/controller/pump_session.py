@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from intelipump_fdc.controller.comm_health import HealthThresholds, HealthTransitionLog
 from intelipump_fdc.controller.session_events import (
@@ -24,8 +24,17 @@ from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import build_ack, build_poll
 from intelipump_fdc.protocol.dart.line.models import DartLineFrame
 from intelipump_fdc.simulator.config import SequencePolicy, next_sequence
+from intelipump_fdc.state_machine.completion_timeout import (
+    DEFAULT_AWAITING_FILLING_COMPLETE_TIMEOUT,
+    DEFAULT_DC2_STABILITY_WINDOW,
+    evaluate_awaiting_filling_complete_timeout,
+)
 from intelipump_fdc.state_machine.machine import PumpStateMachine
 from intelipump_fdc.state_machine.models import PumpContext
+from intelipump_fdc.state_machine.reconciliation import (
+    LiveObservationSummary,
+    reconcile_after_restart,
+)
 from intelipump_fdc.state_machine.wayne_mapper import (
     MappedWayneObservation,
     MapperContext,
@@ -49,12 +58,18 @@ class PumpSession:
         sequence_policy: SequencePolicy = SequencePolicy.SPEC_F_TO_1,
         thresholds: HealthThresholds | None = None,
         transitions: HealthTransitionLog | None = None,
+        awaiting_filling_complete_timeout: timedelta = (
+            DEFAULT_AWAITING_FILLING_COMPLETE_TIMEOUT
+        ),
+        dc2_stability_window: timedelta = DEFAULT_DC2_STABILITY_WINDOW,
     ) -> None:
         self.state = PumpSessionState(address=address, pump_id=pump_id)
         self.events = events
         self.sequence_policy = sequence_policy
         self.thresholds = thresholds or HealthThresholds()
         self.transitions = transitions
+        self.awaiting_filling_complete_timeout = awaiting_filling_complete_timeout
+        self.dc2_stability_window = dc2_stability_window
         self.machine = PumpStateMachine(
             PumpContext(
                 pump_id=pump_id,
@@ -64,10 +79,104 @@ class PumpSession:
             )
         )
         self._applied_completion_keys: set[str] = set()
+        self._needs_restart_reconcile = False
+        self._persisted_for_reconcile: PumpContext | None = None
+        self._await_started_at: datetime | None = None
+        self._dc2_last_changed_at: datetime | None = None
+        self._last_dc2_volume: int | None = None
+        self._insufficient_evidence_warned = False
+        self._inferred_completion_key: str | None = None
 
     @property
     def address(self) -> int:
         return self.state.address
+
+    def seed_recovered_context(self, context: PumpContext) -> None:
+        """Apply recovery snapshot; require live reconcile before healthy claims."""
+        seeded = context.with_updates(communication_healthy=False)
+        # Re-derive awaiting when snapshot is FILLING_COMPLETE with open sale.
+        if (
+            seeded.current_state is PumpState.FILLING_COMPLETE
+            and seeded.active_transaction_id is not None
+            and not seeded.completion_inferred
+        ):
+            seeded = seeded.with_updates(
+                awaiting_filling_complete=True,
+                has_unresolved_transaction=True,
+            )
+        elif seeded.active_transaction_id is not None:
+            seeded = seeded.with_updates(has_unresolved_transaction=True)
+        self.machine = PumpStateMachine(seeded)
+        self.state.last_state = seeded.current_state
+        self._persisted_for_reconcile = seeded
+        self._needs_restart_reconcile = True
+        self._await_started_at = (
+            seeded.last_observation_at if seeded.awaiting_filling_complete else None
+        )
+        self._insufficient_evidence_warned = False
+        if seeded.dispensed_volume_raw is not None:
+            self._last_dc2_volume = seeded.dispensed_volume_raw
+            self._dc2_last_changed_at = seeded.last_observation_at
+
+    def tick_awaiting_completion(self, *, now: datetime | None = None) -> None:
+        """Evaluate hang-up completion timeout (poll-loop driven; idempotent)."""
+        now = now or datetime.now(UTC)
+        ctx = self.machine.context
+        if not ctx.awaiting_filling_complete:
+            self._await_started_at = None
+            self._insufficient_evidence_warned = False
+            return
+        if self._await_started_at is None:
+            self._await_started_at = ctx.last_observation_at or now
+
+        decision = evaluate_awaiting_filling_complete_timeout(
+            ctx,
+            now=now,
+            timeout=self.awaiting_filling_complete_timeout,
+            await_started_at=self._await_started_at,
+            dc2_last_changed_at=self._dc2_last_changed_at,
+            dc2_stability_window=self.dc2_stability_window,
+        )
+        if decision.insufficient_evidence:
+            if not self._insufficient_evidence_warned:
+                self._insufficient_evidence_warned = True
+                self._publish_reconciliation_warning(
+                    warnings=decision.warnings,
+                    inferences=decision.inferences,
+                    context=ctx,
+                )
+            return
+        if not decision.should_infer or decision.event is None:
+            return
+
+        tx_id = ctx.active_transaction_id or "unknown"
+        key = self._inferred_completion_key or f"inferred:{tx_id}:hangup-timeout"
+        if key in self._applied_completion_keys:
+            return
+        self._inferred_completion_key = key
+        before = ctx.current_state
+        result = self.machine.apply(
+            PumpEvent.FILLING_COMPLETED,
+            observed_at=now,
+            completion_evidence_key=key,
+            completion_inferred=True,
+            awaiting_filling_complete=False,
+            nozzle_out=ctx.nozzle_out,
+            dispensed_volume_raw=ctx.dispensed_volume_raw,
+            active_transaction_id=ctx.active_transaction_id,
+        )
+        if result.accepted:
+            self._applied_completion_keys.add(key)
+            self._await_started_at = None
+            self._insufficient_evidence_warned = False
+            warnings = tuple([*decision.warnings, *result.warnings])
+            self._publish_state_changed(
+                before=before,
+                after=result.context.current_state,
+                event_name=PumpEvent.FILLING_COMPLETED.value,
+                context=result.context.with_updates(warnings=warnings),
+                completion_evidence_key=key,
+            )
 
     def _clear_transient_communication_error(self) -> None:
         """Clear stale transient link errors after a valid EOT/DATA recovery.
@@ -154,12 +263,22 @@ class PumpSession:
         if self.state.consecutive_timeouts >= disconnected:
             self._set_communication(CommunicationHealth.DISCONNECTED)
             self._apply_sm(PumpEvent.COMMUNICATION_LOST)
+            self._arm_reconnect_reconcile()
         elif self.state.consecutive_timeouts >= degraded:
             self._set_communication(CommunicationHealth.DEGRADED)
 
     def mark_serial_lost(self) -> None:
         """Mark pump DISCONNECTED due to serial port loss (not a protocol timeout)."""
         self._set_communication(CommunicationHealth.DISCONNECTED)
+        if self.machine.context.current_state is not PumpState.DISCONNECTED:
+            self._apply_sm(PumpEvent.COMMUNICATION_LOST)
+        self._arm_reconnect_reconcile()
+
+    def _arm_reconnect_reconcile(self) -> None:
+        ctx = self.machine.context
+        if ctx.active_transaction_id is not None or ctx.has_unresolved_transaction:
+            self._persisted_for_reconcile = ctx
+            self._needs_restart_reconcile = True
 
     def handle_response_frame(self, frame: DartLineFrame) -> bytes | None:
         """Process a pump response. Return optional ACK frame bytes to send."""
@@ -322,6 +441,9 @@ class PumpSession:
             volume = decoded.get("volume") if isinstance(decoded, dict) else None
             amount = decoded.get("amount") if isinstance(decoded, dict) else None
             price = decoded.get("price") if isinstance(decoded, dict) else None
+            raw_volume = (
+                volume.get("raw_scaled") if isinstance(volume, dict) else None
+            )
             self.events.publish(
                 ControllerEvent(
                     type=ControllerEventType.APPLICATION_TRANSACTION_DECODED,
@@ -334,11 +456,7 @@ class PumpSession:
                         "transaction_type": tx.transaction_type.value,
                         "transaction_id": tx.transaction_id,
                         "source_frame_ref": tx.source_frame_raw_hex,
-                        "raw_volume": (
-                            volume.get("raw_scaled")
-                            if isinstance(volume, dict)
-                            else None
-                        ),
+                        "raw_volume": raw_volume,
                         "volume_decimals": (
                             volume.get("decimals") if isinstance(volume, dict) else None
                         ),
@@ -359,6 +477,8 @@ class PumpSession:
                     },
                 )
             )
+            if isinstance(raw_volume, int):
+                self._note_dc2_volume(raw_volume, at=datetime.now(UTC))
             ctx = self.machine.context
             mapped = map_wayne_observation(
                 tx,
@@ -369,6 +489,101 @@ class PumpSession:
                     bus_direction=MessageDirection.SLAVE_TO_MASTER,
                 ),
             )
+            if self._needs_restart_reconcile:
+                self._reconcile_then_apply(mapped, raw_volume=raw_volume)
+            else:
+                self._apply_mapped(mapped)
+
+    def _note_dc2_volume(self, raw_volume: int, *, at: datetime) -> None:
+        if self._last_dc2_volume != raw_volume:
+            self._last_dc2_volume = raw_volume
+            self._dc2_last_changed_at = at
+
+    def _reconcile_then_apply(
+        self,
+        mapped: MappedWayneObservation,
+        *,
+        raw_volume: int | None,
+    ) -> None:
+        persisted = self._persisted_for_reconcile or self.machine.context
+        observed_at = datetime.now(UTC)
+        hint: PumpState | None = None
+        if mapped.event in {
+            PumpEvent.FILLING_STARTED,
+            PumpEvent.FILLING_UPDATED,
+        }:
+            hint = PumpState.FILLING
+        elif mapped.event is PumpEvent.FILLING_COMPLETED:
+            hint = PumpState.FILLING_COMPLETE
+        elif mapped.event is PumpEvent.RESET_OBSERVED:
+            hint = PumpState.RESET
+        elif mapped.event is PumpEvent.LIMIT_REACHED:
+            hint = PumpState.LIMIT_REACHED
+        live = LiveObservationSummary(
+            communication_healthy=True,
+            wayne_status=mapped.raw_wayne_status,
+            normalized_hint=hint,
+            observed_at=observed_at,
+            selected_nozzle=mapped.selected_nozzle,
+            nozzle_out=mapped.nozzle_out,
+            dispensed_volume_raw=(
+                raw_volume
+                if isinstance(raw_volume, int)
+                else persisted.dispensed_volume_raw
+            ),
+            raw_source_hex=(
+                mapped.observation.source_frame_raw_hex
+                if mapped.observation
+                else None
+            ),
+        )
+        result = reconcile_after_restart(
+            persisted,
+            live,
+            had_active_transaction_persisted=persisted.active_transaction_id
+            is not None
+            or persisted.has_unresolved_transaction,
+        )
+        before = self.machine.context.current_state
+        self.machine = PumpStateMachine(result.context)
+        self.state.last_state = result.context.current_state
+        self._needs_restart_reconcile = False
+        self._persisted_for_reconcile = None
+        if result.warnings:
+            self._publish_reconciliation_warning(
+                warnings=result.warnings,
+                inferences=(),
+                context=result.context,
+            )
+        if before is not result.context.current_state:
+            self._publish_state_changed(
+                before=before,
+                after=result.context.current_state,
+                event_name="RESTART_RECONCILED",
+                context=result.context,
+                completion_evidence_key=(
+                    f"restart-complete:{result.preserved_unresolved_transaction_id}"
+                    if result.recovered_state is PumpState.FILLING_COMPLETE
+                    and result.preserved_unresolved_transaction_id
+                    else None
+                ),
+            )
+        elif (
+            result.recovered_state is PumpState.FILLING_COMPLETE
+            and result.preserved_unresolved_transaction_id
+        ):
+            # Case B: already FILLING_COMPLETE in memory; still finalize once.
+            key = f"restart-complete:{result.preserved_unresolved_transaction_id}"
+            self._publish_state_changed(
+                before=before,
+                after=result.context.current_state,
+                event_name=PumpEvent.FILLING_COMPLETED.value,
+                context=result.context.with_updates(awaiting_filling_complete=False),
+                completion_evidence_key=key,
+            )
+        else:
+            # Continue applying this observation onto the reconciled context
+            # (e.g. DC2 volume after FILLING restore) without duplicating txs.
             self._apply_mapped(mapped)
 
     def _apply_mapped(self, mapped: MappedWayneObservation) -> None:
@@ -377,18 +592,44 @@ class PumpSession:
             and mapped.completion_evidence_key in self._applied_completion_keys
         ):
             return
-        before = self.machine.context.current_state
+        before_ctx = self.machine.context
+        before = before_ctx.current_state
+        was_awaiting = before_ctx.awaiting_filling_complete
         result = self.machine.apply_mapped(mapped)
-        if mapped.completion_evidence_key and result.accepted and not result.noop:
-            self._applied_completion_keys.add(mapped.completion_evidence_key)
-        after = result.context.current_state
+        after_ctx = result.context
+        after = after_ctx.current_state
         self.state.last_state = after
-        if before is not after:
+
+        if after_ctx.awaiting_filling_complete and not was_awaiting:
+            self._await_started_at = after_ctx.last_observation_at or datetime.now(UTC)
+            self._insufficient_evidence_warned = False
+        if was_awaiting and not after_ctx.awaiting_filling_complete:
+            self._await_started_at = None
+            self._insufficient_evidence_warned = False
+
+        # FILLING_COMPLETE + FILLING_COMPLETED is a same-state noop in the SM,
+        # but still finalizes a hang-up await and must publish once.
+        cleared_await = was_awaiting and not after_ctx.awaiting_filling_complete
+        finalized = (
+            mapped.event is PumpEvent.FILLING_COMPLETED
+            and result.accepted
+            and (not result.noop or cleared_await or mapped.completion_inferred)
+        )
+        hangup_await = (
+            after_ctx.awaiting_filling_complete
+            and not was_awaiting
+            and mapped.event is PumpEvent.NOZZLE_RETURNED
+        )
+        if mapped.completion_evidence_key and result.accepted and (
+            not result.noop or finalized
+        ):
+            self._applied_completion_keys.add(mapped.completion_evidence_key)
+        if before is not after or finalized or hangup_await:
             self._publish_state_changed(
                 before=before,
                 after=after,
                 event_name=mapped.event.value,
-                context=result.context,
+                context=after_ctx,
                 completion_evidence_key=mapped.completion_evidence_key,
             )
 
@@ -432,6 +673,45 @@ class PumpSession:
                     "raw_wayne_status": context.last_raw_wayne_status,
                     "source_frame_ref": context.last_source_frame_hex,
                     "completion_evidence_key": completion_evidence_key,
+                    "awaiting_filling_complete": context.awaiting_filling_complete,
+                    "completion_inferred": context.completion_inferred,
+                    "dispensed_volume_raw": context.dispensed_volume_raw,
+                    "nozzle_out": context.nozzle_out,
+                    "has_unresolved_transaction": context.has_unresolved_transaction,
+                    "warnings": list(context.warnings[-8:]),
+                },
+            )
+        )
+
+    def _publish_reconciliation_warning(
+        self,
+        *,
+        warnings: tuple[str, ...],
+        inferences: tuple[str, ...],
+        context: PumpContext,
+    ) -> None:
+        self.events.publish(
+            ControllerEvent(
+                type=ControllerEventType.STATE_CHANGED,
+                address=self.address,
+                timestamp=datetime.now(UTC),
+                detail="reconciliation_warning",
+                payload={
+                    "event": "RECONCILIATION_WARNING",
+                    "previous_state": context.current_state.value,
+                    "normalized_state": context.current_state.value,
+                    "state_version": context.state_version,
+                    "selected_nozzle": context.selected_nozzle,
+                    "active_transaction_id": context.active_transaction_id,
+                    "communication_healthy": context.communication_healthy,
+                    "raw_wayne_status": context.last_raw_wayne_status,
+                    "source_frame_ref": context.last_source_frame_hex,
+                    "completion_evidence_key": None,
+                    "awaiting_filling_complete": context.awaiting_filling_complete,
+                    "completion_inferred": context.completion_inferred,
+                    "audit_only": True,
+                    "warnings": list(warnings),
+                    "inferences": list(inferences),
                 },
             )
         )
