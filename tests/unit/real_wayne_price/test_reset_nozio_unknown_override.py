@@ -137,21 +137,29 @@ class FakeResetTransport:
     async def get_chunk(self, timeout_s: float) -> SerialChunk | None:
         import time
 
-        deadline = time.monotonic() + max(0.0, timeout_s)
-        while time.monotonic() < deadline:
+        def _pop() -> SerialChunk:
+            data = self._chunks.pop(0)
+            self._seq += 1
+            now = time.monotonic()
+            return SerialChunk(
+                raw=data,
+                monotonic_ns=time.monotonic_ns(),
+                monotonic_s=now,
+                timestamp_utc=datetime.now(UTC).isoformat(),
+                read_sequence=self._seq,
+            )
+
+        if timeout_s <= 0:
+            if not self._chunks:
+                return None
+            return _pop()
+        deadline = time.monotonic() + timeout_s
+        while True:
             if self._chunks:
-                data = self._chunks.pop(0)
-                self._seq += 1
-                now = time.monotonic()
-                return SerialChunk(
-                    raw=data,
-                    monotonic_ns=time.monotonic_ns(),
-                    monotonic_s=now,
-                    timestamp_utc=datetime.now(UTC).isoformat(),
-                    read_sequence=self._seq,
-                )
+                return _pop()
+            if time.monotonic() >= deadline:
+                return None
             await asyncio.sleep(0.002)
-        return None
 
     async def write(self, data: bytes) -> int:
         assert_real_wayne_write_allowed(

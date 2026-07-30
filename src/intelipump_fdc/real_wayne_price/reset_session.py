@@ -29,6 +29,7 @@ from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.control import ControlType, classify_control
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
 from intelipump_fdc.protocol.dart.line.models import DartLineFrame
+from intelipump_fdc.protocol.sequence import WayneSequenceManager
 from intelipump_fdc.real_wayne_price.evidence import (
     ActiveWriteEvidenceBundle,
     default_reset_uncertainties,
@@ -43,6 +44,7 @@ from intelipump_fdc.real_wayne_price.reset_decision import (
     owned_lab_nozio_unknown_override_confirmed,
 )
 from intelipump_fdc.real_wayne_price.session_helpers import (
+    drain_pending_rx,
     sequence_stale_status_hint,
     wait_for_ack_frame,
 )
@@ -245,6 +247,13 @@ class ResetWriteSession:
         dc1_after: int | None = None
         nozzle_physical: str | None = None
         nozzle_decision: str | None = None
+        control_byte_hex = ""
+        encoded_sequence: int | None = None
+        pre_write_drained: list[str] = []
+        write_monotonic_s: float | None = None
+        ack_monotonic_s: float | None = None
+        ack_latency_ms: float | None = None
+        stale_ack_rejected: list[str] = []
 
         try:
             if not self.transport.is_open:
@@ -322,6 +331,10 @@ class ResetWriteSession:
             candidate_hex = frame.hex(" ")
             crc_hex = f"{crc:04X}"
             expected_ack = ack.hex(" ")
+            encoded_sequence = int(self.params.sequence) & 0x0F
+            control_byte_hex = (
+                f"{WayneSequenceManager.message_byte(encoded_sequence):02x}"
+            )
             state = ResetWriteState.RESET_BLOCK_BUILT
 
             authorize = getattr(self.transport, "authorize_single_active_write", None)
@@ -332,6 +345,18 @@ class ResetWriteSession:
                 )
             authorize(frame, kind=ActiveFrameKind.CD1_RESET)
             state = ResetWriteState.RESET_AUTHORIZED_FOR_SINGLE_WRITE
+
+            # Discard stale RX (e.g. leftover 50 c0 fa) before the single TX.
+            pre_write_drained = await drain_pending_rx(
+                self.transport, quiet_ms=20.0
+            )
+            if pre_write_drained:
+                warnings.append(
+                    "pre_write_rx_drained:"
+                    + ",".join(pre_write_drained[:8])
+                )
+
+            write_monotonic_s = time.monotonic()
             await self.transport.write(frame)
             flush = getattr(self.transport, "flush", None)
             if callable(flush):
@@ -341,11 +366,23 @@ class ResetWriteSession:
             active_writes = int(getattr(self.transport, "cd1_reset_write_count", 1))
             state = ResetWriteState.RESET_TRANSMITTED
 
-            matched, ack_outcome, ack_rx_hex = await wait_for_ack_frame(
+            ack_result = await wait_for_ack_frame(
                 self.transport,
                 expected_ack=ack,
                 timeout_ms=self.params.ack_timeout_ms,
+                not_before_monotonic_s=write_monotonic_s,
             )
+            matched = ack_result.matched
+            ack_outcome = ack_result.outcome
+            ack_rx_hex = list(ack_result.observed_hex)
+            ack_monotonic_s = ack_result.ack_monotonic_s
+            ack_latency_ms = ack_result.ack_latency_ms
+            stale_ack_rejected = list(ack_result.stale_rejected_hex)
+            if stale_ack_rejected:
+                warnings.append(
+                    "stale_ack_rejected:"
+                    + ",".join(stale_ack_rejected[:8])
+                )
             if matched:
                 state = ResetWriteState.ACK_RECEIVED
             elif _observed_nak(ack_rx_hex, wire_address=self.wire_address):
@@ -464,6 +501,13 @@ class ResetWriteSession:
             remaining_uncertainties=default_reset_uncertainties(),
             refusal_reasons=refusal_reasons,
             warnings=warnings,
+            encoded_sequence=encoded_sequence,
+            control_byte_hex=control_byte_hex,
+            pre_write_drained_hex=pre_write_drained,
+            write_monotonic_s=write_monotonic_s,
+            ack_monotonic_s=ack_monotonic_s,
+            ack_latency_ms=ack_latency_ms,
+            stale_ack_rejected_hex=stale_ack_rejected,
         )
         paths = write_active_write_evidence(
             self.params.evidence_dir, bundle, stem="cd1-reset-write"
@@ -491,9 +535,17 @@ class ResetWriteSession:
             "candidatePayloadHex": payload_hex,
             "candidateFrameHex": candidate_hex,
             "crc": crc_hex,
+            "sequence": self.params.sequence,
+            "encodedSequence": encoded_sequence,
+            "controlByteHex": control_byte_hex,
             "expectedAckHypothesis": expected_ack,
             "ackOutcome": ack_outcome,
             "ackObservedHex": ack_rx_hex,
+            "writeMonotonicS": write_monotonic_s,
+            "ackMonotonicS": ack_monotonic_s,
+            "ackLatencyMs": ack_latency_ms,
+            "preWriteDrainedHex": pre_write_drained,
+            "staleAckRejectedHex": stale_ack_rejected,
             "expectedStatusAfter": expected_after,
             "nozzlePhysicalState": nozzle_physical,
             "resetNozzleDecision": nozzle_decision,

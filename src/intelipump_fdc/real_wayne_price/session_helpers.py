@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 
 from intelipump_fdc.bench_poll.poll_io import (
     StatusPollOutcome,
@@ -25,22 +26,85 @@ from intelipump_fdc.real_wayne_price.status_decode import (
 )
 
 
+@dataclass(slots=True)
+class AckWaitResult:
+    """ACK wait outcome; unpacks as ``(matched, outcome, observed_hex)``."""
+
+    matched: bool
+    outcome: str
+    observed_hex: list[str]
+    not_before_monotonic_s: float
+    ack_monotonic_s: float | None = None
+    ack_latency_ms: float | None = None
+    stale_rejected_hex: list[str] = field(default_factory=list)
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.matched
+        yield self.outcome
+        yield self.observed_hex
+
+
+async def drain_pending_rx(
+    transport: BenchByteTransport,
+    *,
+    quiet_ms: float = 20.0,
+    max_chunks: int = 64,
+) -> list[str]:
+    """Discard pending RX chunks before an active write (stale-ACK defense).
+
+    Empties anything already queued, then waits a short quiet window for the
+    permanent reader to deliver OS-buffered bytes. Never transmits.
+    """
+    drained: list[str] = []
+
+    while len(drained) < max_chunks:
+        chunk = await transport.get_chunk(0.0)
+        if chunk is None or chunk.is_error or not chunk.raw:
+            break
+        drained.append(chunk.raw.hex(" "))
+
+    if quiet_ms <= 0:
+        return drained
+
+    deadline = time.monotonic() + (quiet_ms / 1000.0)
+    while time.monotonic() < deadline and len(drained) < max_chunks:
+        remaining = deadline - time.monotonic()
+        chunk = await transport.get_chunk(min(0.01, max(0.0, remaining)))
+        if chunk is None or chunk.is_error or not chunk.raw:
+            continue
+        drained.append(chunk.raw.hex(" "))
+    return drained
+
+
 async def wait_for_ack_frame(
     transport: BenchByteTransport,
     *,
     expected_ack: bytes,
     timeout_ms: int,
-) -> tuple[bool, str, list[str]]:
+    not_before_monotonic_s: float | None = None,
+) -> AckWaitResult:
+    """Wait for an ACK observed strictly after ``not_before_monotonic_s``.
+
+    Chunks with ``monotonic_s < not_before`` are recorded as rejected stale
+    bytes and never produce ``ACK_MATCH``. When ``not_before`` is omitted,
+    the wait start time is used (legacy behavior for other benches).
+    """
     assembler = LegacyIgemStreamAssembler()
     observed: list[str] = []
+    stale_rejected: list[str] = []
     deadline = time.monotonic() + (timeout_ms / 1000.0)
-    t0 = time.monotonic()
+    not_before = (
+        time.monotonic()
+        if not_before_monotonic_s is None
+        else float(not_before_monotonic_s)
+    )
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
         chunk = await transport.get_chunk(min(remaining, 0.05))
         if chunk is None or chunk.is_error or not chunk.raw:
             continue
-        if chunk.monotonic_s < t0:
+        if chunk.monotonic_s < not_before:
+            stale_rejected.append(chunk.raw.hex(" "))
             continue
         for event in assembler.feed(chunk.raw):
             if event.kind is not AssemblerEventKind.FRAME:
@@ -48,17 +112,33 @@ async def wait_for_ack_frame(
             raw = event.raw
             observed.append(raw.hex(" "))
             view = event.captured
-            if raw == expected_ack:
-                return True, "ACK_MATCH", observed
-            if (
+            matched = raw == expected_ack or (
                 view is not None
                 and view.classification is CapturedFrameClass.SEQUENCE_CONTROL_OR_ACK
                 and len(raw) == 3
                 and raw[0] == expected_ack[0]
                 and raw[1] == expected_ack[1]
-            ):
-                return True, "ACK_MATCH", observed
-    return False, "ACK_TIMEOUT", observed
+            )
+            if matched:
+                latency_ms = (chunk.monotonic_s - not_before) * 1000.0
+                return AckWaitResult(
+                    matched=True,
+                    outcome="ACK_MATCH",
+                    observed_hex=observed,
+                    not_before_monotonic_s=not_before,
+                    ack_monotonic_s=chunk.monotonic_s,
+                    ack_latency_ms=latency_ms,
+                    stale_rejected_hex=stale_rejected,
+                )
+    return AckWaitResult(
+        matched=False,
+        outcome="ACK_TIMEOUT",
+        observed_hex=observed,
+        not_before_monotonic_s=not_before,
+        ack_monotonic_s=None,
+        ack_latency_ms=None,
+        stale_rejected_hex=stale_rejected,
+    )
 
 
 async def poll_status_until(
@@ -151,9 +231,15 @@ def sequence_stale_status_hint(
     if "_not_reached" not in joined and "dc1_not_" not in joined:
         return None
     nxt = next_sequence_nibble(sequence)
+    ctrl_cur = 0x30 | (sequence & 0x0F)
+    ctrl_nxt = 0x30 | (nxt & 0x0F)
     return (
         "ACK_MATCH with unchanged DC1: not necessarily a duplicate sequence. "
-        f"If the prior active write already used a lower sequence, try --sequence {nxt} "
-        "once; otherwise check DART alternate flow (nozzle OUT then RESET) and "
-        "confirm the display physically before further TX"
+        f"DATA CTRL low nibble encodes sequence on the wire "
+        f"(0x{ctrl_cur:02X}→0x{ctrl_nxt:02X}). "
+        f"If the prior active write already used a lower sequence, try "
+        f"--sequence {nxt} once after confirming pre-write RX drain / "
+        f"post-write ACK timing in evidence; otherwise check DART alternate "
+        f"flow (nozzle OUT then RESET) and confirm the display physically "
+        f"before further TX"
     )

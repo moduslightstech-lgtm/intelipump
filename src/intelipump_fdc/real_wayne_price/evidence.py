@@ -383,6 +383,14 @@ class ActiveWriteEvidenceBundle:
     mid_status_hex: str = ""
     decoded_status_mid: dict[str, Any] | None = None
     reset_sequence: int | None = None
+    # Wire sequence / post-write ACK timing (owned-lab RESET path).
+    encoded_sequence: int | None = None
+    control_byte_hex: str = ""
+    pre_write_drained_hex: list[str] | None = None
+    write_monotonic_s: float | None = None
+    ack_monotonic_s: float | None = None
+    ack_latency_ms: float | None = None
+    stale_ack_rejected_hex: list[str] | None = None
 
 
 def write_active_write_evidence(
@@ -421,9 +429,20 @@ def write_active_write_evidence(
         "candidateFrameHex": bundle.candidate_frame_hex,
         "crc": bundle.crc_hex,
         "sequence": bundle.sequence,
+        "encodedSequence": (
+            bundle.encoded_sequence
+            if bundle.encoded_sequence is not None
+            else bundle.sequence
+        ),
+        "controlByteHex": bundle.control_byte_hex,
         "expectedAckHypothesis": bundle.expected_ack_hex,
         "ackOutcome": bundle.ack_outcome,
         "ackObservedHex": bundle.ack_observed_hex,
+        "writeMonotonicS": bundle.write_monotonic_s,
+        "ackMonotonicS": bundle.ack_monotonic_s,
+        "ackLatencyMs": bundle.ack_latency_ms,
+        "preWriteDrainedHex": bundle.pre_write_drained_hex or [],
+        "staleAckRejectedHex": bundle.stale_ack_rejected_hex or [],
         "expectedStatusAfter": bundle.expected_status_after,
         "writeState": bundle.write_state,
         "remainingUncertainties": bundle.remaining_uncertainties,
@@ -466,7 +485,15 @@ def write_active_write_evidence(
         "candidatePayloadHex": bundle.candidate_payload_hex,
         "candidateFrameHex": bundle.candidate_frame_hex,
         "crc": bundle.crc_hex,
+        "sequence": bundle.sequence,
+        "encodedSequence": (
+            bundle.encoded_sequence
+            if bundle.encoded_sequence is not None
+            else bundle.sequence
+        ),
+        "controlByteHex": bundle.control_byte_hex,
         "ackOutcome": bundle.ack_outcome,
+        "ackLatencyMs": bundle.ack_latency_ms,
         "expectedStatusAfter": bundle.expected_status_after,
         "motorIsolated": bundle.confirmations.get("motorIsolated", False),
         "valvesIsolated": bundle.confirmations.get("valvesIsolated", False),
@@ -498,9 +525,12 @@ def write_active_write_evidence(
         f"- Transmitted: `{bundle.transmitted}`",
         f"- activeWriteCount: `{bundle.active_write_count}`",
         f"- Write state: `{bundle.write_state}`",
+        f"- Encoded sequence: `{review_obj['encodedSequence']}`",
+        f"- Control byte: `{bundle.control_byte_hex}`",
         f"- Payload: `{bundle.candidate_payload_hex}`",
         f"- Candidate frame: `{bundle.candidate_frame_hex}`",
         f"- ACK outcome: `{bundle.ack_outcome}`",
+        f"- ACK latency ms: `{bundle.ack_latency_ms}`",
         f"- Status before: `{review_obj['statusBefore']}`",
         f"- Status after: `{review_obj['statusAfter']}`",
         "",
@@ -571,8 +601,8 @@ __all__ = [
     "DryRunEvidenceBundle",
     "WriteEvidenceBundle",
     "default_authorize_uncertainties",
-    "default_cd101_uncertainties",
     "default_cd2_reset_uncertainties",
+    "default_cd101_uncertainties",
     "default_reset_uncertainties",
     "default_return_status_reset_uncertainties",
     "default_uncertainties",
