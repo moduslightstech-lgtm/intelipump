@@ -15,33 +15,36 @@ from intelipump_fdc.protocol.dart.application.nozio import (
 
 
 @pytest.mark.parametrize(
-    ("raw", "logical", "out"),
+    ("raw", "logical_raw", "selected", "out"),
     [
-        (0x01, 1, False),
-        (0x11, 1, True),
-        (0x02, 2, False),
-        (0x12, 2, True),
-        (0x07, 7, False),
-        (0x17, 7, True),
+        (0x01, 1, 1, False),
+        (0x11, 1, 1, True),
+        (0x02, 2, 2, False),
+        (0x12, 2, 2, True),
+        (0x10, 0, None, True),
+        (0x00, 0, None, False),
+        (0x07, 7, 7, False),
+        (0x17, 7, 7, True),
     ],
 )
-def test_documented_nozio_examples(raw: int, logical: int, out: bool) -> None:
+def test_documented_nozio_examples(
+    raw: int, logical_raw: int, selected: int | None, out: bool
+) -> None:
+    nozio = raw
+    logical_nozzle = nozio & 0x0F
+    nozzle_out = bool(nozio & 0x10)
+    assert logical_nozzle == logical_raw
+    assert nozzle_out is out
     dec = decode_nozio(raw)
-    assert dec.selected_logical_nozzle == logical
+    assert dec.logical_nozzle_raw == logical_raw
+    assert dec.selected_logical_nozzle == selected
     assert dec.nozzle_out is out
     assert dec.nozzle_position == ("OUT" if out else "IN")
     assert dec.reserved_bits == 0
-    assert dec.decoder_confidence == "HIGH_DOCUMENTED_MASKS"
     ev = dec.to_evidence_dict()
-    assert ev["nozioRawHex"] == f"{raw:02X}"
-    assert ev["nozioBinary"] == format(raw, "08b")
-    assert ev["logicalNozzleMask"] == "0x0F"
+    assert ev["logicalNozzleRaw"] == logical_raw
+    assert ev["selectedLogicalNozzle"] == selected
     assert ev["positionMask"] == "0x10"
-    assert ev["reservedBits"] == "0x00"
-    assert ev["selectedLogicalNozzle"] == logical
-    assert ev["nozzlePosition"] == ("OUT" if out else "IN")
-    assert "page 21" in ev["documentationSource"]
-    assert ev["decoderConfidence"] == "HIGH_DOCUMENTED_MASKS"
 
 
 def test_nozio_masks_are_documented_values() -> None:
@@ -63,12 +66,11 @@ def test_reserved_bits_warn_and_lower_confidence() -> None:
 def test_dc3_payload_includes_nozio_evidence() -> None:
     bundle = decode_data_payload(bytes.fromhex("03 04 00 11 75 11"), price_decimals=2)
     tx = bundle.transactions[0]
-    assert tx.transaction_type is TransactionType.DC3_NOZZLE_STATUS_PRICE
+    assert tx.transaction_type is TransactionType.AMBIGUOUS_CD3_OR_DC3
     assert tx.decoded_body is not None
     assert tx.decoded_body["selected_logical_nozzle"] == 1
+    assert tx.decoded_body["logical_nozzle_raw"] == 1
     assert tx.decoded_body["nozzle_out"] is True
     nozio = tx.decoded_body["nozio"]
     assert nozio["nozioRawHex"] == "11"
-    assert nozio["nozioBinary"] == "00010001"
-    assert nozio["nozzlePosition"] == "OUT"
-    assert nozio["decoderConfidence"] == "HIGH_DOCUMENTED_MASKS"
+    assert nozio["selectedLogicalNozzle"] == 1

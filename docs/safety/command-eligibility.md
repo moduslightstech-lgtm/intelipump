@@ -56,13 +56,24 @@ Allowed when `communication_healthy`. Evaluation only.
 
 ### AUTHORIZE
 
-- State is `NOZZLE_UP`
-- Selected nozzle known
-- Price verified
+**Protocol-complete default (Wayne):** AUTHORIZE may precede or follow
+nozzle lift. Eligibility allows state in `{RESET, READY, NOZZLE_UP}`.
+
+- Selected nozzle known (`selected_nozzle` set; nozzle 0 / unknown blocks)
+- Price verified (`price_verified`; DC3 filling-price check when a nozzle
+  is selected; CD5 programming may mark verified when all nozzles are
+  programmed and decimals are known)
 - Communication healthy
 - No active unresolved transaction
 - No fault
 - Execution remains disabled outside this evaluation
+- Never auto-authorize after restart or communication recovery
+
+**Optional deployment policy:** when
+`require_nozzle_lift_before_authorize=True`, AUTHORIZE is blocked unless
+state is `NOZZLE_UP` (lift-first). This is InteliPump policy, not a Wayne
+protocol requirement. Blocking reason:
+`require_nozzle_lift_before_authorize`.
 
 ### STOP
 

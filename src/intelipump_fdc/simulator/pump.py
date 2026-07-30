@@ -11,7 +11,11 @@ from intelipump_fdc.domain.pump_command import PumpCommand
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
 from intelipump_fdc.protocol.dart.application.bcd import decode_packed_bcd
-from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
+from intelipump_fdc.protocol.dart.application.constants import (
+    MessageDirection,
+    PumpControlCommand,
+)
+from intelipump_fdc.protocol.dart.application.decoder import decode_data_payload
 from intelipump_fdc.protocol.dart.application.status import WaynePumpStatus
 from intelipump_fdc.simulator.clock import SimulatedClock
 from intelipump_fdc.simulator.config import PumpConfig, SimulatorConfig
@@ -28,6 +32,8 @@ from intelipump_fdc.simulator.models import OutboundApplicationTransaction, Pump
 from intelipump_fdc.state_machine.guards import evaluate_command_eligibility
 from intelipump_fdc.state_machine.machine import PumpStateMachine
 from intelipump_fdc.state_machine.models import PumpContext
+from intelipump_fdc.state_machine.price_verification import verify_dc3_filling_price
+from intelipump_fdc.state_machine.wayne_mapper import MapperContext, map_wayne_observation
 
 
 @dataclass
@@ -137,19 +143,18 @@ class SimulatedPump:
         self.data_pending_since_ms = None
 
     def cold_start_to_ready(self) -> None:
-        """High-level cold start path: DISCONNECTED → … → READY."""
+        """High-level cold start: DISCONNECTED → … → READY via DC1/DC3 mapper."""
         if not self.communication_enabled:
             self.enable_communication()
-        self._apply_event(PumpEvent.PUMP_DISCOVERED)
         self.wayne_status = WaynePumpStatus.RESET
-        self._apply_event(PumpEvent.RESET_OBSERVED, raw_wayne_status=int(self.wayne_status))
         self.nozzle_out = False
-        self._apply_event(PumpEvent.READY_OBSERVED)
-        self.wayne_status = WaynePumpStatus.RESET
-        self.queue_status_and_nozzle()
+        self.selected_nozzle = None
+        self.price_verified = False
+        # Production path: emit DC1+DC3 and map (no synthetic READY_OBSERVED).
+        self.apply_queued_status_observations()
 
     def restart_pump(self, *, preserve_totals: bool = True) -> None:
-        """Simulate pump electronic restart."""
+        """Simulate pump electronic restart (never auto-authorize)."""
         was_filling = self.filling_active or self.normalized_state in {
             PumpState.FILLING,
             PumpState.SUSPENDED,
@@ -164,13 +169,14 @@ class SimulatedPump:
         self.preset_volume_raw = None
         self.fault_code = None
         self.active_transaction_id = None
+        self.price_verified = False
+        self.selected_nozzle = None
         self.pending_outbound.clear()
         self.reset_protocol_sequences()
         if not preserve_totals:
             self.total_volume_raw = 0
             self.total_amount_raw = 0
         if self.communication_enabled:
-            # Prefer live idle state after restart.
             self._machine = PumpStateMachine(
                 PumpContext(
                     pump_id=self.config.pump_id,
@@ -178,6 +184,7 @@ class SimulatedPump:
                     current_state=PumpState.DISCOVERING,
                     communication_healthy=True,
                     price_verified=False,
+                    nozzle_out=False,
                     warnings=(
                         ("restart during filling; recovered to DISCOVERING",)
                         if was_filling
@@ -186,8 +193,7 @@ class SimulatedPump:
                 )
             )
             self.wayne_status = WaynePumpStatus.RESET
-            self._apply_event(PumpEvent.RESET_OBSERVED)
-            self._apply_event(PumpEvent.READY_OBSERVED)
+            self.apply_queued_status_observations()
         else:
             self._machine = PumpStateMachine(
                 PumpContext(
@@ -210,23 +216,51 @@ class SimulatedPump:
                     at_ms=self.clock.now(),
                 )
             ]
+        # Preserve prior holster state for mapper edge detection (IN→OUT).
+        previous_out = self.context.nozzle_out
+        if previous_out is None:
+            previous_out = False
         self.selected_nozzle = nozzle
         self.nozzle_out = True
-        self.price_verified = True
+        self._refresh_price_verification()
         self._sync_context_fields()
-        self._apply_event(
-            PumpEvent.NOZZLE_LIFTED,
-            selected_nozzle=nozzle,
-            price_verified=True,
+        self._machine.replace_context(
+            self.context.with_updates(nozzle_out=previous_out)
         )
-        self.queue_status_and_nozzle()
+        if self.normalized_state is PumpState.AUTHORIZED:
+            self.apply_queued_status_observations(preserve_context_nozzle=True)
+            self.filling_active = True
+            self.suspended = False
+            self.last_fill_tick_ms = self.clock.now()
+            self.wayne_status = WaynePumpStatus.FILLING
+            self.apply_queued_status_observations()
+            self._queue_fill_data()
+            return []
+        self.apply_queued_status_observations(preserve_context_nozzle=True)
         return []
 
     def return_nozzle(self) -> None:
+        previous_out = self.context.nozzle_out
+        if previous_out is None:
+            previous_out = True
         self.nozzle_out = False
-        if self.normalized_state in {PumpState.NOZZLE_UP, PumpState.AUTHORIZED}:
-            self._apply_event(PumpEvent.NOZZLE_RETURNED)
-        self.queue_status_and_nozzle()
+        self._sync_context_fields()
+        self._machine.replace_context(
+            self.context.with_updates(nozzle_out=previous_out)
+        )
+        if self.normalized_state in {
+            PumpState.FILLING,
+            PumpState.SUSPENDED,
+            PumpState.LIMIT_REACHED,
+        }:
+            self.apply_queued_status_observations(preserve_context_nozzle=True)
+            self.filling_active = False
+            self.suspended = False
+            self.wayne_status = WaynePumpStatus.FILLING_COMPLETED
+            self.apply_queued_status_observations()
+            self._queue_fill_data()
+            return
+        self.apply_queued_status_observations(preserve_context_nozzle=True)
 
     def inject_fault(self, code: int = 1) -> None:
         self.fault_code = code
@@ -240,8 +274,9 @@ class SimulatedPump:
         self.fault_code = None
         self._apply_event(PumpEvent.FAULT_CLEARED)
         self.wayne_status = WaynePumpStatus.RESET
-        self._apply_event(PumpEvent.RESET_OBSERVED)
-        self._apply_event(PumpEvent.READY_OBSERVED)
+        self.nozzle_out = False
+        self.price_verified = False
+        self.apply_queued_status_observations()
 
     # --- Application command handling (controller DATA) ---------------------
 
@@ -374,13 +409,22 @@ class SimulatedPump:
                 PumpCommand.SET_PRICE, price_raw=price_raw, nozzle=nozzle
             )
             faults.extend(result)
-        if not faults and was_not_programmed and self.price_verified:
-            self.wayne_status = WaynePumpStatus.FILLING_COMPLETED
-            self._apply_event(
-                PumpEvent.FILLING_COMPLETED,
-                raw_wayne_status=int(self.wayne_status),
+        if not faults and was_not_programmed:
+            # CD5 programs prices without a selected nozzle; treat a complete
+            # multi-nozzle accept as verified for the documented 0→5 path.
+            self.price_verified = all(
+                n in self.prices_raw
+                for n in range(1, self.config.nozzle_count + 1)
             )
-            self.queue_status_and_nozzle()
+            self._sync_context_fields()
+            if self.price_verified:
+                self.wayne_status = WaynePumpStatus.FILLING_COMPLETED
+                self._apply_event(
+                    PumpEvent.FILLING_COMPLETED,
+                    raw_wayne_status=int(self.wayne_status),
+                    price_verified=True,
+                )
+                self.queue_status_and_nozzle()
         return faults
 
     def _execute_guarded(
@@ -415,7 +459,18 @@ class SimulatedPump:
         if command is PumpCommand.SET_PRICE:
             assert price_raw is not None and nozzle is not None
             self.prices_raw[nozzle] = price_raw
-            self.price_verified = True
+            # CD5 master write programs prices; DC3 verify only when a nozzle
+            # is selected. With no selection, mark verified once every nozzle
+            # has an accepted programmed price and decimals are known.
+            if self.selected_nozzle is not None:
+                self._refresh_price_verification()
+            else:
+                decimals_known = self.config.filling.price_decimals is not None
+                all_programmed = all(
+                    n in self.prices_raw
+                    for n in range(1, self.config.nozzle_count + 1)
+                )
+                self.price_verified = decimals_known and all_programmed
             self._sync_context_fields()
             self.queue_status_and_nozzle()
             return []
@@ -440,16 +495,20 @@ class SimulatedPump:
                 active_transaction_id=self.active_transaction_id,
                 raw_wayne_status=int(self.wayne_status),
             )
-            self.filling_active = True
-            self.suspended = False
-            self.last_fill_tick_ms = self.clock.now()
-            self.wayne_status = WaynePumpStatus.FILLING
-            self._apply_event(
-                PumpEvent.FILLING_STARTED,
-                raw_wayne_status=int(self.wayne_status),
-            )
-            self.queue_status_and_nozzle()
-            self._queue_fill_data()
+            # Wayne may authorize before lift; start FILLING only once nozzle is OUT.
+            if self.nozzle_out:
+                self.filling_active = True
+                self.suspended = False
+                self.last_fill_tick_ms = self.clock.now()
+                self.wayne_status = WaynePumpStatus.FILLING
+                self._apply_event(
+                    PumpEvent.FILLING_STARTED,
+                    raw_wayne_status=int(self.wayne_status),
+                )
+                self.queue_status_and_nozzle()
+                self._queue_fill_data()
+            else:
+                self.queue_status_and_nozzle()
             return []
 
         if command is PumpCommand.STOP:
@@ -485,17 +544,85 @@ class SimulatedPump:
             self.preset_amount_raw = None
             self.preset_volume_raw = None
             self.active_transaction_id = None
+            self.price_verified = False
             self.wayne_status = WaynePumpStatus.RESET
-            self._apply_event(
-                PumpEvent.RESET_OBSERVED,
-                raw_wayne_status=int(self.wayne_status),
-            )
-            if not self.nozzle_out:
-                self._apply_event(PumpEvent.READY_OBSERVED)
-            self.queue_status_and_nozzle()
+            # RESET clears display/amount/volume/preset; READY only via mapper.
+            self.apply_queued_status_observations()
             return []
 
         return []
+
+    def apply_queued_status_observations(
+        self, *, preserve_context_nozzle: bool = False
+    ) -> None:
+        """Encode DC1+DC3 and apply through production decoder/mapper.
+
+        This is the simulator stand-in for pump→controller DATA so READY and
+        nozzle edges use the same path as real hardware observations.
+
+        When ``preserve_context_nozzle`` is True, keep the current context
+        ``nozzle_out`` (prior edge state) instead of overwriting it from the
+        physical sim flag before mapping.
+        """
+        payload = encode_dc1_status(int(self.wayne_status)) + self._encode_dc3()
+        self.queue_status_and_nozzle()
+        bundle = decode_data_payload(
+            payload,
+            pump_address=self.config.dart_address,
+            source_frame_raw_hex=f"sim:{self.clock.now()}:{payload.hex()}",
+            price_decimals=self.config.filling.price_decimals,
+        )
+        prior_noz = self.context.nozzle_out
+        self._sync_context_fields()
+        if preserve_context_nozzle:
+            self._machine.replace_context(
+                self.context.with_updates(nozzle_out=prior_noz)
+            )
+        for tx in bundle.transactions:
+            mapped = map_wayne_observation(
+                tx,
+                context=MapperContext.from_pump_context(
+                    self.context,
+                    resolve_as_dc1=True,
+                    resolve_as_dc3=True,
+                    bus_direction=MessageDirection.SLAVE_TO_MASTER,
+                ),
+            )
+            self._machine.apply_mapped(
+                mapped,
+                dispensed_volume_raw=self.volume_raw,
+                price_verified=self.price_verified,
+            )
+            self._sync_from_machine()
+
+    def _refresh_price_verification(self) -> None:
+        nozzle = self.selected_nozzle
+        if nozzle is None:
+            self.price_verified = False
+            return
+        price_raw = self.prices_raw.get(nozzle)
+        result = verify_dc3_filling_price(
+            received_price_raw=price_raw,
+            selected_nozzle=nozzle,
+            configured_prices_raw=self.prices_raw,
+            price_decimals=self.config.filling.price_decimals,
+            price_bcd_valid=True,
+        )
+        # Full verify when decimals known; partial raw match is not verified.
+        self.price_verified = result.verified
+        if result.partial and not result.verified:
+            self._notes.append(f"price partially verified: {result.reasons}")
+
+    def _sync_from_machine(self) -> None:
+        ctx = self.context
+        if ctx.nozzle_out is not None:
+            self.nozzle_out = ctx.nozzle_out
+        if ctx.selected_nozzle is not None:
+            self.selected_nozzle = ctx.selected_nozzle
+        self.price_verified = ctx.price_verified
+        self.active_transaction_id = ctx.active_transaction_id
+        self.fault_code = ctx.fault_code
+        # Wayne status remains simulator-authoritative (encoded into DC1).
 
     # --- Filling engine -----------------------------------------------------
 
@@ -649,11 +776,21 @@ class SimulatedPump:
     def _sync_context_fields(self) -> None:
         ctx = self.context.with_updates(
             selected_nozzle=self.selected_nozzle,
+            nozzle_out=self.nozzle_out,
             price_verified=self.price_verified,
             communication_healthy=self.communication_enabled,
             active_transaction_id=self.active_transaction_id,
             fault_code=self.fault_code,
             last_raw_wayne_status=int(self.wayne_status),
+            dispensed_volume_raw=self.volume_raw,
+            has_unresolved_transaction=self.active_transaction_id is not None
+            and self.normalized_state
+            in {
+                PumpState.FILLING,
+                PumpState.SUSPENDED,
+                PumpState.LIMIT_REACHED,
+                PumpState.FILLING_COMPLETE,
+            },
         )
         self._machine.replace_context(ctx)
 

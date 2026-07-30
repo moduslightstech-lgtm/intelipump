@@ -6,7 +6,7 @@ Wire layout inside DC3 (TRANS=0x03, LNG=4):
 
 NOZIO bit masks (documented):
 
-- bits 0..3: selected logical nozzle number
+- bits 0..3: selected logical nozzle number (1..15; 0 = none selected)
 - bit 4: nozzle in/out (0 = in, 1 = out)
 - bits 5..7: reserved/unknown — preserve and warn if nonzero
 """
@@ -31,7 +31,8 @@ class NozioDecode:
     """Documented NOZIO field decode with evidence fields."""
 
     nozio_raw: int
-    selected_logical_nozzle: int
+    logical_nozzle_raw: int
+    selected_logical_nozzle: int | None
     nozzle_out: bool
     reserved_bits: int
     warnings: tuple[str, ...]
@@ -57,6 +58,7 @@ class NozioDecode:
             "logicalNozzleMask": f"0x{NOZIO_LOGICAL_NOZZLE_MASK:02X}",
             "positionMask": f"0x{NOZIO_POSITION_MASK:02X}",
             "reservedBits": f"0x{self.reserved_bits:02X}",
+            "logicalNozzleRaw": self.logical_nozzle_raw,
             "selectedLogicalNozzle": self.selected_logical_nozzle,
             "nozzlePosition": self.nozzle_position,
             "nozzleOut": self.nozzle_out,
@@ -67,9 +69,14 @@ class NozioDecode:
 
 
 def decode_nozio(nozio: int) -> NozioDecode:
-    """Decode one NOZIO byte with explicit documented masks."""
+    """Decode one NOZIO byte with explicit documented masks.
+
+    Preserves reserved upper bits with a warning; never discards the
+    transaction or invents meanings for bits 5..7.
+    """
     value = int(nozio) & 0xFF
-    logical = value & NOZIO_LOGICAL_NOZZLE_MASK
+    logical_raw = value & NOZIO_LOGICAL_NOZZLE_MASK
+    selected = logical_raw if 1 <= logical_raw <= 15 else None
     nozzle_out = bool(value & NOZIO_POSITION_MASK)
     reserved = value & NOZIO_RESERVED_MASK
     warnings: list[str] = []
@@ -81,9 +88,14 @@ def decode_nozio(nozio: int) -> NozioDecode:
         confidence = "MEDIUM_RESERVED_BITS_SET"
     else:
         confidence = "HIGH_DOCUMENTED_MASKS"
+    if logical_raw == 0:
+        warnings.append(
+            "NOZIO logical nozzle raw=0; treated as no selected logical nozzle"
+        )
     return NozioDecode(
         nozio_raw=value,
-        selected_logical_nozzle=logical,
+        logical_nozzle_raw=logical_raw,
+        selected_logical_nozzle=selected,
         nozzle_out=nozzle_out,
         reserved_bits=reserved,
         warnings=tuple(warnings),

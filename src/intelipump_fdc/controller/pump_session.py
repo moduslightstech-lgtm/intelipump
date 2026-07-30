@@ -17,6 +17,7 @@ from intelipump_fdc.controller.session_models import (
 )
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
+from intelipump_fdc.protocol.dart.application.constants import MessageDirection
 from intelipump_fdc.protocol.dart.application.decoder import decode_data_payload
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.control import ControlType
@@ -24,7 +25,7 @@ from intelipump_fdc.protocol.dart.line.frame_builder import build_ack, build_pol
 from intelipump_fdc.protocol.dart.line.models import DartLineFrame
 from intelipump_fdc.simulator.config import SequencePolicy, next_sequence
 from intelipump_fdc.state_machine.machine import PumpStateMachine
-from intelipump_fdc.state_machine.models import ObservationRef, PumpContext
+from intelipump_fdc.state_machine.models import PumpContext
 from intelipump_fdc.state_machine.wayne_mapper import (
     MappedWayneObservation,
     MapperContext,
@@ -358,15 +359,14 @@ class PumpSession:
                     },
                 )
             )
+            ctx = self.machine.context
             mapped = map_wayne_observation(
                 tx,
-                context=MapperContext(
-                    current_state=self.machine.context.current_state,
-                    previous_wayne_status=self.machine.context.last_raw_wayne_status,
-                    # Controller received slave→master DATA: resolve DC1/DC3.
-                    resolve_as_dc1=tx.transaction_id == 0x01,
-                    resolve_as_dc3=tx.transaction_id == 0x03,
-                    bus_direction=tx.direction,
+                context=MapperContext.from_pump_context(
+                    ctx,
+                    resolve_as_dc1=True,
+                    resolve_as_dc3=True,
+                    bus_direction=MessageDirection.SLAVE_TO_MASTER,
                 ),
             )
             self._apply_mapped(mapped)
@@ -378,18 +378,7 @@ class PumpSession:
         ):
             return
         before = self.machine.context.current_state
-        result = self.machine.apply(
-            mapped.event,
-            observation=mapped.observation
-            or ObservationRef(
-                source_frame_raw_hex=None,
-                transaction_type=None,
-            ),
-            selected_nozzle=mapped.selected_nozzle,
-            raw_wayne_status=mapped.raw_wayne_status,
-            completion_evidence_key=mapped.completion_evidence_key,
-            allow_implicit_authorize_to_filling=mapped.allow_implicit_authorize_to_filling,
-        )
+        result = self.machine.apply_mapped(mapped)
         if mapped.completion_evidence_key and result.accepted and not result.noop:
             self._applied_completion_keys.add(mapped.completion_evidence_key)
         after = result.context.current_state

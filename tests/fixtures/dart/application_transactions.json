@@ -51,25 +51,25 @@
     "name": "dc3_nozzle_status_price-4",
     "sourceFile": "capture_2026-07-19_merged_a.jsonl",
     "direction": "SLAVE_TO_MASTER",
-    "expectedTransactionType": "DC3_NOZZLE_STATUS_PRICE",
+    "expectedTransactionType": "AMBIGUOUS_CD3_OR_DC3",
     "expectedDecodeStatus": "PARTIAL",
     "rawTransactionHex": "03 04 00 11 75 01",
     "sourceFrameRawHex": "51 3A 02 08 00 00 00 00 00 00 00 00 03 04 00 11 75 01 01 01 05 60 27 03 FA",
     "pumpAddress": 81,
     "lineSequence": 10,
-    "notes": "Interpreted TRANS 0x03 LNG=4 as DC3 (PRI+NOZIO). CD3 preset volume shares this wire size (Pump Interface pp. 14 and 21).; Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) were not provided."
+    "notes": "TRANS 0x03 LNG=4 is ambiguous: CD3 (preset volume) and DC3 (filling price + NOZIO) share this wire encoding (Pump Interface Rev 2.11, pages 14 and 21). Direction/context required before treating as DC3; both interpretations are preserved.; Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) were not provided."
   },
   {
     "name": "dc3_nozzle_status_price-5",
     "sourceFile": "capture_2026-07-19_merged_a.jsonl",
     "direction": "SLAVE_TO_MASTER",
-    "expectedTransactionType": "DC3_NOZZLE_STATUS_PRICE",
+    "expectedTransactionType": "AMBIGUOUS_CD3_OR_DC3",
     "expectedDecodeStatus": "PARTIAL",
     "rawTransactionHex": "03 04 00 11 75 01",
     "sourceFrameRawHex": "51 3C 01 01 05 03 04 00 11 75 01 1A C7 03 FA",
     "pumpAddress": 81,
     "lineSequence": 12,
-    "notes": "Interpreted TRANS 0x03 LNG=4 as DC3 (PRI+NOZIO). CD3 preset volume shares this wire size (Pump Interface pp. 14 and 21).; Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) were not provided."
+    "notes": "TRANS 0x03 LNG=4 is ambiguous: CD3 (preset volume) and DC3 (filling price + NOZIO) share this wire encoding (Pump Interface Rev 2.11, pages 14 and 21). Direction/context required before treating as DC3; both interpretations are preserved.; Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) were not provided."
   },
   {
     "name": "cd5_price_update-6",
@@ -154,7 +154,7 @@
     "expectedTransactionCount": 4,
     "transactionTypes": [
       "DC2_FILLED_VOLUME_AMOUNT",
-      "DC3_NOZZLE_STATUS_PRICE",
+      "AMBIGUOUS_CD3_OR_DC3",
       "AMBIGUOUS_CD1_OR_DC1",
       "DC101_TOTAL_COUNTERS"
     ],

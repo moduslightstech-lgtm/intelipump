@@ -140,8 +140,15 @@ def decode_status_frame(
                     "filledAmountRaw": _pad_bcd_digits(amt.get("raw_scaled"), 8),
                 }
             )
-        elif tx.transaction_type is TransactionType.DC3_NOZZLE_STATUS_PRICE:
+        elif tx.transaction_type in {
+            TransactionType.DC3_NOZZLE_STATUS_PRICE,
+            TransactionType.AMBIGUOUS_CD3_OR_DC3,
+        }:
+            # Lab status frames are pump→controller; treat ambiguous CD3/DC3 as DC3
+            # evidence for the snapshot (wire collision noted on decode_status).
             price = body.get("price") or {}
+            if isinstance(price, dict) and "error" in price:
+                price = {}
             snap.filling_price_raw_scaled = price.get("raw_scaled")
             snap.filling_price_raw_bcd_hex = price.get("raw_bcd_hex")
             snap.selected_logical_nozzle = body.get("selected_logical_nozzle")
@@ -155,6 +162,9 @@ def decode_status_frame(
                     "fillingPriceRaw": _pad_bcd_digits(price.get("raw_scaled"), 6),
                     "selectedLogicalNozzle": snap.selected_logical_nozzle,
                     "nozzlePosition": "OUT" if snap.nozzle_out else "IN",
+                    "wireAmbiguousCd3Dc3": (
+                        tx.transaction_type is TransactionType.AMBIGUOUS_CD3_OR_DC3
+                    ),
                 }
             )
             if snap.nozio_evidence is not None:

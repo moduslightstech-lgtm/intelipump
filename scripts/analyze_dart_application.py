@@ -252,7 +252,8 @@ def main() -> int:
             "## Unresolved",
             "",
             "1. CD1 vs DC1 on TRANS `0x01` (same LNG=1) without direction.",
-            "2. CD3 vs DC3 on TRANS `0x03` LNG=4 — prefer DC3 in passive decode.",
+            "2. CD3 vs DC3 on TRANS `0x03` LNG=4 — ambiguous until direction/"
+            "session context resolves (never prefer DC3 from TRANS alone).",
             "3. True money/volume decimal places until DC7 parameters are captured.",
             "",
         ]

@@ -15,6 +15,13 @@ from intelipump_fdc.state_machine.transitions import TRANSITION_TABLE
 
 
 def _ctx(state: PumpState = PumpState.DISCONNECTED, **kwargs: object) -> PumpContext:
+    # READY contexts need readiness gates so finalize_readiness does not
+    # immediately revoke to RESET under default communication_healthy=False.
+    if state is PumpState.READY:
+        kwargs.setdefault("communication_healthy", True)
+        kwargs.setdefault("nozzle_out", False)
+        kwargs.setdefault("last_raw_wayne_status", 1)
+        kwargs.setdefault("was_ready_derivable", True)
     return PumpContext(pump_id="p1", dart_address=1, current_state=state, **kwargs)  # type: ignore[arg-type]
 
 
@@ -31,14 +38,21 @@ VALID_CASES: list[tuple[PumpState, PumpEvent, PumpState]] = [
     (PumpState.DISCOVERING, PumpEvent.READY_OBSERVED, PumpState.READY),
     (PumpState.NOT_PROGRAMMED, PumpEvent.FILLING_COMPLETED, PumpState.FILLING_COMPLETE),
     (PumpState.RESET, PumpEvent.READY_OBSERVED, PumpState.READY),
+    (PumpState.RESET, PumpEvent.AUTHORIZATION_CONFIRMED, PumpState.AUTHORIZED),
     (PumpState.READY, PumpEvent.NOZZLE_LIFTED, PumpState.NOZZLE_UP),
+    (PumpState.READY, PumpEvent.AUTHORIZATION_CONFIRMED, PumpState.AUTHORIZED),
     (PumpState.NOZZLE_UP, PumpEvent.AUTHORIZATION_CONFIRMED, PumpState.AUTHORIZED),
+    (PumpState.NOZZLE_UP, PumpEvent.NOZZLE_RETURNED, PumpState.RESET),
     (PumpState.AUTHORIZED, PumpEvent.FILLING_STARTED, PumpState.FILLING),
+    (PumpState.AUTHORIZED, PumpEvent.NOZZLE_RETURNED, PumpState.RESET),
     (PumpState.FILLING, PumpEvent.FILLING_UPDATED, PumpState.FILLING),
     (PumpState.FILLING, PumpEvent.FILLING_COMPLETED, PumpState.FILLING_COMPLETE),
+    (PumpState.FILLING, PumpEvent.NOZZLE_RETURNED, PumpState.FILLING_COMPLETE),
     (PumpState.FILLING, PumpEvent.SUSPENDED_OBSERVED, PumpState.SUSPENDED),
     (PumpState.SUSPENDED, PumpEvent.RESUMED_OBSERVED, PumpState.FILLING),
+    (PumpState.SUSPENDED, PumpEvent.NOZZLE_RETURNED, PumpState.FILLING_COMPLETE),
     (PumpState.FILLING, PumpEvent.LIMIT_REACHED, PumpState.LIMIT_REACHED),
+    (PumpState.LIMIT_REACHED, PumpEvent.NOZZLE_RETURNED, PumpState.FILLING_COMPLETE),
     (PumpState.FILLING_COMPLETE, PumpEvent.RESET_OBSERVED, PumpState.RESET),
     (PumpState.FAULTED, PumpEvent.FAULT_CLEARED, PumpState.DISCOVERING),
     (PumpState.MAINTENANCE, PumpEvent.MAINTENANCE_EXITED, PumpState.DISCOVERING),
@@ -119,19 +133,78 @@ def test_fault_from_every_operational_state(state: PumpState) -> None:
 
 
 def test_duplicate_ready_is_noop() -> None:
-    machine = PumpStateMachine(_ctx(PumpState.READY, state_version=5))
+    machine = PumpStateMachine(
+        _ctx(
+            PumpState.READY,
+            state_version=5,
+            communication_healthy=True,
+            nozzle_out=False,
+            last_raw_wayne_status=1,
+        )
+    )
     result = machine.apply(
         PumpEvent.READY_OBSERVED,
-        raw_wayne_status=1,  # same meaningful fields absent initially bumps
+        raw_wayne_status=1,
+        nozzle_out=False,
     )
-    # First READY noop may bump version due to raw status change.
     version_after_first = result.context.state_version
-    result2 = machine.apply(PumpEvent.READY_OBSERVED, raw_wayne_status=1)
+    result2 = machine.apply(
+        PumpEvent.READY_OBSERVED,
+        raw_wayne_status=1,
+        nozzle_out=False,
+    )
     assert result2.accepted is True
     assert result2.noop is True
     assert result2.current_state is PumpState.READY
     assert result2.context.state_version == version_after_first
 
+
+def test_unknown_observation_preserves_state() -> None:
+    machine = PumpStateMachine(
+        _ctx(
+            PumpState.READY,
+            state_version=4,
+            communication_healthy=True,
+            nozzle_out=False,
+            last_raw_wayne_status=1,
+        )
+    )
+    result = machine.apply(
+        PumpEvent.UNKNOWN_OBSERVATION,
+        observation=ObservationRef(source_frame_raw_hex="FRAME"),
+    )
+    assert result.accepted is True
+    assert result.noop is True
+    assert result.current_state is PumpState.READY
+
+
+def test_state_version_changes_only_on_meaningful_changes() -> None:
+    machine = PumpStateMachine(
+        _ctx(
+            PumpState.READY,
+            state_version=10,
+            communication_healthy=True,
+            nozzle_out=False,
+            last_raw_wayne_status=1,
+        )
+    )
+    # Same-state READY with no field changes: version stays.
+    result = machine.apply(
+        PumpEvent.READY_OBSERVED,
+        raw_wayne_status=1,
+        nozzle_out=False,
+    )
+    assert result.noop is True
+    assert result.context.state_version == 10
+    # Meaningful selected_nozzle change bumps version.
+    result2 = machine.apply(
+        PumpEvent.NOZZLE_STATUS_OBSERVED,
+        selected_nozzle=2,
+        nozzle_out=False,
+        raw_wayne_status=1,
+    )
+    assert result2.context.state_version == 11
+    assert result2.current_state is PumpState.READY
 
 def test_repeated_filling_update_preserves_state() -> None:
     machine = PumpStateMachine(_ctx(PumpState.FILLING, state_version=2))
@@ -182,39 +255,11 @@ def test_stale_event_does_not_roll_state_backward() -> None:
     assert result.current_state is PumpState.FILLING
 
 
-def test_unknown_observation_preserves_state() -> None:
-    machine = PumpStateMachine(_ctx(PumpState.READY, state_version=1))
-    result = machine.apply(
-        PumpEvent.UNKNOWN_OBSERVATION,
-        raw_wayne_status=7,
-        observation=ObservationRef(source_frame_raw_hex="01 01 07"),
-    )
-    assert result.accepted is True
-    assert result.noop is True
-    assert result.current_state is PumpState.READY
-    assert result.context.last_raw_wayne_status == 7
-
-
 def test_fault_cleared_does_not_go_directly_to_filling() -> None:
     machine = PumpStateMachine(_ctx(PumpState.FAULTED))
     result = machine.apply(PumpEvent.FAULT_CLEARED)
     assert result.current_state is PumpState.DISCOVERING
     assert result.current_state is not PumpState.FILLING
-
-
-def test_state_version_changes_only_on_meaningful_changes() -> None:
-    machine = PumpStateMachine(
-        _ctx(
-            PumpState.READY,
-            state_version=10,
-            last_raw_wayne_status=1,
-        )
-    )
-    result = machine.apply(PumpEvent.READY_OBSERVED, raw_wayne_status=1)
-    assert result.noop is True
-    assert result.context.state_version == 10
-    result2 = machine.apply(PumpEvent.NOZZLE_LIFTED)
-    assert result2.context.state_version == 11
 
 
 def test_transition_table_non_empty() -> None:

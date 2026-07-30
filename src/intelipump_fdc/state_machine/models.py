@@ -29,17 +29,32 @@ class PumpContext:
     current_state: PumpState = PumpState.DISCONNECTED
     previous_state: PumpState | None = None
     selected_nozzle: int | None = None
+    logical_nozzle_raw: int | None = None
+    nozzle_out: bool | None = None
+    last_nozio_raw: int | None = None
+    last_filling_price_raw: int | None = None
     active_transaction_id: str | None = None
+    fueling_session_uuid: str | None = None
+    has_unresolved_transaction: bool = False
+    dispensed_volume_raw: int | None = None
+    awaiting_filling_complete: bool = False
+    completion_inferred: bool = False
     last_observation_at: datetime | None = None
     last_transition_at: datetime | None = None
     last_raw_wayne_status: int | None = None
     communication_healthy: bool = False
     price_verified: bool = False
+    price_partially_verified: bool = False
     fault_code: int | None = None
+    # InteliPump deployment policy (not a Wayne protocol rule).
+    require_nozzle_lift_before_authorize: bool = False
+    # Simulator-only override for tests; never enable on real hardware paths.
+    simulator_bypass_price_verification: bool = False
     warnings: tuple[str, ...] = ()
     state_version: int = 0
     completed_evidence_keys: frozenset[str] = field(default_factory=frozenset)
     last_source_frame_hex: str | None = None
+    was_ready_derivable: bool = False
 
     def with_updates(self, **kwargs: Any) -> PumpContext:
         return replace(self, **kwargs)

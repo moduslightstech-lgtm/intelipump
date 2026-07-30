@@ -59,7 +59,7 @@ def test_representative_filling_and_completed_from_multi_payload() -> None:
     )
     types = {tx.transaction_type for tx in bundle.transactions}
     assert TransactionType.DC2_FILLED_VOLUME_AMOUNT in types
-    assert TransactionType.DC3_NOZZLE_STATUS_PRICE in types
+    assert TransactionType.AMBIGUOUS_CD3_OR_DC3 in types
     dc2 = next(
         tx
         for tx in bundle.transactions

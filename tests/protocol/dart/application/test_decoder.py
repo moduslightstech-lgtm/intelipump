@@ -103,10 +103,14 @@ def test_scaled_bcd_rejects_invalid() -> None:
 def test_dc3_nozzle_and_price() -> None:
     bundle = decode_data_payload(bytes.fromhex("03 04 00 11 75 11"), price_decimals=2)
     tx = bundle.transactions[0]
-    assert tx.transaction_type is TransactionType.DC3_NOZZLE_STATUS_PRICE
+    assert tx.transaction_type is TransactionType.AMBIGUOUS_CD3_OR_DC3
+    assert tx.direction is MessageDirection.UNKNOWN
+    assert tx.decode_status is DecodeStatus.PARTIAL
     assert tx.decoded_body is not None
     assert tx.decoded_body["price"]["value"] == "11.75"
     assert tx.decoded_body["selected_logical_nozzle"] == 1
     assert tx.decoded_body["nozzle_out"] is True
     assert tx.decoded_body["nozio"]["nozioRawHex"] == "11"
     assert tx.decoded_body["nozio"]["positionMask"] == "0x10"
+    assert "cd3_preset_volume" in tx.decoded_body
+    assert "dc3_nozzle_status_price" in tx.decoded_body

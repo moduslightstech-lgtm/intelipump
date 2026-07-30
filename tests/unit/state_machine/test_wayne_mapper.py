@@ -39,30 +39,70 @@ def test_ambiguous_cd1_resolved_as_dc1_maps_status() -> None:
 
 def test_ambiguous_cd3_dc3_does_not_force_state() -> None:
     tx = decode_data_payload(bytes.fromhex("03 04 00 11 75 11")).transactions[0]
-    assert tx.transaction_type is TransactionType.DC3_NOZZLE_STATUS_PRICE
+    assert tx.transaction_type is TransactionType.AMBIGUOUS_CD3_OR_DC3
     assert tx.decode_status is DecodeStatus.PARTIAL
+    assert tx.direction is MessageDirection.UNKNOWN
     mapped = map_wayne_observation(tx)
     assert mapped.event is PumpEvent.UNKNOWN_OBSERVATION
     assert any("CD3/DC3" in w for w in mapped.warnings)
+    assert mapped.nozzle_out is None
 
 
-def test_resolved_dc3_nozzle_out_maps_to_nozzle_lifted() -> None:
+def test_resolved_dc3_nozzle_out_edge_maps_to_nozzle_lifted() -> None:
     tx = decode_data_payload(bytes.fromhex("03 04 00 11 75 11")).transactions[0]
     mapped = map_wayne_observation(
         tx,
-        context=MapperContext(resolve_as_dc3=True),
+        context=MapperContext(
+            resolve_as_dc3=True,
+            nozzle_out=False,
+            current_state=PumpState.READY,
+        ),
     )
     assert mapped.event is PumpEvent.NOZZLE_LIFTED
     assert mapped.selected_nozzle == 1
 
 
-def test_resolved_dc3_nozzle_in_maps_to_ready_observed() -> None:
+def test_resolved_dc3_nozzle_in_maps_to_ready_only_with_gates() -> None:
+    tx = decode_data_payload(bytes.fromhex("03 04 00 11 75 01")).transactions[0]
+    blocked = map_wayne_observation(
+        tx,
+        context=MapperContext(
+            resolve_as_dc3=True,
+            current_state=PumpState.RESET,
+            nozzle_out=False,
+            was_ready_derivable=True,
+        ),
+    )
+    assert blocked.event is PumpEvent.NOZZLE_STATUS_OBSERVED
+
+    ready = map_wayne_observation(
+        tx,
+        context=MapperContext(
+            resolve_as_dc3=True,
+            current_state=PumpState.RESET,
+            previous_wayne_status=int(WaynePumpStatus.RESET),
+            last_raw_wayne_status=int(WaynePumpStatus.RESET),
+            communication_healthy=True,
+            nozzle_out=False,
+            was_ready_derivable=False,
+        ),
+    )
+    assert ready.event is PumpEvent.READY_OBSERVED
+
+
+def test_dc3_nozzle_return_during_filling() -> None:
     tx = decode_data_payload(bytes.fromhex("03 04 00 11 75 01")).transactions[0]
     mapped = map_wayne_observation(
         tx,
-        context=MapperContext(resolve_as_dc3=True, current_state=PumpState.RESET),
+        context=MapperContext(
+            resolve_as_dc3=True,
+            current_state=PumpState.FILLING,
+            previous_wayne_status=int(WaynePumpStatus.FILLING),
+            nozzle_out=True,
+        ),
     )
-    assert mapped.event is PumpEvent.READY_OBSERVED
+    assert mapped.event is PumpEvent.NOZZLE_RETURNED
+    assert mapped.awaiting_filling_complete is True
 
 
 def test_dc2_maps_to_filling_updated() -> None:
@@ -71,9 +111,9 @@ def test_dc2_maps_to_filling_updated() -> None:
     assert mapped.event is PumpEvent.FILLING_UPDATED
 
 
-def test_switched_off_is_unknown() -> None:
+def test_switched_off_is_explicit() -> None:
     mapped = map_wayne_status_code(WaynePumpStatus.SWITCHED_OFF)
-    assert mapped.event is PumpEvent.UNKNOWN_OBSERVATION
+    assert mapped.event is PumpEvent.SWITCHED_OFF_OBSERVED
 
 
 def test_status_mapping_table() -> None:
@@ -115,7 +155,6 @@ def test_outstanding_request_resolves_dc1() -> None:
 
 
 def test_transaction_id_collision_not_used_as_direction_proof() -> None:
-    """Same TRANS value alone must not resolve CD1/DC1."""
     tx = ApplicationTransaction(
         transaction_id=0x01,
         transaction_type=TransactionType.AMBIGUOUS_CD1_OR_DC1,

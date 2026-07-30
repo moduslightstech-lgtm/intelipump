@@ -80,3 +80,46 @@ def test_set_price_rejected_while_filling() -> None:
     )
     assert any(f.kind is ProtocolFaultKind.INELIGIBLE_COMMAND for f in faults)
     assert pump.prices_raw[1] == before
+
+
+def test_authorize_before_nozzle_lift_then_fill() -> None:
+    session = _session()
+    pump = session.get_pump(1)
+    pump.cold_start_to_ready()
+    # Grade selected while holstered (Wayne 4.1 style).
+    pump.selected_nozzle = 1
+    pump._refresh_price_verification()
+    pump._sync_context_fields()
+    faults = pump.handle_application_payload(
+        encode_cd1_command(PumpControlCommand.AUTHORIZE)
+    )
+    assert faults == []
+    assert pump.normalized_state is PumpState.AUTHORIZED
+    assert pump.nozzle_out is False
+    pump.lift_nozzle(1)
+    assert pump.normalized_state is PumpState.FILLING
+    session.advance(200)
+    assert pump.volume_raw > 0
+
+
+def test_nozzle_hangup_during_filling_completes_sale() -> None:
+    session = _session()
+    pump = session.get_pump(1)
+    pump.cold_start_to_ready()
+    pump.lift_nozzle(1)
+    pump.handle_application_payload(encode_cd1_command(PumpControlCommand.AUTHORIZE))
+    session.advance(200)
+    assert pump.normalized_state is PumpState.FILLING
+    assert pump.volume_raw > 0
+    pump.return_nozzle()
+    assert pump.normalized_state is PumpState.FILLING_COMPLETE
+    assert pump.nozzle_out is False
+    v, a = pump.volume_raw, pump.amount_raw
+    session.advance(1000)
+    assert pump.volume_raw == v
+    assert pump.amount_raw == a
+    # Idempotent: second hang-up / complete path is a no-op.
+    pump.return_nozzle()
+    assert pump.normalized_state is PumpState.FILLING_COMPLETE
+    assert pump.volume_raw == v
+    assert pump.amount_raw == a

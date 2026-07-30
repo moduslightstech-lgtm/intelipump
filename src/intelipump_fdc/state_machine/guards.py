@@ -44,6 +44,15 @@ _RESET_ELIGIBLE_STATES: frozenset[PumpState] = frozenset(
     }
 )
 
+_AUTHORIZE_STATES: frozenset[PumpState] = frozenset(
+    {
+        # Wayne: AUTHORIZE normally received in RESET; may precede or follow lift.
+        PumpState.RESET,
+        PumpState.READY,
+        PumpState.NOZZLE_UP,
+    }
+)
+
 _PRESET_STATES: frozenset[PumpState] = frozenset(
     {
         PumpState.READY,
@@ -137,20 +146,34 @@ def evaluate_command_eligibility(
             blocking.append("active_unresolved_transaction")
 
     elif command is PumpCommand.AUTHORIZE:
-        if context.current_state is not PumpState.NOZZLE_UP:
-            blocking.append("state_not_nozzle_up")
+        # Protocol-complete default: Wayne allows AUTHORIZE before or after lift
+        # (normally from RESET). Optional InteliPump policy may require lift first.
+        if context.require_nozzle_lift_before_authorize:
+            if context.current_state is not PumpState.NOZZLE_UP:
+                blocking.append("require_nozzle_lift_before_authorize")
+        elif context.current_state not in _AUTHORIZE_STATES:
+            blocking.append("state_not_authorize_eligible")
         if context.selected_nozzle is None:
             blocking.append("selected_nozzle_unknown")
-        if not context.price_verified:
+        if context.simulator_bypass_price_verification:
+            warnings.append(
+                "simulator_bypass_price_verification enabled; not for real hardware"
+            )
+        elif not context.price_verified:
             blocking.append("price_not_verified")
         if not context.communication_healthy:
             blocking.append("communication_unhealthy")
         if context.active_transaction_id is not None:
             blocking.append("active_unresolved_transaction")
+        if context.has_unresolved_transaction:
+            blocking.append("unresolved_transaction")
         if context.fault_code is not None or context.current_state is PumpState.FAULTED:
             blocking.append("fault_present")
         warnings.append(
-            "AUTHORIZE eligibility only; active command execution remains disabled."
+            "AUTHORIZE eligibility only; active command execution remains disabled. "
+            "Wayne protocol allows AUTHORIZE before or after nozzle lift; "
+            "require_nozzle_lift_before_authorize is an InteliPump policy flag "
+            f"(currently {context.require_nozzle_lift_before_authorize})."
         )
 
     elif command is PumpCommand.STOP:

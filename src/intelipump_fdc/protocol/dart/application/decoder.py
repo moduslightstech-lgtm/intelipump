@@ -93,7 +93,7 @@ def decode_raw_transaction(
             amount_decimals=amount_decimals,
         )
     if tid == 0x03 and lng == 4:
-        return _decode_dc3_preferred(
+        return _decode_ambiguous_03(
             raw_tx,
             pump_address=pump_address,
             line_sequence=line_sequence,
@@ -294,7 +294,7 @@ def _decode_dc2(
     )
 
 
-def _decode_dc3_preferred(
+def _decode_ambiguous_03(
     raw_tx: RawTransaction,
     *,
     pump_address: int | None,
@@ -302,59 +302,75 @@ def _decode_dc3_preferred(
     source_frame_raw_hex: str | None,
     price_decimals: int | None,
 ) -> ApplicationTransaction:
-    """Prefer DC3 (price + NOZIO) for TRANS=0x03 LNG=4.
+    """CD3 and DC3 share TRANS=0x03 / LNG=4 (Pump Interface pp. 14 and 21).
 
-    CD3 preset volume also uses TRANS=0x03 LNG=4 (4-byte BCD volume). Capture
-    patterns match DC3 (3-byte price + nozzle byte). Both interpretations are
-    noted; primary decode is DC3 for passive monitoring.
+    Passive / merged-bus decode must not claim DC3 (or CD3) without proven
+    direction or controller-session context. Both structural views are
+    preserved; NOZIO bit masks stay documented and unchanged.
     """
     warnings = [
-        "Interpreted TRANS 0x03 LNG=4 as DC3 (PRI+NOZIO). CD3 preset volume "
-        "shares this wire size (Pump Interface pp. 14 and 21).",
+        "TRANS 0x03 LNG=4 is ambiguous: CD3 (preset volume) and DC3 "
+        "(filling price + NOZIO) share this wire encoding (Pump Interface "
+        "Rev 2.11, pages 14 and 21). Direction/context required before "
+        "treating as DC3; both interpretations are preserved.",
     ]
+
+    # DC3 view: PRI(3) + NOZIO(1). Keep documented NOZIO masks.
+    nozio = raw_tx.data[3]
+    nozio_dec = decode_nozio(nozio)
+    warnings.extend(nozio_dec.warnings)
     try:
         price = decode_scaled_bcd(raw_tx.data[0:3], decimals=price_decimals)
+        price_view: dict[str, Any] = price.as_report_dict()
+        price_ok = True
     except BcdError as exc:
-        return _envelope(
-            raw_tx,
-            transaction_type=TransactionType.DC3_NOZZLE_STATUS_PRICE,
-            direction=MessageDirection.SLAVE_TO_MASTER,
-            decode_status=DecodeStatus.MALFORMED,
-            decoded_body=None,
-            warnings=[*warnings, f"invalid BCD in DC3 price: {exc}"],
-            pump_address=pump_address,
-            line_sequence=line_sequence,
-            source_frame_raw_hex=source_frame_raw_hex,
-        )
+        price_view = {"error": f"invalid BCD in DC3 price view: {exc}"}
+        price_ok = False
+        warnings.append(f"invalid BCD in DC3 price view: {exc}")
 
-    nozio_dec = decode_nozio(raw_tx.data[3])
-    warnings.extend(nozio_dec.warnings)
-    if price_decimals is None:
+    if price_decimals is None and price_ok:
         warnings.append(
             "Price Decimal omitted: pump unit-price decimals (DC7 DPUNP) "
             "were not provided."
         )
 
-    # Capture-based alternate view of the same 4 bytes as CD3 volume.
+    # CD3 view: 4-byte packed-BCD preset volume.
     try:
-        alt_volume = decode_scaled_bcd(raw_tx.data, decimals=None).as_report_dict()
-    except BcdError:
-        alt_volume = {"error": "invalid BCD if interpreted as CD3 volume"}
+        cd3_volume = decode_scaled_bcd(raw_tx.data, decimals=None).as_report_dict()
+    except BcdError as exc:
+        cd3_volume = {"error": f"invalid BCD if interpreted as CD3 volume: {exc}"}
 
-    body = {
-        "price": price.as_report_dict(),
+    body: dict[str, Any] = {
+        # Convenience fields for callers that resolve as DC3.
+        "price": price_view,
         "nozio_raw": nozio_dec.nozio_raw,
+        "logical_nozzle_raw": nozio_dec.logical_nozzle_raw,
         "selected_logical_nozzle": nozio_dec.selected_logical_nozzle,
         "nozzle_out": nozio_dec.nozzle_out,
         "nozio": nozio_dec.to_evidence_dict(),
-        "alternate_cd3_volume_view": alt_volume,
-        "spec_ref": nozio_dec.documentation_source,
+        "dc3_nozzle_status_price": {
+            "price": price_view,
+            "nozio_raw": nozio_dec.nozio_raw,
+            "logical_nozzle_raw": nozio_dec.logical_nozzle_raw,
+            "selected_logical_nozzle": nozio_dec.selected_logical_nozzle,
+            "nozzle_out": nozio_dec.nozzle_out,
+            "nozio": nozio_dec.to_evidence_dict(),
+            "spec_ref": nozio_dec.documentation_source,
+        },
+        "cd3_preset_volume": {
+            "volume": cd3_volume,
+            "spec_ref": "Pump Interface Rev 2.11, page 14, CD3 Preset volume",
+        },
+        "spec_ref": (
+            "Pump Interface Rev 2.11, pages 14 and 21 "
+            "(CD3/DC3 TRANS 0x03 LNG=4 collision)"
+        ),
     }
     return _envelope(
         raw_tx,
-        transaction_type=TransactionType.DC3_NOZZLE_STATUS_PRICE,
-        direction=MessageDirection.SLAVE_TO_MASTER,
-        decode_status=DecodeStatus.PARTIAL,
+        transaction_type=TransactionType.AMBIGUOUS_CD3_OR_DC3,
+        direction=MessageDirection.UNKNOWN,
+        decode_status=DecodeStatus.PARTIAL if price_ok else DecodeStatus.MALFORMED,
         decoded_body=body,
         warnings=warnings,
         pump_address=pump_address,

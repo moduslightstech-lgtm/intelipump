@@ -21,60 +21,84 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     (PumpState.NOT_PROGRAMMED, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
     (PumpState.RESET, PumpEvent.READY_OBSERVED): PumpState.READY,
     (PumpState.RESET, PumpEvent.CONFIGURATION_MISSING): PumpState.NOT_PROGRAMMED,
+    # Protocol-complete: AUTHORIZE may precede nozzle lift (Wayne RESET).
+    (PumpState.RESET, PumpEvent.AUTHORIZATION_CONFIRMED): PumpState.AUTHORIZED,
     (PumpState.READY, PumpEvent.NOZZLE_LIFTED): PumpState.NOZZLE_UP,
-    (PumpState.READY, PumpEvent.RESET_OBSERVED): PumpState.RESET,
+    # Repeated DC1 RESET while application READY is not a demotion.
+    (PumpState.READY, PumpEvent.RESET_OBSERVED): PumpState.READY,
+    (PumpState.READY, PumpEvent.AUTHORIZATION_CONFIRMED): PumpState.AUTHORIZED,
     (PumpState.NOZZLE_UP, PumpEvent.AUTHORIZATION_CONFIRMED): PumpState.AUTHORIZED,
-    (PumpState.NOZZLE_UP, PumpEvent.NOZZLE_RETURNED): PumpState.READY,
+    # Return before authorize → idle/reset-derived (READY only via predicate).
+    (PumpState.NOZZLE_UP, PumpEvent.NOZZLE_RETURNED): PumpState.RESET,
     (PumpState.NOZZLE_UP, PumpEvent.FILLING_STARTED): PumpState.FILLING,
     (PumpState.AUTHORIZED, PumpEvent.FILLING_STARTED): PumpState.FILLING,
-    (PumpState.AUTHORIZED, PumpEvent.NOZZLE_RETURNED): PumpState.READY,
+    # Cancel auth with no dispense; READY only if readiness edge follows.
+    (PumpState.AUTHORIZED, PumpEvent.NOZZLE_RETURNED): PumpState.RESET,
+    (PumpState.AUTHORIZED, PumpEvent.NOZZLE_LIFTED): PumpState.AUTHORIZED,
     (PumpState.FILLING, PumpEvent.FILLING_UPDATED): PumpState.FILLING,
     (PumpState.FILLING, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
+    # Hang-up: leave FILLING; await/confirm DC1 FILLING_COMPLETED.
+    (PumpState.FILLING, PumpEvent.NOZZLE_RETURNED): PumpState.FILLING_COMPLETE,
     (PumpState.FILLING, PumpEvent.SUSPENDED_OBSERVED): PumpState.SUSPENDED,
     (PumpState.FILLING, PumpEvent.LIMIT_REACHED): PumpState.LIMIT_REACHED,
     (PumpState.SUSPENDED, PumpEvent.RESUMED_OBSERVED): PumpState.FILLING,
     (PumpState.SUSPENDED, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
+    (PumpState.SUSPENDED, PumpEvent.NOZZLE_RETURNED): PumpState.FILLING_COMPLETE,
     (PumpState.SUSPENDED, PumpEvent.LIMIT_REACHED): PumpState.LIMIT_REACHED,
     (PumpState.LIMIT_REACHED, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
+    (PumpState.LIMIT_REACHED, PumpEvent.NOZZLE_RETURNED): PumpState.FILLING_COMPLETE,
     (PumpState.LIMIT_REACHED, PumpEvent.RESET_OBSERVED): PumpState.RESET,
     (PumpState.FILLING_COMPLETE, PumpEvent.RESET_OBSERVED): PumpState.RESET,
     (PumpState.FAULTED, PumpEvent.FAULT_CLEARED): PumpState.DISCOVERING,
     (PumpState.MAINTENANCE, PumpEvent.MAINTENANCE_EXITED): PumpState.DISCOVERING,
 }
 
-# PUMP_DISCOVERED: DISCOVERING -> RESET (default recovery target)
 TRANSITION_TABLE[(PumpState.DISCOVERING, PumpEvent.PUMP_DISCOVERED)] = PumpState.RESET
 
-# COMMUNICATION_LOST from every state including DISCONNECTED (stays / enters DISCONNECTED)
 for state in PumpState:
     TRANSITION_TABLE[(state, PumpEvent.COMMUNICATION_LOST)] = PumpState.DISCONNECTED
 
-# FAULT_OBSERVED from every operational state
 for state in OPERATIONAL_STATES:
     TRANSITION_TABLE[(state, PumpEvent.FAULT_OBSERVED)] = PumpState.FAULTED
 
-# MAINTENANCE_ENTERED from any state except already in MAINTENANCE (handled as no-op)
 for state in PumpState:
     if state is not PumpState.MAINTENANCE:
         TRANSITION_TABLE[(state, PumpEvent.MAINTENANCE_ENTERED)] = PumpState.MAINTENANCE
 
-# Events that are valid no-ops when already in the target state
+# SWITCHED_OFF: explicit offline/disabled — disconnect path (not READY/RESET).
+for state in OPERATIONAL_STATES:
+    TRANSITION_TABLE[(state, PumpEvent.SWITCHED_OFF_OBSERVED)] = PumpState.DISCONNECTED
+
 SAME_STATE_NOOP_EVENTS: frozenset[tuple[PumpState, PumpEvent]] = frozenset(
     {
         (PumpState.READY, PumpEvent.READY_OBSERVED),
+        (PumpState.READY, PumpEvent.RESET_OBSERVED),
         (PumpState.RESET, PumpEvent.RESET_OBSERVED),
         (PumpState.FILLING, PumpEvent.FILLING_UPDATED),
         (PumpState.FILLING, PumpEvent.FILLING_STARTED),
         (PumpState.AUTHORIZED, PumpEvent.AUTHORIZATION_CONFIRMED),
+        (PumpState.AUTHORIZED, PumpEvent.NOZZLE_LIFTED),
         (PumpState.NOZZLE_UP, PumpEvent.NOZZLE_LIFTED),
+        (PumpState.NOZZLE_UP, PumpEvent.NOZZLE_SELECTION_CHANGED),
+        (PumpState.AUTHORIZED, PumpEvent.NOZZLE_SELECTION_CHANGED),
+        (PumpState.FILLING, PumpEvent.NOZZLE_SELECTION_CHANGED),
         (PumpState.FILLING_COMPLETE, PumpEvent.FILLING_COMPLETED),
+        (PumpState.FILLING_COMPLETE, PumpEvent.NOZZLE_STATUS_OBSERVED),
         (PumpState.SUSPENDED, PumpEvent.SUSPENDED_OBSERVED),
         (PumpState.LIMIT_REACHED, PumpEvent.LIMIT_REACHED),
         (PumpState.FAULTED, PumpEvent.FAULT_OBSERVED),
         (PumpState.DISCONNECTED, PumpEvent.COMMUNICATION_LOST),
+        (PumpState.DISCONNECTED, PumpEvent.SWITCHED_OFF_OBSERVED),
         (PumpState.DISCOVERING, PumpEvent.COMMUNICATION_STARTED),
         (PumpState.MAINTENANCE, PumpEvent.MAINTENANCE_ENTERED),
         (PumpState.NOT_PROGRAMMED, PumpEvent.CONFIGURATION_MISSING),
+        (PumpState.READY, PumpEvent.NOZZLE_STATUS_OBSERVED),
+        (PumpState.RESET, PumpEvent.NOZZLE_STATUS_OBSERVED),
+        (PumpState.NOZZLE_UP, PumpEvent.NOZZLE_STATUS_OBSERVED),
+        (PumpState.AUTHORIZED, PumpEvent.NOZZLE_STATUS_OBSERVED),
+        (PumpState.FILLING, PumpEvent.NOZZLE_STATUS_OBSERVED),
+        (PumpState.SUSPENDED, PumpEvent.NOZZLE_STATUS_OBSERVED),
+        (PumpState.LIMIT_REACHED, PumpEvent.NOZZLE_STATUS_OBSERVED),
     }
 )
 

@@ -3,11 +3,14 @@
 Inferences are documented on each result. Ambiguous CD1/DC1 and CD3/DC3
 records do not force lifecycle state changes unless the caller resolves
 direction with explicit context (not TRANS-ID collisions).
+
+NOZIO lift/return events are edge-triggered against MapperContext.nozzle_out.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
@@ -18,7 +21,8 @@ from intelipump_fdc.protocol.dart.application.constants import (
 )
 from intelipump_fdc.protocol.dart.application.models import ApplicationTransaction
 from intelipump_fdc.protocol.dart.application.status import WaynePumpStatus
-from intelipump_fdc.state_machine.models import ObservationRef
+from intelipump_fdc.state_machine.models import ObservationRef, PumpContext
+from intelipump_fdc.state_machine.readiness import can_derive_ready, readiness_blockers
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +38,48 @@ class MapperContext:
     resolve_as_cd3: bool = False
     outstanding_request_was_cd1_status: bool = False
     bus_direction: MessageDirection | None = None
+    # Edge / READY inputs (mirrors PumpContext fields).
+    nozzle_out: bool | None = None
+    selected_nozzle: int | None = None
+    communication_healthy: bool = False
+    active_transaction_id: str | None = None
+    has_unresolved_transaction: bool = False
+    fault_code: int | None = None
+    last_raw_wayne_status: int | None = None
+    dispensed_volume_raw: int | None = None
+    was_ready_derivable: bool = False
+
+    @classmethod
+    def from_pump_context(
+        cls,
+        context: PumpContext,
+        *,
+        resolve_as_dc1: bool = False,
+        resolve_as_dc3: bool = False,
+        resolve_as_cd1: bool = False,
+        resolve_as_cd3: bool = False,
+        outstanding_request_was_cd1_status: bool = False,
+        bus_direction: MessageDirection | None = None,
+    ) -> MapperContext:
+        return cls(
+            current_state=context.current_state,
+            previous_wayne_status=context.last_raw_wayne_status,
+            last_raw_wayne_status=context.last_raw_wayne_status,
+            resolve_as_dc1=resolve_as_dc1,
+            resolve_as_dc3=resolve_as_dc3,
+            resolve_as_cd1=resolve_as_cd1,
+            resolve_as_cd3=resolve_as_cd3,
+            outstanding_request_was_cd1_status=outstanding_request_was_cd1_status,
+            bus_direction=bus_direction,
+            nozzle_out=context.nozzle_out,
+            selected_nozzle=context.selected_nozzle,
+            communication_healthy=context.communication_healthy,
+            active_transaction_id=context.active_transaction_id,
+            has_unresolved_transaction=context.has_unresolved_transaction,
+            fault_code=context.fault_code,
+            dispensed_volume_raw=context.dispensed_volume_raw,
+            was_ready_derivable=context.was_ready_derivable,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +88,15 @@ class MappedWayneObservation:
     observation: ObservationRef
     raw_wayne_status: int | None = None
     selected_nozzle: int | None = None
+    logical_nozzle_raw: int | None = None
+    nozzle_out: bool | None = None
+    nozio_raw: int | None = None
+    filling_price_raw: int | None = None
     completion_evidence_key: str | None = None
+    awaiting_filling_complete: bool | None = None
+    completion_inferred: bool = False
     allow_implicit_authorize_to_filling: bool = False
+    filling_inferred_from_dc2: bool = False
     inferences: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
@@ -69,18 +122,14 @@ def map_wayne_observation(
     if tx.transaction_type is TransactionType.DC1_PUMP_STATUS:
         return _map_dc1(tx, obs, ctx)
 
-    if tx.transaction_type is TransactionType.DC3_NOZZLE_STATUS_PRICE:
+    if tx.transaction_type in {
+        TransactionType.DC3_NOZZLE_STATUS_PRICE,
+        TransactionType.AMBIGUOUS_CD3_OR_DC3,
+    }:
         return _map_dc3(tx, obs, ctx)
 
     if tx.transaction_type is TransactionType.DC2_FILLED_VOLUME_AMOUNT:
-        return MappedWayneObservation(
-            event=PumpEvent.FILLING_UPDATED,
-            observation=obs,
-            inferences=(
-                "INFERENCE: TRANS 0x02 LNG=8 decoded as DC2 (VOL+AMO); "
-                "maps to FILLING_UPDATED for live volume/amount progress.",
-            ),
-        )
+        return _map_dc2(tx, obs, ctx)
 
     if tx.transaction_type is TransactionType.DC5_ALARM:
         body = tx.decoded_body or {}
@@ -106,7 +155,6 @@ def map_wayne_observation(
             inferences=("DC9 pump identity maps to PUMP_DISCOVERED.",),
         )
 
-    # Master-side or non-lifecycle observations: preserve, do not force state.
     return MappedWayneObservation(
         event=PumpEvent.UNKNOWN_OBSERVATION,
         observation=obs,
@@ -157,6 +205,10 @@ def _extract_raw_status(tx: ApplicationTransaction) -> int | None:
         dc1_code = dc1.get("raw_code")
         if isinstance(dc1_code, int):
             return dc1_code
+        # describe_wayne embeds name only in ambiguous body; status field for DC1
+    status = body.get("status")
+    if isinstance(status, int):
+        return status
     return None
 
 
@@ -244,28 +296,101 @@ def _map_dc1(
     )
 
 
+def _map_dc2(
+    tx: ApplicationTransaction,
+    obs: ObservationRef,
+    ctx: MapperContext,
+) -> MappedWayneObservation:
+    """DC2 is supporting volume/amount evidence; FILLING is primarily DC1."""
+    body = tx.decoded_body or {}
+    volume = body.get("volume") if isinstance(body.get("volume"), dict) else {}
+    vol_raw = volume.get("raw_scaled") if isinstance(volume, dict) else None
+    inferences = (
+        "INFERENCE: TRANS 0x02 LNG=8 decoded as DC2 (VOL+AMO); "
+        "maps to FILLING_UPDATED as supporting evidence. "
+        "FILLING entry remains DC1-driven.",
+    )
+    warnings: tuple[str, ...] = ()
+    # Only when DC1 is unavailable may DC2 *infer* filling (explicitly marked).
+    if (
+        ctx.current_state in {PumpState.AUTHORIZED, PumpState.NOZZLE_UP}
+        and ctx.previous_wayne_status not in {
+            int(WaynePumpStatus.FILLING),
+            int(WaynePumpStatus.AUTHORIZED),
+        }
+        and isinstance(vol_raw, int)
+        and vol_raw > 0
+        and ctx.previous_wayne_status is None
+    ):
+        return MappedWayneObservation(
+            event=PumpEvent.FILLING_STARTED,
+            observation=obs,
+            filling_inferred_from_dc2=True,
+            warnings=(
+                "DC1 FILLING unavailable; inferring FILLING_STARTED from DC2 "
+                "volume increase (marked inferred).",
+            ),
+            inferences=inferences,
+        )
+    return MappedWayneObservation(
+        event=PumpEvent.FILLING_UPDATED,
+        observation=obs,
+        inferences=inferences,
+        warnings=warnings,
+    )
+
+
+def _probe_ready_context(
+    ctx: MapperContext,
+    *,
+    nozzle_out: bool,
+    wayne_status: int | None = None,
+) -> PumpContext:
+    """Build a transient PumpContext for readiness checks."""
+    return PumpContext(
+        pump_id="mapper",
+        dart_address=0,
+        current_state=ctx.current_state or PumpState.RESET,
+        last_raw_wayne_status=(
+            wayne_status
+            if wayne_status is not None
+            else ctx.last_raw_wayne_status
+            if ctx.last_raw_wayne_status is not None
+            else ctx.previous_wayne_status
+        ),
+        nozzle_out=nozzle_out,
+        communication_healthy=ctx.communication_healthy,
+        active_transaction_id=ctx.active_transaction_id,
+        has_unresolved_transaction=ctx.has_unresolved_transaction,
+        fault_code=ctx.fault_code,
+        was_ready_derivable=ctx.was_ready_derivable,
+    )
+
+
 def _map_dc3(
     tx: ApplicationTransaction,
     obs: ObservationRef,
     ctx: MapperContext,
 ) -> MappedWayneObservation:
-    """DC3 is PARTIAL due to CD3 collision unless caller resolves it."""
-    if ctx.resolve_as_cd3:
+    """DC3 requires proven pump→controller direction; nozzle edges only."""
+    if ctx.resolve_as_cd3 or (
+        (ctx.bus_direction or tx.direction) is MessageDirection.MASTER_TO_SLAVE
+        and not ctx.resolve_as_dc3
+    ):
         return MappedWayneObservation(
             event=PumpEvent.UNKNOWN_OBSERVATION,
             observation=obs,
             warnings=(
                 "Resolved as CD3 preset volume (master→slave); not a "
-                "pump-state observation.",
+                "pump-state observation; nozzle/price not updated.",
             ),
-            inferences=("INFERENCE: caller selected CD3 interpretation.",),
+            inferences=("INFERENCE: caller/direction selected CD3 interpretation.",),
         )
 
-    # Phase-3 prefer-DC3 decode is PARTIAL and not proof of direction.
-    # Require explicit resolve_as_dc3 (or DECODED + SLAVE_TO_MASTER).
     direction = ctx.bus_direction or tx.direction
     resolved_dc3 = ctx.resolve_as_dc3 or (
-        tx.decode_status is DecodeStatus.DECODED
+        tx.transaction_type is TransactionType.DC3_NOZZLE_STATUS_PRICE
+        and tx.decode_status is DecodeStatus.DECODED
         and direction is MessageDirection.SLAVE_TO_MASTER
     )
     if not resolved_dc3:
@@ -275,11 +400,11 @@ def _map_dc3(
             warnings=(
                 "Ambiguous CD3/DC3 (TRANS 0x03 LNG=4): direction/context "
                 "insufficient; nozzle/price fields are not used to force "
-                "state without resolve_as_dc3=True.",
+                "state or update nozzle context.",
             ),
             inferences=(
                 "Pump Interface pp. 14 and 21 wire collision; "
-                "passive prefer-DC3 is not proof of direction.",
+                "passive ambiguous decode is not proof of direction.",
             ),
         )
 
@@ -287,52 +412,197 @@ def _map_dc3(
     nozzle_out = body.get("nozzle_out")
     selected = body.get("selected_logical_nozzle")
     selected_nozzle = int(selected) if isinstance(selected, int) else None
+    logical_raw = body.get("logical_nozzle_raw")
+    if not isinstance(logical_raw, int):
+        logical_raw = selected_nozzle if selected_nozzle is not None else 0
+    nozio_raw = body.get("nozio_raw")
+    nozio_raw_i = int(nozio_raw) if isinstance(nozio_raw, int) else None
+    price = body.get("price") if isinstance(body.get("price"), dict) else {}
+    price_raw = price.get("raw_scaled") if isinstance(price, dict) else None
+    price_raw_i = int(price_raw) if isinstance(price_raw, int) else None
+
+    base_kwargs: dict[str, Any] = dict(
+        observation=obs,
+        selected_nozzle=selected_nozzle,
+        logical_nozzle_raw=logical_raw if isinstance(logical_raw, int) else None,
+        nozzle_out=nozzle_out if isinstance(nozzle_out, bool) else None,
+        nozio_raw=nozio_raw_i,
+        filling_price_raw=price_raw_i,
+    )
 
     if not isinstance(nozzle_out, bool):
         return MappedWayneObservation(
             event=PumpEvent.UNKNOWN_OBSERVATION,
-            observation=obs,
-            selected_nozzle=selected_nozzle,
             warnings=("DC3 body missing nozzle_out; preserved as unknown.",),
+            **base_kwargs,
         )
 
-    if nozzle_out:
+    previous = ctx.nozzle_out
+    # First observation: treat as edge from unknown → current.
+    if previous is None:
+        if nozzle_out:
+            return MappedWayneObservation(
+                event=PumpEvent.NOZZLE_LIFTED,
+                inferences=(
+                    "INFERENCE: first resolved DC3 with nozzle OUT → NOZZLE_LIFTED.",
+                ),
+                **base_kwargs,
+            )
+        return _maybe_ready_or_status(
+            ctx,
+            base_kwargs=base_kwargs,
+            idle_event=PumpEvent.NOZZLE_STATUS_OBSERVED,
+            idle_inference=(
+                "INFERENCE: first resolved DC3 with nozzle IN; no lift edge."
+            ),
+        )
+
+    # Edge: IN → OUT
+    if previous is False and nozzle_out is True:
         return MappedWayneObservation(
             event=PumpEvent.NOZZLE_LIFTED,
-            observation=obs,
-            selected_nozzle=selected_nozzle,
             inferences=(
-                "INFERENCE: resolved DC3 NOZIO bit0x10 set → NOZZLE_LIFTED. "
-                "Wayne has no dedicated READY status; nozzle-out drives "
-                "NOZZLE_UP path.",
+                "INFERENCE: NOZIO edge IN→OUT → NOZZLE_LIFTED.",
             ),
+            **base_kwargs,
         )
 
-    # Nozzle in / holstered.
-    if ctx.current_state in {
-        PumpState.NOZZLE_UP,
-        PumpState.AUTHORIZED,
-        PumpState.FILLING,
-        PumpState.SUSPENDED,
-    }:
+    # Edge: OUT → IN
+    if previous is True and nozzle_out is False:
+        return _map_nozzle_return_edge(ctx, base_kwargs=base_kwargs)
+
+    # Steady OUT: selection change vs status-only
+    if previous is True and nozzle_out is True:
+        if (
+            selected_nozzle is not None
+            and ctx.selected_nozzle is not None
+            and selected_nozzle != ctx.selected_nozzle
+        ):
+            return MappedWayneObservation(
+                event=PumpEvent.NOZZLE_SELECTION_CHANGED,
+                inferences=(
+                    "INFERENCE: nozzle remained OUT; selected logical nozzle "
+                    f"changed {ctx.selected_nozzle}→{selected_nozzle}; "
+                    "not a second NOZZLE_LIFTED.",
+                ),
+                **base_kwargs,
+            )
+        return MappedWayneObservation(
+            event=PumpEvent.NOZZLE_STATUS_OBSERVED,
+            inferences=(
+                "INFERENCE: repeated DC3 nozzle OUT; no lift edge; "
+                "context (NOZIO/price/nozzle) updated only.",
+            ),
+            **base_kwargs,
+        )
+
+    # Steady IN
+    return _maybe_ready_or_status(
+        ctx,
+        base_kwargs=base_kwargs,
+        idle_event=PumpEvent.NOZZLE_STATUS_OBSERVED,
+        idle_inference=(
+            "INFERENCE: repeated DC3 nozzle IN; no return edge; "
+            "context updated only."
+        ),
+    )
+
+
+def _map_nozzle_return_edge(
+    ctx: MapperContext,
+    *,
+    base_kwargs: dict[str, Any],
+) -> MappedWayneObservation:
+    state = ctx.current_state
+    if state in {PumpState.FILLING, PumpState.SUSPENDED}:
+        frame = base_kwargs["observation"].source_frame_raw_hex or ""
         return MappedWayneObservation(
             event=PumpEvent.NOZZLE_RETURNED,
-            observation=obs,
-            selected_nozzle=selected_nozzle,
+            awaiting_filling_complete=True,
+            completion_evidence_key=f"nozzle_return_pending:{frame}",
             inferences=(
-                "INFERENCE: resolved DC3 nozzle_out=false while operational "
-                "nozzle/fueling state → NOZZLE_RETURNED.",
+                "INFERENCE: NOZIO edge OUT→IN during "
+                f"{state.value} → NOZZLE_RETURNED; expect DC1 "
+                "FILLING_COMPLETED (Rev 2.11). Awaiting confirmation.",
             ),
+            warnings=(
+                "Nozzle hang-up observed; FILLING_COMPLETE pending DC1 "
+                "confirmation (or inferred completion with audit).",
+            ),
+            **base_kwargs,
         )
 
-    return MappedWayneObservation(
-        event=PumpEvent.READY_OBSERVED,
-        observation=obs,
-        selected_nozzle=selected_nozzle,
-        inferences=(
-            "INFERENCE: Wayne DC1 has no READY code. Resolved DC3 with "
-            "nozzle_out=false is mapped to READY_OBSERVED (idle/holstered).",
+    if state is PumpState.LIMIT_REACHED:
+        frame = base_kwargs["observation"].source_frame_raw_hex or ""
+        return MappedWayneObservation(
+            event=PumpEvent.NOZZLE_RETURNED,
+            awaiting_filling_complete=True,
+            completion_evidence_key=f"limit_nozzle_return:{frame}",
+            inferences=(
+                "INFERENCE: nozzle return after LIMIT_REACHED → expect "
+                "FILLING_COMPLETE; capture final DC2; completion idempotent.",
+            ),
+            **base_kwargs,
+        )
+
+    if state is PumpState.AUTHORIZED:
+        volume = ctx.dispensed_volume_raw or 0
+        if volume <= 0:
+            return MappedWayneObservation(
+                event=PumpEvent.NOZZLE_RETURNED,
+                inferences=(
+                    "INFERENCE: AUTHORIZED + nozzle return with no dispense → "
+                    "cancel authorization (no completed paid sale).",
+                ),
+                warnings=("authorization_cancelled_no_dispense",),
+                **base_kwargs,
+            )
+
+    # Idle / NOZZLE_UP / others: READY only on false→true readiness edge.
+    return _maybe_ready_or_status(
+        ctx,
+        base_kwargs=base_kwargs,
+        idle_event=PumpEvent.NOZZLE_RETURNED,
+        idle_inference=(
+            "INFERENCE: NOZIO edge OUT→IN → NOZZLE_RETURNED "
+            "(idle/reset-derived unless READY gates pass)."
         ),
+    )
+
+
+def _maybe_ready_or_status(
+    ctx: MapperContext,
+    *,
+    base_kwargs: dict[str, Any],
+    idle_event: PumpEvent,
+    idle_inference: str,
+) -> MappedWayneObservation:
+    probe = _probe_ready_context(ctx, nozzle_out=False)
+    ready_now = can_derive_ready(probe)
+    if ready_now and not ctx.was_ready_derivable:
+        return MappedWayneObservation(
+            event=PumpEvent.READY_OBSERVED,
+            inferences=(
+                "INFERENCE: application READY derived (Wayne has no READY). "
+                "Gates: DC1=RESET, nozzle IN, healthy, no unresolved txn/fault. "
+                "Emitted on readiness false→true edge only.",
+            ),
+            **base_kwargs,
+        )
+    if not ready_now and ctx.was_ready_derivable:
+        blockers = readiness_blockers(probe)
+        return MappedWayneObservation(
+            event=idle_event,
+            warnings=(
+                "READY no longer derivable: " + ",".join(blockers),
+            ),
+            inferences=(idle_inference,),
+            **base_kwargs,
+        )
+    return MappedWayneObservation(
+        event=idle_event,
+        inferences=(idle_inference,),
+        **base_kwargs,
     )
 
 
@@ -344,6 +614,10 @@ def _status_code_to_event(
     current_state: PumpState | None,
     inferences: tuple[str, ...],
 ) -> MappedWayneObservation:
+    """Map Wayne DC1 STATUS bytes (Pump Interface Rev 2.11, page 20).
+
+    Documented codes: 0,1,2,4,5,6,7,8. There is no status 3 in Rev 2.11.
+    """
     try:
         status = WaynePumpStatus(status_code)
     except ValueError:
@@ -395,28 +669,28 @@ def _status_code_to_event(
                     "INFERENCE: prior SUSPENDED + live FILLING → RESUMED_OBSERVED.",
                 ),
             )
-        if current_state is PumpState.FILLING or previous_wayne_status == (
-            WaynePumpStatus.FILLING
-        ):
+        # Only treat as update when already in FILLING normalized state.
+        # Do not use previous_wayne_status alone — the simulator may pre-set
+        # intended DC1 before mapping.
+        if current_state is PumpState.FILLING:
             return MappedWayneObservation(
                 event=PumpEvent.FILLING_UPDATED,
                 observation=obs,
                 raw_wayne_status=status_code,
                 inferences=(
                     *inferences,
-                    "Already filling; DC1 FILLING → FILLING_UPDATED.",
+                    "Already filling; DC1 FILLING → FILLING_UPDATED "
+                    "(idempotent; no new transaction).",
                 ),
             )
         return MappedWayneObservation(
             event=PumpEvent.FILLING_STARTED,
             observation=obs,
             raw_wayne_status=status_code,
-            # Implicit auth path only when evidence exists (caller may enable).
             allow_implicit_authorize_to_filling=False,
             inferences=(
                 *inferences,
-                "DC1 STATUS=4 FILLING → FILLING_STARTED. "
-                "NOZZLE_UP→FILLING still requires machine flag for implicit auth.",
+                "DC1 STATUS=4 FILLING → FILLING_STARTED (primary filling signal).",
             ),
         )
 
@@ -426,6 +700,7 @@ def _status_code_to_event(
             observation=obs,
             raw_wayne_status=status_code,
             completion_evidence_key=completion_key,
+            awaiting_filling_complete=False,
             inferences=(*inferences, "DC1 STATUS=5 → FILLING_COMPLETED."),
         )
 
@@ -439,14 +714,14 @@ def _status_code_to_event(
 
     if status is WaynePumpStatus.SWITCHED_OFF:
         return MappedWayneObservation(
-            event=PumpEvent.UNKNOWN_OBSERVATION,
+            event=PumpEvent.SWITCHED_OFF_OBSERVED,
             observation=obs,
             raw_wayne_status=status_code,
             warnings=(
-                "Wayne SWITCHED_OFF has no dedicated normalized event; "
-                "preserved as UNKNOWN_OBSERVATION (not forced to MAINTENANCE).",
+                "Wayne SWITCHED_OFF is not READY/RESET; preserved as "
+                "SWITCHED_OFF_OBSERVED (offline/disabled).",
             ),
-            inferences=inferences,
+            inferences=(*inferences, "DC1 STATUS=7 → SWITCHED_OFF_OBSERVED."),
         )
 
     if status is WaynePumpStatus.SUSPENDED:

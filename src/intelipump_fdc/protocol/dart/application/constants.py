@@ -66,6 +66,7 @@ class TransactionType(StrEnum):
     DC103_PUMP_UNIT_PRICES = "DC103_PUMP_UNIT_PRICES"
     UNKNOWN = "UNKNOWN"
     AMBIGUOUS_CD1_OR_DC1 = "AMBIGUOUS_CD1_OR_DC1"
+    AMBIGUOUS_CD3_OR_DC3 = "AMBIGUOUS_CD3_OR_DC3"
 
 
 # CD1 DCC values — Pump Interface Rev 2.11, page 13

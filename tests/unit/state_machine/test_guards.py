@@ -27,9 +27,22 @@ def test_disconnected_authorize_rejected() -> None:
         _ctx(current_state=PumpState.DISCONNECTED),
     )
     assert result.eligible is False
-    assert "state_not_nozzle_up" in result.blocking_reasons
+    assert "state_not_authorize_eligible" in result.blocking_reasons
     assert result.requires_physical_enable is True
     assert result.requires_active_commands_enabled is True
+
+
+def test_authorize_allowed_from_reset_ready_or_nozzle_up() -> None:
+    for state in (PumpState.RESET, PumpState.READY, PumpState.NOZZLE_UP):
+        result = evaluate_command_eligibility(
+            PumpCommand.AUTHORIZE,
+            _ctx(
+                current_state=state,
+                selected_nozzle=1,
+                price_verified=True,
+            ),
+        )
+        assert result.eligible is True, state
 
 
 def test_filling_set_price_rejected() -> None:
