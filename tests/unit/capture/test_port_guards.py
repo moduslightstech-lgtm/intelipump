@@ -263,15 +263,23 @@ async def test_tiocexcl_failure_fails_closed(
 
 
 def test_failed_guard_creates_no_capture_started(tmp_path: Path) -> None:
+    """A refused preflight must not create capture output.
+
+    Missing devices under ``/tmp/`` are intentionally allowed as LAB aliases
+    that may appear later; use a non-``/tmp`` missing path so DEVICE_MISSING
+    still fails closed before any capture file exists.
+    """
     out = tmp_path / "should-not-exist.jsonl"
-    with pytest.raises(PassiveCaptureRefusedError):
+    missing = "/dev/intelipump-pytest-missing-capture-device"
+    with pytest.raises(PassiveCaptureRefusedError) as excinfo:
         run_preflight_guards(
-            port=str(tmp_path / "missing-device"),
+            port=missing,
             confirm_tx_physically_inhibited=True,
             confirm_controller_stopped=True,
             skip_service_check=True,
             lock_dir=tmp_path / "locks",
         )
+    assert excinfo.value.reason is PassiveCaptureRefuseReason.DEVICE_MISSING
     assert not out.exists()
 
 

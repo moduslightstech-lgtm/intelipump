@@ -306,7 +306,7 @@ async def test_tx_events_never_closer_than_300ms(tmp_path: Path) -> None:
         transport,  # type: ignore[arg-type]
         ContinuousPollSessionConfig(
             port="/tmp/fake",
-            address=1,
+            addresses=(1,),
             baud=9600,
             duration_seconds=1.5,
             poll_interval_ms=300,

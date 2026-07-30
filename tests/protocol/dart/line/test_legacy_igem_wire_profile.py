@@ -488,7 +488,7 @@ async def test_continuous_simulator_polling_both_sides(
         transport,  # type: ignore[arg-type]
         ContinuousPollSessionConfig(
             port="/tmp/x",
-            address=logical,
+            addresses=(logical,),
             baud=9600,
             duration_seconds=1.0,
             poll_interval_ms=100,
