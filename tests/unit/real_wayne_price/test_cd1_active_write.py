@@ -41,19 +41,20 @@ from intelipump_fdc.real_wayne_price.states import (
     ResetWriteState,
 )
 
+# Documented nozzle OUT (NOZIO bit 0x10 set): logical nozzle 1 + OUT = 0x11.
 _STATUS_FILLING_COMPLETE = bytes.fromhex(
     "02 08 00 00 00 00 00 00 00 00"
-    "03 04 00 11 75 01"
+    "03 04 00 11 75 11"
     "01 01 05"
 )
 _STATUS_RESET = bytes.fromhex(
     "02 08 00 00 00 00 00 00 00 00"
-    "03 04 00 11 75 01"
+    "03 04 00 11 75 11"
     "01 01 01"
 )
 _STATUS_AUTHORIZED = bytes.fromhex(
     "02 08 00 00 00 00 00 00 00 00"
-    "03 04 00 11 75 01"
+    "03 04 00 11 75 11"
     "01 01 02"
 )
 
@@ -261,6 +262,7 @@ async def test_reset_session_transmits_once(tmp_path: Path) -> None:
         evidence_dir=tmp_path / "ev",
         confirmations=_reset_confirms(),
         post_write_settle_ms=0,
+        post_reset_observation_seconds=0,
     )
     result = await ResetWriteSession(transport, params).run()
     assert result.transmitted is True
@@ -273,6 +275,9 @@ async def test_reset_session_transmits_once(tmp_path: Path) -> None:
     review = json.loads((tmp_path / "ev" / "cd1-reset-write-result.json").read_text())
     assert review["command"] == "RESET"
     assert review["transmitted"] is True
+    assert result.summary["diagnosticResult"] == (
+        "RESET_DIAGNOSTIC_ACK_STATE_CHANGED"
+    )
 
 
 @pytest.mark.asyncio
@@ -284,6 +289,7 @@ async def test_reset_refuses_without_filling_complete(tmp_path: Path) -> None:
         evidence_dir=tmp_path / "ev",
         confirmations=_reset_confirms(),
         post_write_settle_ms=0,
+        post_reset_observation_seconds=0,
     )
     result = await ResetWriteSession(transport, params).run()
     assert result.transmitted is False

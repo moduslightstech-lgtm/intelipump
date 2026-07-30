@@ -35,10 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Technician-supervised real-Wayne CD1 RESET attempt. "
             "Requires DC1 FILLING_COMPLETE (CLOSED after price), transmits "
-            "exactly one RESET DATA frame, then verifies DC1 RESET. "
-            "Lab note: on the owned Wayne head, RESET has ACK'd without DC1 "
-            "moving to RESET — treat as unproven; do not spam sequences. "
-            "Does not send CD5 or AUTHORIZE."
+            "exactly one RESET DATA frame, then observes/verifies status. "
+            "Documented nozzle OUT (NOZIO bit 0x10) allows the normal path; "
+            "owned-lab heads that never assert 0x10 may use the gated "
+            "--allow-nozio-unknown-for-reset override with extra confirms. "
+            "Does not send CD5, CD2, or AUTHORIZE."
         ),
     )
     p.add_argument("--port", required=True)
@@ -49,10 +50,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ack-timeout-ms", type=int, default=500)
     p.add_argument("--post-write-settle-ms", type=int, default=1000)
     p.add_argument("--post-write-max-status-polls", type=int, default=16)
+    p.add_argument(
+        "--post-reset-observation-seconds",
+        type=float,
+        default=3.0,
+        help="Bounded fresh status observation window after RESET TX (default 3)",
+    )
     p.add_argument("--sequence", type=int, default=0)
     p.add_argument("--confirm-owned-lab-pump", action="store_true")
     p.add_argument("--confirm-technician-present", action="store_true")
     p.add_argument("--confirm-no-product-connected", action="store_true")
+    p.add_argument(
+        "--confirm-no-fuel-test",
+        action="store_true",
+        help="Alias of --confirm-no-product-connected (no fuel / no product)",
+    )
     p.add_argument("--confirm-motor-isolated", action="store_true")
     p.add_argument("--confirm-valves-isolated", action="store_true")
     p.add_argument("--confirm-emergency-isolation-ready", action="store_true")
@@ -64,6 +76,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--i-understand-this-transmits-to-owned-lab-pump", action="store_true"
+    )
+    p.add_argument(
+        "--confirm-physical-nozzle-out",
+        action="store_true",
+        help="Operator confirms nozzle is physically OUT (override path)",
+    )
+    p.add_argument(
+        "--confirm-price-visible",
+        action="store_true",
+        help="Operator confirms price is visible on the head (override path)",
+    )
+    p.add_argument(
+        "--allow-nozio-unknown-for-reset",
+        action="store_true",
+        help=(
+            "Owned-lab only: treat missing NOZIO 0x10 as UNKNOWN and allow one "
+            "RESET diagnostic when all override confirms are present"
+        ),
+    )
+    p.add_argument(
+        "--confirm-reset-only",
+        action="store_true",
+        help="Operator confirms this session sends RESET only (override path)",
+    )
+    p.add_argument(
+        "--confirm-no-authorize",
+        action="store_true",
+        help="Operator confirms AUTHORIZE is prohibited (override path)",
     )
     p.add_argument("--skip-service-check", action="store_true")
     p.add_argument("--skip-port-check", action="store_true")
@@ -85,10 +125,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _params_from_args(args: argparse.Namespace) -> ResetWriteParams:
+    no_product = bool(args.confirm_no_product_connected) or bool(
+        args.confirm_no_fuel_test
+    )
     confirms = ResetWriteConfirmations(
         owned_lab_pump=bool(args.confirm_owned_lab_pump),
         technician_present=bool(args.confirm_technician_present),
-        no_product_connected=bool(args.confirm_no_product_connected),
+        no_product_connected=no_product,
         motor_isolated=bool(args.confirm_motor_isolated),
         valves_isolated=bool(args.confirm_valves_isolated),
         emergency_isolation_ready=bool(args.confirm_emergency_isolation_ready),
@@ -101,6 +144,11 @@ def _params_from_args(args: argparse.Namespace) -> ResetWriteParams:
         understand_transmits_to_owned_lab_pump=bool(
             args.i_understand_this_transmits_to_owned_lab_pump
         ),
+        confirm_physical_nozzle_out=bool(args.confirm_physical_nozzle_out),
+        confirm_price_visible=bool(args.confirm_price_visible),
+        allow_nozio_unknown_for_reset=bool(args.allow_nozio_unknown_for_reset),
+        confirm_reset_only=bool(args.confirm_reset_only),
+        confirm_no_authorize=bool(args.confirm_no_authorize),
     )
     return ResetWriteParams(
         port=args.port,
@@ -112,6 +160,7 @@ def _params_from_args(args: argparse.Namespace) -> ResetWriteParams:
         ack_timeout_ms=args.ack_timeout_ms,
         post_write_settle_ms=args.post_write_settle_ms,
         post_write_max_status_polls=args.post_write_max_status_polls,
+        post_reset_observation_seconds=float(args.post_reset_observation_seconds),
         sequence=args.sequence,
         skip_service_check=bool(args.skip_service_check),
         skip_port_check=bool(args.skip_port_check),
@@ -176,6 +225,7 @@ async def _async_main(argv: list[str] | None) -> int:
         print(json.dumps(result.summary, indent=2))
     else:
         print(f"state: {result.state.value}")
+        print(f"diagnosticResult: {result.summary.get('diagnosticResult')}")
         print(f"transmitted: {result.transmitted}")
         print(f"candidateFrameHex: {result.summary.get('candidateFrameHex')}")
         print(f"ackOutcome: {result.summary.get('ackOutcome')}")

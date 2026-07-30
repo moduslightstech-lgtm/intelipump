@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,7 +26,9 @@ from intelipump_fdc.protocol.cd1 import (
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.application.status import WaynePumpStatus
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
+from intelipump_fdc.protocol.dart.line.control import ControlType, classify_control
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
+from intelipump_fdc.protocol.dart.line.models import DartLineFrame
 from intelipump_fdc.real_wayne_price.evidence import (
     ActiveWriteEvidenceBundle,
     default_reset_uncertainties,
@@ -32,14 +37,21 @@ from intelipump_fdc.real_wayne_price.evidence import (
     write_active_write_evidence,
 )
 from intelipump_fdc.real_wayne_price.guards import ResetWriteParams
+from intelipump_fdc.real_wayne_price.reset_decision import (
+    controller_profile_for_reset,
+    evaluate_reset_nozzle_gate,
+    owned_lab_nozio_unknown_override_confirmed,
+)
 from intelipump_fdc.real_wayne_price.session_helpers import (
-    dc1_is,
-    poll_status_until,
     sequence_stale_status_hint,
     wait_for_ack_frame,
 )
-from intelipump_fdc.real_wayne_price.states import ResetWriteState
+from intelipump_fdc.real_wayne_price.states import (
+    ResetDiagnosticResult,
+    ResetWriteState,
+)
 from intelipump_fdc.real_wayne_price.status_decode import (
+    DecodedStatusSnapshot,
     StatusPreconditionError,
     decode_status_frame,
     validate_post_reset_status,
@@ -56,8 +68,64 @@ class ResetWriteResult:
     serial_write_called_for_candidate: bool = False
 
 
+def _nozio_raw_from_snap(snap: DecodedStatusSnapshot) -> int | None:
+    ev = snap.nozio_evidence
+    if isinstance(ev, dict):
+        raw_hex = ev.get("nozioRawHex")
+        if isinstance(raw_hex, str) and raw_hex:
+            try:
+                return int(raw_hex, 16) & 0xFF
+            except ValueError:
+                return None
+    return None
+
+
+def _observed_nak(ack_rx_hex: list[str], *, wire_address: int) -> bool:
+    for item in ack_rx_hex:
+        try:
+            raw = bytes.fromhex(item)
+        except ValueError:
+            continue
+        if (
+            len(raw) == 3
+            and raw[0] == wire_address
+            and classify_control(raw[1]) is ControlType.NAK
+        ):
+            return True
+    return False
+
+
+def map_reset_diagnostic_result(
+    *,
+    transmitted: bool,
+    ack_outcome: str,
+    dc1_before: int | None,
+    dc1_after: int | None,
+    protocol_error: bool,
+) -> ResetDiagnosticResult:
+    if not transmitted:
+        if protocol_error:
+            return ResetDiagnosticResult.RESET_DIAGNOSTIC_PROTOCOL_ERROR
+        return ResetDiagnosticResult.RESET_DIAGNOSTIC_REFUSED
+    if ack_outcome == "NAK":
+        return ResetDiagnosticResult.RESET_DIAGNOSTIC_NAK
+    if ack_outcome == "ACK_TIMEOUT":
+        return ResetDiagnosticResult.RESET_DIAGNOSTIC_TIMEOUT
+    if ack_outcome == "ACK_MATCH":
+        if (
+            dc1_before is not None
+            and dc1_after is not None
+            and dc1_after != dc1_before
+        ):
+            return ResetDiagnosticResult.RESET_DIAGNOSTIC_ACK_STATE_CHANGED
+        return ResetDiagnosticResult.RESET_DIAGNOSTIC_ACK_STATE_UNCHANGED
+    if protocol_error:
+        return ResetDiagnosticResult.RESET_DIAGNOSTIC_PROTOCOL_ERROR
+    return ResetDiagnosticResult.RESET_DIAGNOSTIC_PROTOCOL_ERROR
+
+
 class ResetWriteSession:
-    """Poll FILLING_COMPLETE → build CD1 RESET → authorize → TX → ACK → verify RESET."""
+    """Poll FILLING_COMPLETE → nozzle gate → CD1 RESET → ACK → observe."""
 
     def __init__(
         self,
@@ -74,9 +142,87 @@ class ResetWriteSession:
         self.session_id = new_session_id().replace("price-dry-run", "cd1-reset")
         self.commit = software_commit()
 
+    async def _observe_post_reset(
+        self,
+        *,
+        dc1_before: int | None,
+        settle_ms: int,
+        observation_seconds: float,
+        max_attempts: int,
+        verification_required: bool,
+    ) -> tuple[DecodedStatusSnapshot | None, str, int, list[str]]:
+        """Fresh status polls only; never reuse the pre-TX snapshot as after."""
+        notes: list[str] = []
+        last_snap: DecodedStatusSnapshot | None = None
+        last_frame: DartLineFrame | None = None
+        status_rx_after = ""
+        polls = 0
+        deadline = time.monotonic() + max(0.0, observation_seconds)
+        first = True
+        while True:
+            if first and settle_ms > 0:
+                await asyncio.sleep(settle_ms / 1000.0)
+            first = False
+            response = await send_status_poll_and_read_response(
+                self.transport,
+                self.logical_address,
+                self.params.response_timeout_ms,
+            )
+            polls += 1
+            if response.outcome is not StatusPollOutcome.DATA_RESPONSE:
+                notes.append(f"observe{polls}:{response.outcome.value}")
+            else:
+                assert response.frame is not None
+                snap = decode_status_frame(
+                    response.frame, expected_wire_address=self.wire_address
+                )
+                last_snap = snap
+                last_frame = response.frame
+                status_rx_after = response.frame.raw_frame.hex(" ")
+                notes.append(
+                    f"observe{polls}:dc1={snap.dc1_name}/{snap.dc1_code}"
+                    f" before={dc1_before}"
+                )
+                if (
+                    verification_required
+                    and snap.dc1_code == int(WaynePumpStatus.RESET)
+                    and snap.crc_valid
+                ):
+                    return last_snap, status_rx_after, polls, notes
+            now = time.monotonic()
+            if observation_seconds <= 0:
+                break
+            if now >= deadline:
+                break
+            if polls >= max_attempts:
+                break
+            await asyncio.sleep(min(0.05, max(0.0, deadline - now)))
+
+        if verification_required:
+            if last_snap is None:
+                raise StatusPreconditionError(
+                    "post_reset_RESET: no DATA status response",
+                    reasons=["post_reset_RESET_no_data", *notes],
+                    poll_count=polls,
+                )
+            raise StatusPreconditionError(
+                "post_reset_RESET: status not reached "
+                f"(last={last_snap.dc1_name}/{last_snap.dc1_code})",
+                reasons=[
+                    "post_reset_RESET_not_reached",
+                    f"last_dc1={last_snap.dc1_name}/{last_snap.dc1_code}",
+                    *notes,
+                ],
+                last_snap=last_snap,
+                last_frame=last_frame,
+                poll_count=polls,
+            )
+        return last_snap, status_rx_after, polls, notes
+
     async def run(self) -> ResetWriteResult:
         refusal_reasons: list[str] = []
         state = ResetWriteState.REFUSED
+        diagnostic = ResetDiagnosticResult.RESET_DIAGNOSTIC_REFUSED
         decoded_before: dict[str, Any] = {}
         decoded_after: dict[str, Any] = {}
         status_tx = build_poll(self.logical_address).hex(" ")
@@ -94,6 +240,11 @@ class ResetWriteSession:
         poll_writes = 0
         active_writes = 0
         warnings: list[str] = []
+        protocol_error = False
+        dc1_before: int | None = None
+        dc1_after: int | None = None
+        nozzle_physical: str | None = None
+        nozzle_decision: str | None = None
 
         try:
             if not self.transport.is_open:
@@ -119,11 +270,47 @@ class ResetWriteSession:
             snap = decode_status_frame(
                 response.frame, expected_wire_address=self.wire_address
             )
-            decoded_before = snap.to_report_dict()
+            dc1_before = snap.dc1_code
             validate_reset_preconditions(
                 snap, expected_wire_address=self.wire_address
             )
             state = ResetWriteState.FILLING_COMPLETE
+
+            nozio_raw = _nozio_raw_from_snap(snap)
+            if nozio_raw is None:
+                raise StatusPreconditionError(
+                    "NOZIO byte missing from status frame",
+                    reasons=["nozio_missing"],
+                )
+            profile = controller_profile_for_reset(self.params)
+            gate = evaluate_reset_nozzle_gate(
+                dc1_code=snap.dc1_code,
+                nozio=nozio_raw,
+                controller_profile=profile,
+                owned_lab_override_confirmed=owned_lab_nozio_unknown_override_confirmed(
+                    self.params
+                ),
+            )
+            nozzle_physical = gate.nozzle_state.value
+            nozzle_decision = gate.decision.value
+            decoded_before = snap.to_report_dict()
+            decoded_before.setdefault("dc3", {})
+            if isinstance(decoded_before.get("dc3"), dict):
+                decoded_before["dc3"] = {
+                    **decoded_before["dc3"],
+                    "physicalState": gate.nozzle_state.value,
+                    "controllerProfileSupportsNozioOutBit": (
+                        profile.supports_nozio_out_bit
+                    ),
+                    "resetNozzleDecision": gate.decision.value,
+                }
+            if gate.warning:
+                warnings.append(gate.warning)
+            if not gate.allow:
+                raise StatusPreconditionError(
+                    f"reset nozzle gate refused: {gate.refusal_reason}",
+                    reasons=[gate.refusal_reason or "nozzle_gate_refused"],
+                )
 
             cd1 = build_cd1_command(PumpControlCommand.RESET)
             frame, crc, ack = build_cd1_candidate_frame(
@@ -161,37 +348,48 @@ class ResetWriteSession:
             )
             if matched:
                 state = ResetWriteState.ACK_RECEIVED
+            elif _observed_nak(ack_rx_hex, wire_address=self.wire_address):
+                ack_outcome = "NAK"
+                state = ResetWriteState.FAULT
+                warnings.append("NAK observed; stopping without retry")
             else:
                 state = ResetWriteState.ACK_TIMEOUT
                 warnings.append(
-                    "ACK not observed within timeout; continuing to status verify"
+                    "ACK not observed within timeout; continuing to status observe"
                 )
 
-            if self.params.confirmations.post_write_status_verification_required:
-                snap_after, frame_after, extra_polls, notes = await poll_status_until(
-                    self.transport,
-                    logical_address=self.logical_address,
-                    wire_address=self.wire_address,
-                    response_timeout_ms=self.params.response_timeout_ms,
-                    predicate=dc1_is(WaynePumpStatus.RESET),
-                    settle_ms=self.params.post_write_settle_ms,
-                    max_attempts=self.params.post_write_max_status_polls,
-                    failure_label="post_reset_RESET",
+            if ack_outcome != "NAK":
+                verification = (
+                    self.params.confirmations.post_write_status_verification_required
+                )
+                snap_after, status_rx_after, extra_polls, notes = (
+                    await self._observe_post_reset(
+                        dc1_before=dc1_before,
+                        settle_ms=self.params.post_write_settle_ms,
+                        observation_seconds=self.params.post_reset_observation_seconds,
+                        max_attempts=self.params.post_write_max_status_polls,
+                        verification_required=verification,
+                    )
                 )
                 poll_writes += extra_polls
                 warnings.extend(notes)
-                status_rx_after = frame_after.raw_frame.hex(" ")
-                decoded_after = snap_after.to_report_dict()
-                validate_post_reset_status(
-                    snap_after, expected_wire_address=self.wire_address
-                )
-                state = ResetWriteState.RESET_VERIFIED
-            else:
-                warnings.append("post-write status verification was not required")
+                if snap_after is not None:
+                    decoded_after = snap_after.to_report_dict()
+                    dc1_after = snap_after.dc1_code
+                if verification:
+                    assert snap_after is not None
+                    validate_post_reset_status(
+                        snap_after, expected_wire_address=self.wire_address
+                    )
+                    state = ResetWriteState.RESET_VERIFIED
+                elif not verification:
+                    warnings.append("post-write status verification was not required")
 
         except (StatusPreconditionError, CD1Error, RealWayneActiveCommandRefusedError) as exc:
             refusal_reasons = list(getattr(exc, "reasons", [str(exc)]))
             state = ResetWriteState.FAULT if transmitted else ResetWriteState.REFUSED
+            if isinstance(exc, CD1Error):
+                protocol_error = True
             last_snap = getattr(exc, "last_snap", None)
             last_frame = getattr(exc, "last_frame", None)
             extra_polls = int(getattr(exc, "poll_count", 0) or 0)
@@ -199,6 +397,7 @@ class ResetWriteSession:
                 poll_writes += extra_polls
             if last_snap is not None:
                 decoded_after = last_snap.to_report_dict()
+                dc1_after = last_snap.dc1_code
             if last_frame is not None:
                 status_rx_after = last_frame.raw_frame.hex(" ")
             hint = sequence_stale_status_hint(
@@ -214,9 +413,20 @@ class ResetWriteSession:
         except Exception as exc:  # pragma: no cover
             refusal_reasons = [str(exc)]
             state = ResetWriteState.FAULT
+            protocol_error = True
             clear = getattr(self.transport, "clear_active_write_authorization", None)
             if callable(clear):
                 clear()
+
+        diagnostic = map_reset_diagnostic_result(
+            transmitted=transmitted,
+            ack_outcome=ack_outcome,
+            dc1_before=dc1_before,
+            dc1_after=dc1_after,
+            protocol_error=protocol_error,
+        )
+        if state is ResetWriteState.RESET_VERIFIED:
+            diagnostic = ResetDiagnosticResult.RESET_DIAGNOSTIC_ACK_STATE_CHANGED
 
         expected_after = {
             "code": int(WaynePumpStatus.RESET),
@@ -269,6 +479,7 @@ class ResetWriteSession:
             "sessionId": self.session_id,
             "command": "RESET",
             "state": state.value,
+            "diagnosticResult": diagnostic.value,
             "transmitted": transmitted,
             "serialWriteCalledForCandidate": serial_write_called,
             "activeWriteCount": active_writes,
@@ -284,12 +495,31 @@ class ResetWriteSession:
             "ackOutcome": ack_outcome,
             "ackObservedHex": ack_rx_hex,
             "expectedStatusAfter": expected_after,
+            "nozzlePhysicalState": nozzle_physical,
+            "resetNozzleDecision": nozzle_decision,
+            "postResetObservationSeconds": self.params.post_reset_observation_seconds,
             "refusalReasons": refusal_reasons,
             "warnings": warnings,
             "evidence": {k: str(v) for k, v in paths.items()},
             "softwareCommit": self.commit,
             "targetType": self.params.target_type,
+            "timestampUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+
+        # Extend evidence review JSON with diagnostic fields.
+        review_path = paths.get("review")
+        if review_path is not None and review_path.exists():
+            try:
+                review_obj = json.loads(review_path.read_text(encoding="utf-8"))
+                review_obj["diagnosticResult"] = diagnostic.value
+                review_obj["nozzlePhysicalState"] = nozzle_physical
+                review_obj["resetNozzleDecision"] = nozzle_decision
+                review_path.write_text(
+                    json.dumps(review_obj, indent=2) + "\n", encoding="utf-8"
+                )
+            except Exception:
+                pass
+
         return ResetWriteResult(
             state=state,
             summary=summary,

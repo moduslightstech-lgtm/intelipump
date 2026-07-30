@@ -273,6 +273,12 @@ class ResetWriteConfirmations:
     execute_cd1_reset: bool = False
     post_write_status_verification_required: bool = False
     understand_transmits_to_owned_lab_pump: bool = False
+    # Owned-lab NOZIO-unknown override (optional; required only when allow flag set).
+    confirm_physical_nozzle_out: bool = False
+    confirm_price_visible: bool = False
+    allow_nozio_unknown_for_reset: bool = False
+    confirm_reset_only: bool = False
+    confirm_no_authorize: bool = False
 
     def missing_flags(self) -> list[str]:
         mapping = {
@@ -311,6 +317,11 @@ class ResetWriteConfirmations:
             "understandTransmitsToOwnedLabPump": (
                 self.understand_transmits_to_owned_lab_pump
             ),
+            "confirmPhysicalNozzleOut": self.confirm_physical_nozzle_out,
+            "confirmPriceVisible": self.confirm_price_visible,
+            "allowNozioUnknownForReset": self.allow_nozio_unknown_for_reset,
+            "confirmResetOnly": self.confirm_reset_only,
+            "confirmNoAuthorize": self.confirm_no_authorize,
         }
 
 
@@ -325,13 +336,11 @@ class ResetWriteParams:
     ack_timeout_ms: int = 500
     post_write_settle_ms: int = 1000
     post_write_max_status_polls: int = 16
+    post_reset_observation_seconds: float = 3.0
     sequence: int = 0
     skip_service_check: bool = False
     skip_port_check: bool = False
-
-    @property
-    def target_type(self) -> str:
-        return TARGET_OWNED_LAB_WAYNE
+    target_type: str = TARGET_OWNED_LAB_WAYNE
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,6 +424,11 @@ class AuthorizeWriteParams:
 
 
 def validate_reset_write_params(params: ResetWriteParams) -> None:
+    # Local import avoids circular dependency with reset_decision.
+    from intelipump_fdc.real_wayne_price.reset_decision import (
+        override_confirmation_missing_flags,
+    )
+
     missing = params.confirmations.missing_flags()
     if missing:
         raise PollBenchRefusedError(
@@ -424,6 +438,23 @@ def validate_reset_write_params(params: ResetWriteParams) -> None:
         raise PollBenchRefusedError("address must be 1 or 2")
     if not 0 <= params.sequence <= 0x0F:
         raise PollBenchRefusedError("sequence must be 0..15")
+    if params.post_reset_observation_seconds < 0:
+        raise PollBenchRefusedError("post-reset-observation-seconds must be >= 0")
+    if params.confirmations.allow_nozio_unknown_for_reset:
+        if params.target_type != TARGET_OWNED_LAB_WAYNE:
+            raise PollBenchRefusedError(
+                "nozio-unknown RESET override requires targetType=OWNED_LAB_WAYNE"
+            )
+        if not params.confirmations.authorization_disabled:
+            raise PollBenchRefusedError(
+                "nozio-unknown RESET override refuses when authorization is enabled"
+            )
+        override_missing = override_confirmation_missing_flags(params.confirmations)
+        if override_missing:
+            raise PollBenchRefusedError(
+                "missing required nozio-unknown override confirmations: "
+                + ", ".join(override_missing)
+            )
 
 
 def validate_authorize_write_params(params: AuthorizeWriteParams) -> None:
@@ -745,10 +776,10 @@ def validate_cd101_write_settings(settings: Settings) -> None:
 __all__ = [
     "AuthorizeWriteConfirmations",
     "AuthorizeWriteParams",
-    "Cd101WriteConfirmations",
-    "Cd101WriteParams",
     "Cd2ResetWriteConfirmations",
     "Cd2ResetWriteParams",
+    "Cd101WriteConfirmations",
+    "Cd101WriteParams",
     "PollBenchRefusedError",
     "PriceDryRunConfirmations",
     "PriceDryRunParams",
@@ -761,10 +792,10 @@ __all__ = [
     "software_commit",
     "validate_authorize_write_params",
     "validate_authorize_write_settings",
-    "validate_cd101_write_params",
-    "validate_cd101_write_settings",
     "validate_cd2_reset_write_params",
     "validate_cd2_reset_write_settings",
+    "validate_cd101_write_params",
+    "validate_cd101_write_settings",
     "validate_price_dry_run_params",
     "validate_price_dry_run_settings",
     "validate_price_write_params",
