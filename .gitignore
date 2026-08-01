@@ -29,3 +29,8 @@ captures/raw/private/*
 .cursor/
 .vscode/
 .idea/
+tools/passive_dart_capture/evidence/*.jsonl
+tools/passive_dart_capture/reports/*
+!tools/passive_dart_capture/evidence/.gitkeep
+!tools/passive_dart_capture/reports/.gitkeep
+
