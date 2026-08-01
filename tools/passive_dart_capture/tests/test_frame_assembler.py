@@ -66,7 +66,8 @@ def test_fragmented_frames() -> None:
 
 def test_partial_final_frame_flush() -> None:
     asm = PassiveFrameAssembler()
-    assert asm.feed_chunk(_chunk(bytes.fromhex("50 30 01"))) == []
+    stamp_ns = 42
+    assert asm.feed_chunk(_chunk(bytes.fromhex("50 30 01"), seq_ns=stamp_ns)) == []
     partial = asm.flush_partial(
         session_now=datetime(2026, 8, 1, tzinfo=UTC),
         mono_ns=99,
@@ -75,6 +76,24 @@ def test_partial_final_frame_flush() -> None:
     assert partial.complete is False
     assert partial.frame_class == "PARTIAL_FRAME"
     assert partial.raw == bytes.fromhex("50 30 01")
+    # Preserve chunk timestamps for the interrupted remnant (not only shutdown now).
+    assert partial.first_byte_monotonic_ns == stamp_ns
+    assert partial.last_byte_monotonic_ns == stamp_ns
+    assert partial.direction == "UNKNOWN"
+    assert partial.direction_inference_reason
+
+
+def test_direction_never_claimed_without_reason() -> None:
+    asm = PassiveFrameAssembler()
+    data = build_data_frame(0x50, 0x0, bytes.fromhex("01 01 04"))
+    blob = bytes.fromhex("50 20 FA 50 C0 FA") + data
+    frames = asm.feed_chunk(_chunk(blob))
+    assert len(frames) == 3
+    for fr in frames:
+        assert fr.direction in {"UNKNOWN", "INFERRED"}
+        assert fr.direction_inference_reason
+        if fr.direction == "INFERRED":
+            assert fr.direction_confidence == "SHAPE_ONLY"
 
 
 def test_valid_and_invalid_crc() -> None:

@@ -73,9 +73,10 @@ Allowed: `Path.write_text`, evidence file `fh.write(...)`, JSON dumps.
 5. **markers.py** — operator marker set + JSONL records.
 6. **capture.py** — loop: read → `serial_chunk` → assemble → `frame` (+ parse); SIGINT clean stop; direction `MERGED_BUS` on chunks, `UNKNOWN`/`INFERRED` on frames.
 7. **analyzer.py** — offline JSONL → `reports/` CSVs/MD/JSON; dedupe by `sessionId+frameSequence`; complete frames only for frame analytics.
-8. **cli.py** — `capture` / `marker` / `analyze` / `compare`.
-9. **tests/** — framing, CRC, DC*, markers, timestamps, dedupe, SIGINT, static safety.
-10. **README.md** — usage; no hardware auto-run.
+8. **cli.py** — `capture` / `dry-run` / `marker` / `analyze` / `compare`.
+9. **dry_run.py** — fixture byte source + tempfile capture→analyze (no serial).
+10. **tests/** — framing, CRC, DC*, markers, timestamps, dedupe, SIGINT, dry-run, static safety.
+11. **README.md** — usage; dry-run; serial open limitations; no hardware auto-run.
 
 ---
 

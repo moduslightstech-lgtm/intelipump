@@ -1,12 +1,14 @@
 """CLI for strictly passive Wayne DART capture and offline analysis.
 
-Commands never transmit. Capture opens the serial port in receive-only mode.
-Do not run against hardware unless the operator intentionally starts capture.
+Commands never transmit. Capture opens the serial port in receive-only mode
+(behaviorally: no write/RTS/DE calls). Do not run against hardware unless the
+operator intentionally starts ``capture``. Prefer ``dry-run`` for pipeline checks.
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -16,8 +18,10 @@ from tools.passive_dart_capture.analyzer import (
     resolve_evidence_path,
 )
 from tools.passive_dart_capture.capture import run_capture
+from tools.passive_dart_capture.dry_run import DEFAULT_FIXTURE, run_dry_run
 from tools.passive_dart_capture.evidence_writer import DEFAULT_EVIDENCE_DIR, DEFAULT_REPORTS_DIR
 from tools.passive_dart_capture.markers import ALLOWED_MARKERS, append_marker
+from tools.passive_dart_capture.serial_reader import PASSIVE_SERIAL_OPEN_LIMITATIONS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,7 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="passive_dart_capture",
         description=(
             "Strictly passive Wayne DART RS-485 capture/analysis. "
-            "LISTEN_ONLY: never transmits, never asserts RTS/DE."
+            "LISTEN_ONLY: never transmits, never asserts RTS/DE. "
+            "Does not auto-run against hardware — choose a subcommand."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -43,6 +48,36 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_EVIDENCE_DIR,
         help=f"Evidence directory (default: {DEFAULT_EVIDENCE_DIR})",
+    )
+
+    dry = sub.add_parser(
+        "dry-run",
+        help=(
+            "Hardware-free pipeline check: fixture → capture evidence → analyze "
+            "(writes under a temp directory; never opens a serial device)"
+        ),
+    )
+    dry.add_argument(
+        "--fixture",
+        type=Path,
+        default=DEFAULT_FIXTURE,
+        help=f"Hex fixture path (default: {DEFAULT_FIXTURE})",
+    )
+    dry.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help="Output directory (default: tempfile.mkdtemp)",
+    )
+    dry.add_argument(
+        "--session-id",
+        default="dry-run",
+        help="Session id for evidence/reports (default: dry-run)",
+    )
+    dry.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="Keep the temp work directory (default: delete when --work-dir omitted)",
     )
 
     mark = sub.add_parser("marker", help="Append an operator marker to a session JSONL")
@@ -109,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             "No transmit. Stop with Ctrl+C / SIGINT.",
             file=sys.stderr,
         )
+        print(PASSIVE_SERIAL_OPEN_LIMITATIONS, file=sys.stderr)
         path = run_capture(
             device=args.device,
             baud=args.baud,
@@ -116,6 +152,31 @@ def main(argv: list[str] | None = None) -> int:
             evidence_dir=args.evidence_dir,
         )
         print(f"Evidence written: {path}")
+        return 0
+
+    if args.command == "dry-run":
+        created_temp = args.work_dir is None
+        result = run_dry_run(
+            fixture_path=args.fixture,
+            work_dir=args.work_dir,
+            session_id=args.session_id,
+        )
+        summary = result.analysis.summary
+        counts = summary["recordCounts"]
+        print("DRY-RUN complete (no serial / no hardware access).")
+        print(f"  work_dir: {result.work_dir}")
+        print(f"  evidence: {result.evidence_path}")
+        print(f"  chunks: {counts['serialChunks']}  frames: {counts['frameRecords']}")
+        print(f"  completeFramesAnalyzed: {counts['completeFramesAnalyzed']}")
+        print(f"  crcInvalid: {summary['errors'].get('crcInvalidFrames', 0)}")
+        print(f"  incompleteFrames: {summary['errors'].get('incompleteFrames', 0)}")
+        for name, p in result.analysis.report_paths.items():
+            print(f"  {name}: {p}")
+        if created_temp and not args.keep_temp:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+            print("  (temp work_dir removed; pass --keep-temp to retain)")
+        elif created_temp and args.keep_temp:
+            print("  (temp work_dir kept)")
         return 0
 
     if args.command == "marker":

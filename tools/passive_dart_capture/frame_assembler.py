@@ -114,16 +114,25 @@ class PassiveFrameAssembler:
         return out
 
     def flush_partial(self, *, session_now: datetime, mono_ns: int) -> AssembledFrame | None:
-        """Emit a PARTIAL_FRAME for any leftover buffer (e.g. on shutdown)."""
+        """Emit a PARTIAL_FRAME for any leftover buffer (e.g. on shutdown).
+
+        Prefer timestamps from the chunk that introduced the remnant; fall back
+        to ``session_now`` / ``mono_ns`` only when no pending stamp exists.
+        """
+        stamp = self._pending
         discarded = self.reset()
         if not discarded:
             return None
+        first_utc = stamp.first_utc if stamp is not None else session_now
+        last_utc = stamp.last_utc if stamp is not None else session_now
+        first_mono = stamp.first_mono if stamp is not None else mono_ns
+        last_mono = stamp.last_mono if stamp is not None else mono_ns
         return AssembledFrame(
             raw=discarded,
-            first_byte_timestamp_utc=session_now,
-            last_byte_timestamp_utc=session_now,
-            first_byte_monotonic_ns=mono_ns,
-            last_byte_monotonic_ns=mono_ns,
+            first_byte_timestamp_utc=first_utc,
+            last_byte_timestamp_utc=last_utc,
+            first_byte_monotonic_ns=first_mono,
+            last_byte_monotonic_ns=last_mono,
             complete=False,
             frame_class=CapturedFrameClass.PARTIAL_FRAME.value,
             address_hex=f"{discarded[0]:02X}" if discarded else None,

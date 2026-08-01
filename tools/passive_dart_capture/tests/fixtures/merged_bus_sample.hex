@@ -1,0 +1,30 @@
+# Passive DART dry-run fixture (merged-bus hex). No hardware involved.
+# Includes: polls, short ACK, DATA (DC1/DC3), fragmented poll, CRC-invalid DATA,
+# and a trailing partial frame (incomplete DATA header).
+#
+# Chunk boundaries in FixtureByteSource follow non-comment lines (and optional
+# mid-line splits for the fragmented poll).
+
+# Complete polls (side1 / side2)
+50 20 FA
+51 20 FA
+
+# Short ACK
+50 C0 FA
+
+# Fragmented poll (one frame across three lines / chunks)
+50
+20
+FA
+
+# DATA: DC1 FILLING (valid CRC)
+50 30 01 01 04 9E 9F 03 FA
+
+# DATA: DC3 price + NOZIO OUT (valid CRC)
+50 31 03 04 00 11 75 11 62 95 03 FA
+
+# DATA: CRC-invalid (structurally complete; CRC nibble flipped)
+50 32 01 01 01 A0 24 03 FA
+
+# Trailing partial (interrupted final frame — incomplete DATA body)
+50 30 01
