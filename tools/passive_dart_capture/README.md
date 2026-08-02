@@ -53,12 +53,35 @@ python -m tools.passive_dart_capture capture --session-id lab-001 --evidence-dir
 python -m tools.passive_dart_capture marker lab-001 NOZZLE_LIFTED --note "hose A"
 python -m tools.passive_dart_capture marker lab-001 END_CAPTURE
 
-# Offline analysis
+# Offline analysis (legacy reports)
 python -m tools.passive_dart_capture analyze lab-001
+
+# Direction-aware analysis (additive; writes <session>-direction-aware-* reports)
+python -m tools.passive_dart_capture analyze lab-002-epump-out \
+  --evidence-file tools/passive_dart_capture/evidence/lab-002-epump-out.jsonl \
+  --direction-aware
 
 # Compare two sessions
 python -m tools.passive_dart_capture compare lab-001 lab-002
 ```
+
+### Direction-aware reports
+
+When `--direction-aware` is set, the analyzer infers PUMP↔CONTROLLER from bus
+sequence (POLL → DATA → ACK vs EOT → DATA), resolves CD1/DC1 and CD5 ambiguity,
+and writes versioned reports:
+
+- `<sessionId>-direction-aware-summary.json`
+- `<sessionId>-direction-aware-status-transitions.csv`
+- `<sessionId>-direction-aware-nozio-transitions.csv`
+- `<sessionId>-direction-aware-window-*.json`
+- `<sessionId>-direction-aware-diagnostics-rejected-addresses.json`
+- `<sessionId>-direction-aware-nozio-sequences.json`
+- `<sessionId>-direction-aware-nozzle-cycle-comparison.json` / `.md`
+
+Full lab-002 report regeneration requires
+`tools/passive_dart_capture/evidence/lab-002-epump-out.jsonl` (read-only; never
+modified). Unit tests include synthetic fixtures when the evidence file is absent.
 
 ### Dry-run
 

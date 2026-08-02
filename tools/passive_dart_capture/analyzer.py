@@ -9,10 +9,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from tools.passive_dart_capture.direction_inference import (
+    annotate_frames,
+    build_dc1_transitions,
+    build_nozio_transitions,
+    build_rejected_address_diagnostics,
+    build_window_report,
+    compare_nozzle_cycles,
+    sequence_around_nozio,
+)
 from tools.passive_dart_capture.evidence_writer import (
     DEFAULT_EVIDENCE_DIR,
     DEFAULT_REPORTS_DIR,
     ensure_dir,
+)
+
+# Focused lab windows for direction-aware reports (inclusive frameSequence).
+DIRECTION_AWARE_WINDOWS: tuple[tuple[int, int], ...] = (
+    (4070, 4140),
+    (4900, 4980),
+    (5490, 5570),
+    (5960, 6030),
 )
 
 
@@ -100,6 +117,19 @@ class AnalysisResult:
     status_transitions: list[dict[str, Any]] = field(default_factory=list)
     nozio_transitions: list[dict[str, Any]] = field(default_factory=list)
     unknown_transactions: list[dict[str, Any]] = field(default_factory=list)
+    report_paths: dict[str, Path] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class DirectionAwareAnalysisResult:
+    session_id: str
+    summary: dict[str, Any]
+    status_transitions: list[dict[str, Any]] = field(default_factory=list)
+    nozio_transitions: list[dict[str, Any]] = field(default_factory=list)
+    rejected_addresses: list[dict[str, Any]] = field(default_factory=list)
+    windows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    nozio_sequences: list[dict[str, Any]] = field(default_factory=list)
+    nozzle_cycle_comparison: dict[str, Any] = field(default_factory=dict)
     report_paths: dict[str, Path] = field(default_factory=dict)
 
 
@@ -228,9 +258,171 @@ def analyze_path(
     *,
     reports_dir: Path | None = None,
     session_id: str | None = None,
-) -> AnalysisResult:
+    direction_aware: bool = False,
+) -> AnalysisResult | DirectionAwareAnalysisResult:
     session = load_session(evidence_path, session_id=session_id)
+    if direction_aware:
+        return analyze_session_direction_aware(session, reports_dir=reports_dir)
     return analyze_session(session, reports_dir=reports_dir)
+
+
+def analyze_session_direction_aware(
+    session: LoadedSession,
+    *,
+    reports_dir: Path | None = None,
+    windows: tuple[tuple[int, int], ...] = DIRECTION_AWARE_WINDOWS,
+) -> DirectionAwareAnalysisResult:
+    """Direction-aware offline analysis (additive; does not replace legacy reports)."""
+    out_dir = ensure_dir(reports_dir or DEFAULT_REPORTS_DIR)
+    sid = session.session_id
+    # Prefer complete frames; include incomplete only in diagnostics via rejected addrs.
+    directed = annotate_frames(session.complete_frames)
+    status_tx = build_dc1_transitions(directed)
+    nozio_tx = build_nozio_transitions(directed)
+    # Diagnostics: rejected addresses from all complete frames (incl. non-state).
+    rejected = build_rejected_address_diagnostics(directed)
+    window_reports = {
+        f"{start}-{end}": build_window_report(directed, start_seq=start, end_seq=end)
+        for start, end in windows
+    }
+    nozio_seqs = sequence_around_nozio(directed, nozio_tx)
+    cycle_cmp = compare_nozzle_cycles(directed, nozio_tx)
+
+    legacy_dc1 = len(_status_transitions(session.complete_frames))
+    summary = {
+        "sessionId": sid,
+        "analysisMode": "direction-aware",
+        "evidenceUnmodified": True,
+        "recordCounts": {
+            "totalRecords": len(session.records),
+            "serialChunks": len(session.chunks),
+            "frameRecords": len(session.frames),
+            "completeFramesAnalyzed": len(session.complete_frames),
+            "markers": len(session.markers),
+        },
+        "dc1TransitionCount": len(status_tx),
+        "dc1TransitionCountLegacyNaive": legacy_dc1,
+        "nozioTransitionCount": len(nozio_tx),
+        "rejectedAddressFrameCount": len(rejected),
+        "stateReportAddresses": ["50", "51"],
+        "nozioTransitionFrameSequences": [t.get("frameSequence") for t in nozio_tx],
+        "nozzleCycleComparison": {
+            "cycleCount": cycle_cmp.get("cycleCount"),
+            "repeatedEPumpSequence": cycle_cmp.get("repeatedEPumpSequence"),
+            "narrative": cycle_cmp.get("narrative"),
+        },
+        "windows": [f"{a}-{b}" for a, b in windows],
+        "rules": [
+            "DATA after same-address POLL (before ACK) → high-confidence PUMP_TO_CONTROLLER",
+            "DATA after EOT/turnaround, not same-address POLL response → CONTROLLER_TO_PUMP",
+            "ACK after DATA is from the opposite side of that DATA",
+            "TRANS 01 never counted as DC1 unless high-confidence PUMP_TO_CONTROLLER",
+            "TRANS 05 never CD5 unless CONTROLLER_TO_PUMP and LNG=3*n",
+            "DC1/NOZIO state reports: complete + CRC valid + address 50/51 only",
+            "Ordered DC3 transactions within one DATA frame are preserved",
+            "Implausible addresses excluded from state reports; retained in diagnostics",
+        ],
+    }
+
+    prefix = f"{sid}-direction-aware"
+    paths: dict[str, Path] = {
+        "summary_json": out_dir / f"{prefix}-summary.json",
+        "status_csv": out_dir / f"{prefix}-status-transitions.csv",
+        "nozio_csv": out_dir / f"{prefix}-nozio-transitions.csv",
+        "diagnostics_json": out_dir / f"{prefix}-diagnostics-rejected-addresses.json",
+        "nozio_sequences_json": out_dir / f"{prefix}-nozio-sequences.json",
+        "nozzle_cycles_json": out_dir / f"{prefix}-nozzle-cycle-comparison.json",
+        "nozzle_cycles_md": out_dir / f"{prefix}-nozzle-cycle-comparison.md",
+    }
+    for label in window_reports:
+        paths[f"window_{label}"] = out_dir / f"{prefix}-window-{label}.json"
+
+    paths["summary_json"].write_text(
+        json.dumps(summary, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    _write_csv(
+        paths["status_csv"],
+        status_tx,
+        fieldnames=[
+            "timestampUtc",
+            "addressHex",
+            "frameSequence",
+            "fromStatus",
+            "toStatus",
+            "statusCode",
+            "inferredDirection",
+            "confidence",
+        ],
+    )
+    _write_csv(
+        paths["nozio_csv"],
+        nozio_tx,
+        fieldnames=[
+            "timestampUtc",
+            "addressHex",
+            "frameSequence",
+            "transactionIndex",
+            "fromPosition",
+            "toPosition",
+            "logicalNozzle",
+            "nozioRawHex",
+            "inferredDirection",
+            "confidence",
+        ],
+    )
+    paths["diagnostics_json"].write_text(
+        json.dumps(
+            {
+                "sessionId": sid,
+                "rejectedAddressFrameCount": len(rejected),
+                "frames": rejected,
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    paths["nozio_sequences_json"].write_text(
+        json.dumps(nozio_seqs, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    paths["nozzle_cycles_json"].write_text(
+        json.dumps(cycle_cmp, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    paths["nozzle_cycles_md"].write_text(
+        str(cycle_cmp.get("narrative") or "") + "\n",
+        encoding="utf-8",
+    )
+    for label, rows in window_reports.items():
+        paths[f"window_{label}"].write_text(
+            json.dumps(
+                {
+                    "sessionId": sid,
+                    "window": label,
+                    "frameCount": len(rows),
+                    "frames": rows,
+                },
+                indent=2,
+                ensure_ascii=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    return DirectionAwareAnalysisResult(
+        session_id=sid,
+        summary=summary,
+        status_transitions=status_tx,
+        nozio_transitions=nozio_tx,
+        rejected_addresses=rejected,
+        windows=window_reports,
+        nozio_sequences=nozio_seqs,
+        nozzle_cycle_comparison=cycle_cmp,
+        report_paths=paths,
+    )
 
 
 def compare_sessions(

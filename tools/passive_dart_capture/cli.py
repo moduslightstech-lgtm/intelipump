@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from tools.passive_dart_capture.analyzer import (
+    DirectionAwareAnalysisResult,
     analyze_path,
     compare_sessions,
     resolve_evidence_path,
@@ -114,6 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REPORTS_DIR,
         help=f"Reports directory (default: {DEFAULT_REPORTS_DIR})",
     )
+    an.add_argument(
+        "--direction-aware",
+        action="store_true",
+        help=(
+            "Additive direction-aware analysis: infer PUMP↔CONTROLLER from bus "
+            "sequence, rebuild DC1/NOZIO transitions, write "
+            "<session>-direction-aware-* reports (does not replace legacy analyze)"
+        ),
+    )
 
     cmp_ = sub.add_parser("compare", help="Compare two capture sessions")
     cmp_.add_argument("session_a", help="First session id")
@@ -202,8 +212,17 @@ def main(argv: list[str] | None = None) -> int:
             path,
             reports_dir=args.reports_dir,
             session_id=args.session_id,
+            direction_aware=bool(args.direction_aware),
         )
         print(f"Analyzed session {result.session_id}")
+        if isinstance(result, DirectionAwareAnalysisResult):
+            print("  mode: direction-aware")
+            print(f"  dc1TransitionCount: {result.summary['dc1TransitionCount']}")
+            print(
+                "  dc1TransitionCountLegacyNaive: "
+                f"{result.summary['dc1TransitionCountLegacyNaive']}"
+            )
+            print(f"  nozioTransitionCount: {result.summary['nozioTransitionCount']}")
         for name, p in result.report_paths.items():
             print(f"  {name}: {p}")
         return 0
