@@ -40,6 +40,10 @@ from intelipump_fdc.controller.price_safety import (
     RealWayneActiveCommandRefusedError,
 )
 from intelipump_fdc.protocol.cd1 import build_cd1_candidate_frame, build_cd1_command
+from intelipump_fdc.protocol.cd101 import (
+    build_cd101_candidate_frame,
+    build_cd101_request,
+)
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.captured_classify import CapturedFrameClass
@@ -76,6 +80,9 @@ class ContinuousPollSessionConfig:
     return_status_sequence: int = 0
     ack_timeout_ms: int = 200
     until_ctrl_c: bool = False
+    cd101_cadence: bool = False
+    cd101_every_n_polls: int = 4
+    cd101_counter_select: int = 1
 
     @property
     def address(self) -> int:
@@ -83,10 +90,13 @@ class ContinuousPollSessionConfig:
 
 
 class ContinuousPollSession:
-    """Sends status polls on a monotonic schedule; optional gated RETURN_STATUS.
+    """Sends status polls on a monotonic schedule; optional RS / CD101 cadence.
 
     One or two logical addresses on a single adapter (round-robin).
-    Never builds RESET/AUTHORIZE. No controller command queue.
+    Never builds RESET/AUTHORIZE/CD5. No controller command queue.
+    RS and CD101 share one per-address L2 DATA sequence nibble so TX#
+    stays monotonic. On the same poll slot, RETURN_STATUS wins and CD101
+    is deferred to the next free slot.
     """
 
     def __init__(
@@ -115,11 +125,18 @@ class ContinuousPollSession:
             raise ValueError("max_writes must be >= 0 (0=unlimited)")
         if not config.until_ctrl_c and config.max_writes < 1:
             raise ValueError("max_writes must be >= 1 unless until_ctrl_c")
-        if config.return_status_cadence:
-            if not (1 <= config.return_status_every_n_polls <= 20):
-                raise ValueError("return_status_every_n_polls must be 1-20")
-            if not (0 <= config.return_status_sequence <= 15):
-                raise ValueError("return_status_sequence must be 0-15")
+        if config.return_status_cadence and not (
+            1 <= config.return_status_every_n_polls <= 20
+        ):
+            raise ValueError("return_status_every_n_polls must be 1-20")
+        if config.cd101_cadence and not (1 <= config.cd101_every_n_polls <= 20):
+            raise ValueError("cd101_every_n_polls must be 1-20")
+        if config.cd101_cadence and not (0 <= config.cd101_counter_select <= 0xFF):
+            raise ValueError("cd101_counter_select must be 0-255")
+        if (config.return_status_cadence or config.cd101_cadence) and not (
+            0 <= config.return_status_sequence <= 15
+        ):
+            raise ValueError("return_status_sequence must be 0-15")
         self.transport = transport
         self.config = config
         self.addresses = config.addresses
@@ -137,11 +154,14 @@ class ContinuousPollSession:
         self.result: ContinuousBenchResult | None = None
         self._fault = False
         self._commit = software_commit()
+        # Shared per-address L2 DATA sequence for RS and CD101 (monotonic TX#).
         start_seq = int(config.return_status_sequence) & 0x0F
-        self._rs_sequence: dict[int, int] = {
+        self._data_sequence: dict[int, int] = {
             addr: start_seq for addr in config.addresses
         }
         self._rr_index = 0
+        # When RS and CD101 are both due, RS wins; CD101 waits for a free slot.
+        self._cd101_deferred = False
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -182,6 +202,8 @@ class ContinuousPollSession:
                     f"max_writes={self.config.max_writes} "
                     f"return_status_cadence={self.config.return_status_cadence} "
                     f"return_status_every_n={self.config.return_status_every_n_polls} "
+                    f"cd101_cadence={self.config.cd101_cadence} "
+                    f"cd101_every_n={self.config.cd101_every_n_polls} "
                     f"until_ctrl_c={self.config.until_ctrl_c} "
                     f"targetType={self.config.target_type} "
                     f"simulatorValidation={self.config.simulator_validation}"
@@ -282,6 +304,10 @@ class ContinuousPollSession:
             "returnStatusAckMatch": self.stats.return_status_ack_match,
             "returnStatusAckTimeout": self.stats.return_status_ack_timeout,
             "returnStatusCadence": self.config.return_status_cadence,
+            "cd101Sent": self.stats.cd101_sent,
+            "cd101AckMatch": self.stats.cd101_ack_match,
+            "cd101AckTimeout": self.stats.cd101_ack_timeout,
+            "cd101Cadence": self.config.cd101_cadence,
             "untilCtrlC": self.config.until_ctrl_c,
             "commandQueueCreated": self.command_queue_created,
             "authorizationObjectsCreated": self.authorization_objects_created,
@@ -420,16 +446,41 @@ class ContinuousPollSession:
             if stop_early:
                 return
 
-            if (
+            rs_due = (
                 self.config.return_status_cadence
                 and seq % self.config.return_status_every_n_polls == 0
-            ):
+            )
+            cd101_scheduled = (
+                self.config.cd101_cadence
+                and seq % self.config.cd101_every_n_polls == 0
+            )
+            cd101_due = cd101_scheduled or self._cd101_deferred
+            if rs_due and cd101_due:
+                # Same slot: RETURN_STATUS wins; defer CD101 to next free slot.
+                self._cd101_deferred = True
                 stop_rs, rs_tx = await self._one_return_status(
                     writer, seq, logical_address=logical
                 )
                 if rs_tx is not None:
                     previous_tx = rs_tx
                 if stop_rs:
+                    return
+            elif rs_due:
+                stop_rs, rs_tx = await self._one_return_status(
+                    writer, seq, logical_address=logical
+                )
+                if rs_tx is not None:
+                    previous_tx = rs_tx
+                if stop_rs:
+                    return
+            elif cd101_due:
+                stop_cd, cd_tx = await self._one_cd101(
+                    writer, seq, logical_address=logical
+                )
+                self._cd101_deferred = False
+                if cd_tx is not None:
+                    previous_tx = cd_tx
+                if stop_cd:
                     return
 
     async def _one_return_status(
@@ -466,10 +517,10 @@ class ContinuousPollSession:
             self._fault = True
             self.stats.stop_reason = StopReason.SAFETY_FAULT
             return True, None
-        rs_seq = self._rs_sequence[logical_address]
+        data_seq = self._data_sequence[logical_address]
         frame, _crc, expected_ack = build_cd1_candidate_frame(
             logical_address=logical_address,
-            sequence=rs_seq,
+            sequence=data_seq,
             cd1=cd1,
         )
         try:
@@ -512,7 +563,7 @@ class ContinuousPollSession:
             event=ContinuousBenchEvent.RETURN_STATUS_SENT,
             notes=(
                 f"CD1_RETURN_STATUS address={logical_address} "
-                f"sequence={rs_seq} (no RESET/AUTHORIZE)"
+                f"sequence={data_seq} (no RESET/AUTHORIZE/CD5)"
             ),
         )
 
@@ -534,8 +585,113 @@ class ContinuousPollSession:
             poll_sequence=poll_seq,
             notes=f"ack={ack_outcome}; observed={observed[:3]}",
         )
-        self._rs_sequence[logical_address] = next_sequence_nibble(rs_seq)
+        self._data_sequence[logical_address] = next_sequence_nibble(data_seq)
         # ACK timeout is non-fatal (mirrors office path continuing after RS).
+        return False, tx_mono
+
+    async def _one_cd101(
+        self,
+        writer: EvidenceWriter,
+        poll_seq: int,
+        *,
+        logical_address: int,
+    ) -> tuple[bool, float | None]:
+        """Transmit one gated CD101 request-totals; never RESET/AUTHORIZE/CD5."""
+        self.logical_address = logical_address
+        self.wire_address = encode_wire_address(logical_address)
+        authorize = getattr(self.transport, "authorize_single_active_write", None)
+        if not callable(authorize):
+            self._fault = True
+            self.stats.stop_reason = StopReason.SAFETY_FAULT
+            writer.emit_event(
+                ContinuousBenchEvent.SAFETY_REFUSED,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=logical_address,
+                notes="transport_missing_active_authorization",
+                stop_reason=StopReason.SAFETY_FAULT.value,
+            )
+            return True, None
+
+        write_count = getattr(self.transport, "write_count", self.stats.polls_sent)
+        if self.config.max_writes > 0 and write_count >= self.config.max_writes:
+            self._fault = True
+            self.stats.stop_reason = StopReason.MAX_WRITES
+            return True, None
+
+        cd101 = build_cd101_request(
+            counter_select=self.config.cd101_counter_select
+        )
+        data_seq = self._data_sequence[logical_address]
+        frame, _crc, expected_ack = build_cd101_candidate_frame(
+            logical_address=logical_address,
+            sequence=data_seq,
+            cd101=cd101,
+        )
+        try:
+            authorize(frame, kind=ActiveFrameKind.CD101_REQUEST_TOTALS)
+            tx_mono = time.monotonic()
+            mono_ns = time.monotonic_ns()
+            await self.transport.write(frame)
+            flush = getattr(self.transport, "flush", None)
+            if callable(flush):
+                await flush()
+        except (RealWayneActiveCommandRefusedError, OSError, TransportNotOpenError) as exc:
+            self._fault = True
+            self.stats.stop_reason = (
+                StopReason.SERIAL_DISCONNECT
+                if isinstance(exc, (OSError, TransportNotOpenError))
+                else StopReason.SAFETY_FAULT
+            )
+            writer.emit_event(
+                ContinuousBenchEvent.SAFETY_REFUSED,
+                monotonic_ns=time.monotonic_ns(),
+                pump_address=logical_address,
+                notes=str(exc),
+                stop_reason=self.stats.stop_reason.value,
+            )
+            return True, None
+
+        self.stats.cd101_sent += 1
+        self.stats.last_tx_hex = frame.hex(" ")
+        writer.emit_frame(
+            direction="TX",
+            raw=frame,
+            monotonic_ns=mono_ns,
+            pump_address=logical_address,
+            logical_address=logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=poll_seq,
+            timeout_ms=self.config.ack_timeout_ms,
+            classification=None,
+            crc_valid=None,
+            event=ContinuousBenchEvent.CD101_SENT,
+            notes=(
+                f"CD101_REQUEST_TOTALS address={logical_address} "
+                f"sequence={data_seq} counter_select="
+                f"{self.config.cd101_counter_select} "
+                f"(no RESET/AUTHORIZE/CD5)"
+            ),
+        )
+
+        matched, ack_outcome, observed = await wait_for_ack_frame(
+            self.transport,
+            expected_ack=expected_ack,
+            timeout_ms=self.config.ack_timeout_ms,
+        )
+        if matched:
+            self.stats.cd101_ack_match += 1
+        else:
+            self.stats.cd101_ack_timeout += 1
+        writer.emit_event(
+            ContinuousBenchEvent.CD101_ACK,
+            monotonic_ns=time.monotonic_ns(),
+            pump_address=logical_address,
+            logical_address=logical_address,
+            wire_address=self.wire_address,
+            poll_sequence=poll_seq,
+            notes=f"ack={ack_outcome}; observed={observed[:3]}",
+        )
+        self._data_sequence[logical_address] = next_sequence_nibble(data_seq)
         return False, tx_mono
 
     async def _wait_quiet_gap(

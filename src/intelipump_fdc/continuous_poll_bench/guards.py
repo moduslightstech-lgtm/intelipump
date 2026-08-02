@@ -38,6 +38,7 @@ __all__ = [
     "REAL_WAYNE_MAX_DURATION_S",
     "REAL_WAYNE_MAX_WRITES",
     "REAL_WAYNE_MIN_POLL_INTERVAL_MS",
+    "REAL_WAYNE_OWNED_LAB_FAST_POLL_MIN_INTERVAL_MS",
     "SIMULATOR_EXTENDED_MAX_DURATION_S",
     "SIMULATOR_MAX_DURATION_S",
     "ContinuousPollBenchParams",
@@ -52,13 +53,16 @@ __all__ = [
 REAL_WAYNE_MAX_DURATION_S = 5
 SIMULATOR_MAX_DURATION_S = 30
 REAL_WAYNE_MAX_WRITES = 50
-# Extended POLL-only / POLL+RS watch (requires --confirm-extended-watch).
+# Extended POLL-only / POLL+RS / POLL+CD101 watch (requires --confirm-extended-watch).
 # Still bounded; Ctrl+C / SIGTERM stops early. Not a daemon / indefinite mode.
 REAL_WAYNE_EXTENDED_MAX_DURATION_S = 300
 SIMULATOR_EXTENDED_MAX_DURATION_S = 300
 # Allows ~5 min @ 300 ms with RETURN_STATUS every 2 polls (~1500 TX).
 REAL_WAYNE_EXTENDED_MAX_WRITES = 2000
+# Default real-Wayne floor (production-safe lab default).
 REAL_WAYNE_MIN_POLL_INTERVAL_MS = 300
+# Owned-lab only: unlock with --confirm-owned-lab-fast-poll-100ms.
+REAL_WAYNE_OWNED_LAB_FAST_POLL_MIN_INTERVAL_MS = 100
 REAL_WAYNE_DEFAULT_RESPONSE_TIMEOUT_MS = 250
 MALFORMED_THRESHOLD = 3
 
@@ -69,15 +73,24 @@ def estimate_continuous_write_count(
     poll_interval_ms: int,
     return_status_cadence: bool,
     return_status_every_n_polls: int = 2,
+    cd101_cadence: bool = False,
+    cd101_every_n_polls: int = 4,
 ) -> int:
-    """Approximate TX count: polls + optional RETURN_STATUS every N polls."""
+    """Approximate TX count: polls + optional RS / CD101 cadences.
+
+    Conflict slots (both due) count both (slight overestimate); runtime
+    defers CD101 when RETURN_STATUS wins the same slot.
+    """
     duration_ms = duration_seconds * 1000.0
     polls = int((duration_ms - 1e-9) // poll_interval_ms) + 1
-    if not return_status_cadence:
-        return polls
-    every_n = max(1, int(return_status_every_n_polls))
-    return_status = (polls + every_n - 1) // every_n
-    return polls + return_status
+    extras = 0
+    if return_status_cadence:
+        every_n = max(1, int(return_status_every_n_polls))
+        extras += (polls + every_n - 1) // every_n
+    if cd101_cadence:
+        every_m = max(1, int(cd101_every_n_polls))
+        extras += (polls + every_m - 1) // every_m
+    return polls + extras
 
 
 class ContinuousPollRefusedError(PollBenchRefusedError):
@@ -98,9 +111,13 @@ class ContinuousPollConfirmations:
     extended_watch: bool = False
     # Run until SIGINT/SIGTERM (no wall-clock duration stop).
     until_ctrl_c: bool = False
-    # Option 2: interleave gated CD1 RETURN_STATUS (no RESET/AUTHORIZE).
+    # Option 2: interleave gated CD1 RETURN_STATUS (no RESET/AUTHORIZE/CD5).
     return_status_cadence: bool = False
+    # Option 3: interleave gated CD101 request-totals (no RESET/AUTHORIZE/CD5).
+    cd101_cadence: bool = False
     no_reset_no_authorize: bool = False
+    # Owned-lab only: allow real-Wayne poll-interval-ms down to 100.
+    owned_lab_fast_poll_100ms: bool = False
 
     def missing_flags(self) -> list[str]:
         missing: list[str] = []
@@ -118,7 +135,8 @@ class ContinuousPollConfirmations:
             pass  # --confirm-until-ctrl-c already set on this object
         elif not self.bounded_duration:
             missing.append("--confirm-bounded-duration")
-        if self.return_status_cadence:
+        active_cadence = self.return_status_cadence or self.cd101_cadence
+        if active_cadence:
             if not self.no_reset_no_authorize:
                 missing.append("--confirm-no-reset-no-authorize")
         elif not self.status_poll_only:
@@ -145,6 +163,8 @@ class ContinuousPollBenchParams:
     return_status_every_n_polls: int = 2
     return_status_sequence: int = 0
     ack_timeout_ms: int = 200
+    cd101_every_n_polls: int = 4
+    cd101_counter_select: int = 1
 
     @property
     def address(self) -> int:
@@ -166,6 +186,10 @@ class ContinuousPollBenchParams:
     @property
     def return_status_cadence(self) -> bool:
         return self.confirmations.return_status_cadence
+
+    @property
+    def cd101_cadence(self) -> bool:
+        return self.confirmations.cd101_cadence
 
     @property
     def max_duration_s(self) -> int:
@@ -194,6 +218,8 @@ class ContinuousPollBenchParams:
             poll_interval_ms=self.poll_interval_ms,
             return_status_cadence=self.return_status_cadence,
             return_status_every_n_polls=self.return_status_every_n_polls,
+            cd101_cadence=self.cd101_cadence,
+            cd101_every_n_polls=self.cd101_every_n_polls,
         ) + 2
         if self.simulator_validation:
             cap = (
@@ -303,7 +329,11 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
                 f"({'simulator' if params.simulator_validation else 'real-Wayne'} "
                 f"short path); got {params.duration_seconds}. "
                 f"For a longer POLL-only watch (max "
-                f"{REAL_WAYNE_EXTENDED_MAX_DURATION_S if not params.simulator_validation else SIMULATOR_EXTENDED_MAX_DURATION_S}s, "
+                f"{(
+                    SIMULATOR_EXTENDED_MAX_DURATION_S
+                    if params.simulator_validation
+                    else REAL_WAYNE_EXTENDED_MAX_DURATION_S
+                )}s, "
                 f"Ctrl+C to stop early), pass --confirm-extended-watch. "
                 f"For continuous until Ctrl+C, pass --confirm-until-ctrl-c.",
                 reason="duration_exceeded",
@@ -334,55 +364,90 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
         raise ContinuousPollRefusedError(
             f"baud must be 9600 or 19200, got {params.baud}", reason="bad_baud"
         )
-    if (
+    active_cadence = (
         params.confirmations.return_status_cadence
-        and params.confirmations.status_poll_only
-    ):
+        or params.confirmations.cd101_cadence
+    )
+    if active_cadence and params.confirmations.status_poll_only:
         raise ContinuousPollRefusedError(
             "cannot combine --confirm-status-poll-only with "
-            "--confirm-return-status-cadence; omit status-poll-only for "
-            "POLL+RETURN_STATUS watch",
+            "--confirm-return-status-cadence or --confirm-cd101-cadence; "
+            "omit status-poll-only for POLL+cadence watch",
             reason="conflicting_confirmations",
         )
-    if params.confirmations.return_status_cadence:
+    if active_cadence:
         if not (
             params.confirmations.extended_watch
             or params.confirmations.until_ctrl_c
         ):
             raise ContinuousPollRefusedError(
-                "return-status-cadence requires --confirm-extended-watch "
-                "or --confirm-until-ctrl-c",
-                reason="return_status_requires_extended",
-            )
-        if not (1 <= params.return_status_every_n_polls <= 20):
-            raise ContinuousPollRefusedError(
-                "return-status-every-n-polls must be 1-20",
-                reason="bad_return_status_every_n",
+                "return-status-cadence / cd101-cadence requires "
+                "--confirm-extended-watch or --confirm-until-ctrl-c",
+                reason="cadence_requires_extended",
             )
         if not (0 <= params.return_status_sequence <= 15):
             raise ContinuousPollRefusedError(
-                "sequence must be 0-15 (DATA sequence nibble)",
+                "sequence must be 0-15 (shared DATA sequence nibble for "
+                "RETURN_STATUS and/or CD101)",
                 reason="bad_sequence",
             )
         if not (50 <= params.ack_timeout_ms < params.poll_interval_ms):
             raise ContinuousPollRefusedError(
-                "ack-timeout-ms must be >= 50 and < poll-interval-ms",
+                "ack-timeout-ms must be >= 50 and < poll-interval-ms "
+                "(example at 100 ms poll: ack 70, response 80)",
                 reason="bad_ack_timeout",
             )
+    if params.confirmations.return_status_cadence and not (
+        1 <= params.return_status_every_n_polls <= 20
+    ):
+        raise ContinuousPollRefusedError(
+            "return-status-every-n-polls must be 1-20",
+            reason="bad_return_status_every_n",
+        )
+    if params.confirmations.cd101_cadence and not (
+        1 <= params.cd101_every_n_polls <= 20
+    ):
+        raise ContinuousPollRefusedError(
+            "cd101-every-n-polls must be 1-20",
+            reason="bad_cd101_every_n",
+        )
+    if params.confirmations.cd101_cadence and not (
+        0 <= params.cd101_counter_select <= 0xFF
+    ):
+        raise ContinuousPollRefusedError(
+            "cd101-counter-select must be 0-255 (ePump-like default 1)",
+            reason="bad_cd101_counter_select",
+        )
     if not params.simulator_validation:
-        if params.poll_interval_ms < REAL_WAYNE_MIN_POLL_INTERVAL_MS:
+        if params.confirmations.owned_lab_fast_poll_100ms:
+            min_interval = REAL_WAYNE_OWNED_LAB_FAST_POLL_MIN_INTERVAL_MS
+            interval_hint = (
+                f">= {min_interval} with "
+                f"--confirm-owned-lab-fast-poll-100ms"
+            )
+        else:
+            min_interval = REAL_WAYNE_MIN_POLL_INTERVAL_MS
+            interval_hint = (
+                f">= {min_interval} (or pass "
+                f"--confirm-owned-lab-fast-poll-100ms for owned-lab "
+                f"fast path down to "
+                f"{REAL_WAYNE_OWNED_LAB_FAST_POLL_MIN_INTERVAL_MS} ms)"
+            )
+        if params.poll_interval_ms < min_interval:
             raise ContinuousPollRefusedError(
-                f"real-Wayne poll-interval-ms must be >= "
-                f"{REAL_WAYNE_MIN_POLL_INTERVAL_MS} (got {params.poll_interval_ms})",
+                f"real-Wayne poll-interval-ms must be {interval_hint} "
+                f"(got {params.poll_interval_ms})",
                 reason="real_wayne_poll_interval",
             )
         if not params.until_ctrl_c:
-            # Real-Wayne: hard-cap computed writes (polls + optional RETURN_STATUS).
+            # Real-Wayne: hard-cap computed writes (polls + optional cadences).
             approx = estimate_continuous_write_count(
                 duration_seconds=params.duration_seconds,
                 poll_interval_ms=params.poll_interval_ms,
                 return_status_cadence=params.return_status_cadence,
                 return_status_every_n_polls=params.return_status_every_n_polls,
+                cd101_cadence=params.cd101_cadence,
+                cd101_every_n_polls=params.cd101_every_n_polls,
             )
             write_cap = (
                 REAL_WAYNE_EXTENDED_MAX_WRITES
@@ -393,7 +458,7 @@ def validate_continuous_params(params: ContinuousPollBenchParams) -> None:
                 raise ContinuousPollRefusedError(
                     f"computed write count {approx} exceeds real-Wayne max "
                     f"{write_cap}; reduce duration, increase interval, "
-                    f"raise return-status-every-n-polls, or use "
+                    f"raise cadence every-n, or use "
                     f"--confirm-until-ctrl-c",
                     reason="max_writes_exceeded",
                 )

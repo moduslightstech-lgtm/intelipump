@@ -24,6 +24,8 @@ from intelipump_fdc.continuous_poll_bench.guards import (
     REAL_WAYNE_EXTENDED_MAX_WRITES,
     REAL_WAYNE_MAX_DURATION_S,
     REAL_WAYNE_MAX_WRITES,
+    REAL_WAYNE_MIN_POLL_INTERVAL_MS,
+    REAL_WAYNE_OWNED_LAB_FAST_POLL_MIN_INTERVAL_MS,
     ContinuousPollBenchParams,
     ContinuousPollConfirmations,
     ContinuousPollRefusedError,
@@ -144,7 +146,9 @@ class FakeBenchTransport:
     _active_writes_remaining: int = 0
     _approved_kind: object | None = None
     cd1_return_status_write_count: int = 0
+    cd101_write_count: int = 0
     auto_ack_return_status: bool = True
+    auto_ack_cd101: bool = True
 
     @property
     def is_open(self) -> bool:
@@ -189,8 +193,13 @@ class FakeBenchTransport:
         classified = classify_active_data_frame(frame)
         if classified is None or classified is not kind:
             raise AssertionError(f"bad authorize kind {kind} vs {classified}")
-        if kind is not ActiveFrameKind.CD1_RETURN_STATUS:
-            raise AssertionError("tests only allow CD1_RETURN_STATUS")
+        if kind not in {
+            ActiveFrameKind.CD1_RETURN_STATUS,
+            ActiveFrameKind.CD101_REQUEST_TOTALS,
+        }:
+            raise AssertionError(
+                "tests only allow CD1_RETURN_STATUS or CD101_REQUEST_TOTALS"
+            )
         self._approved_active_frame = bytes(frame)
         self._active_writes_remaining = 1
         self._approved_kind = kind
@@ -212,6 +221,7 @@ class FakeBenchTransport:
             and data == self._approved_active_frame
             and self._active_writes_remaining > 0
         )
+        approved_kind = self._approved_kind
         if (
             self.disconnect_after_writes is not None
             and self.write_count >= self.disconnect_after_writes
@@ -223,10 +233,23 @@ class FakeBenchTransport:
         self.written.append(data)
         if is_active:
             self._active_writes_remaining -= 1
-            self.cd1_return_status_write_count += 1
+            if approved_kind is ActiveFrameKind.CD1_RETURN_STATUS:
+                self.cd1_return_status_write_count += 1
+            elif approved_kind is ActiveFrameKind.CD101_REQUEST_TOTALS:
+                self.cd101_write_count += 1
             self._approved_active_frame = None
             self._approved_kind = None
-            if self.auto_ack_return_status and len(data) >= 2:
+            auto_ack = (
+                (
+                    approved_kind is ActiveFrameKind.CD1_RETURN_STATUS
+                    and self.auto_ack_return_status
+                )
+                or (
+                    approved_kind is ActiveFrameKind.CD101_REQUEST_TOTALS
+                    and self.auto_ack_cd101
+                )
+            )
+            if auto_ack and len(data) >= 2:
                 # ACK uses same sequence nibble as DATA control byte low nibble.
                 seq = data[1] & 0x0F
                 self.chunks.append(build_ack(data[0], seq))
@@ -524,7 +547,9 @@ def test_parser_exposes_confirm_extended_watch() -> None:
 def test_return_status_cadence_requires_extended_and_no_reset(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(ContinuousPollRefusedError, match="extended-watch|until-ctrl-c"):
+    with pytest.raises(
+        ContinuousPollRefusedError, match=r"extended-watch|until-ctrl-c"
+    ):
         validate_continuous_params(
             _params(
                 tmp_path,
@@ -613,6 +638,44 @@ def test_return_status_conflicts_with_status_poll_only(tmp_path: Path) -> None:
         )
 
 
+def test_cd101_conflicts_with_status_poll_only(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="status-poll-only"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=60,
+                poll_interval_ms=100,
+                response_timeout_ms=50,
+                simulator_validation=True,
+                confirmations=_confirms(
+                    status_poll_only=True,
+                    extended_watch=True,
+                    cd101_cadence=True,
+                    no_reset_no_authorize=True,
+                ),
+            )
+        )
+
+
+def test_cd101_cadence_requires_no_reset(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="no-reset-no-authorize"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=60,
+                poll_interval_ms=100,
+                response_timeout_ms=50,
+                simulator_validation=True,
+                confirmations=_confirms(
+                    status_poll_only=False,
+                    extended_watch=True,
+                    cd101_cadence=True,
+                    no_reset_no_authorize=False,
+                ),
+            )
+        )
+
+
 def test_return_status_cadence_params_ok(tmp_path: Path) -> None:
     validate_continuous_params(
         _params(
@@ -628,6 +691,30 @@ def test_return_status_cadence_params_ok(tmp_path: Path) -> None:
                 status_poll_only=False,
                 extended_watch=True,
                 return_status_cadence=True,
+                no_reset_no_authorize=True,
+            ),
+        )
+    )
+
+
+def test_cd101_and_rs_cadence_params_ok(tmp_path: Path) -> None:
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=60,
+            poll_interval_ms=100,
+            response_timeout_ms=50,
+            simulator_validation=True,
+            return_status_every_n_polls=2,
+            cd101_every_n_polls=4,
+            cd101_counter_select=1,
+            return_status_sequence=0,
+            ack_timeout_ms=50,
+            confirmations=_confirms(
+                status_poll_only=False,
+                extended_watch=True,
+                return_status_cadence=True,
+                cd101_cadence=True,
                 no_reset_no_authorize=True,
             ),
         )
@@ -652,6 +739,98 @@ def test_real_wayne_min_poll_interval_300ms(tmp_path: Path) -> None:
             poll_interval_ms=300,
             response_timeout_ms=250,
             simulator_validation=False,
+        )
+    )
+    assert REAL_WAYNE_MIN_POLL_INTERVAL_MS == 300
+    assert REAL_WAYNE_OWNED_LAB_FAST_POLL_MIN_INTERVAL_MS == 100
+
+
+def test_real_wayne_fast_poll_100ms_requires_confirm(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match=r"300|fast-poll"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=3,
+                poll_interval_ms=100,
+                response_timeout_ms=80,
+                simulator_validation=False,
+                confirmations=_confirms(),
+            )
+        )
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=3,
+            poll_interval_ms=100,
+            response_timeout_ms=80,
+            simulator_validation=False,
+            confirmations=_confirms(owned_lab_fast_poll_100ms=True),
+        )
+    )
+
+
+def test_real_wayne_fast_poll_rejects_below_100ms(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="100"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=3,
+                poll_interval_ms=99,
+                response_timeout_ms=50,
+                simulator_validation=False,
+                confirmations=_confirms(owned_lab_fast_poll_100ms=True),
+            )
+        )
+
+
+def test_fast_poll_timeout_ordering_enforced(tmp_path: Path) -> None:
+    with pytest.raises(ContinuousPollRefusedError, match="response-timeout-ms"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=3,
+                poll_interval_ms=100,
+                response_timeout_ms=100,
+                simulator_validation=False,
+                confirmations=_confirms(owned_lab_fast_poll_100ms=True),
+            )
+        )
+    with pytest.raises(ContinuousPollRefusedError, match="ack-timeout-ms"):
+        validate_continuous_params(
+            _params(
+                tmp_path,
+                duration_seconds=3,
+                poll_interval_ms=100,
+                response_timeout_ms=80,
+                ack_timeout_ms=100,
+                simulator_validation=False,
+                confirmations=_confirms(
+                    status_poll_only=False,
+                    bounded_duration=False,
+                    until_ctrl_c=True,
+                    owned_lab_fast_poll_100ms=True,
+                    return_status_cadence=True,
+                    no_reset_no_authorize=True,
+                ),
+            )
+        )
+    validate_continuous_params(
+        _params(
+            tmp_path,
+            duration_seconds=3,
+            poll_interval_ms=100,
+            response_timeout_ms=80,
+            ack_timeout_ms=70,
+            simulator_validation=False,
+            confirmations=_confirms(
+                status_poll_only=False,
+                bounded_duration=False,
+                until_ctrl_c=True,
+                owned_lab_fast_poll_100ms=True,
+                return_status_cadence=True,
+                cd101_cadence=True,
+                no_reset_no_authorize=True,
+            ),
         )
     )
 
@@ -1353,11 +1532,114 @@ async def test_return_status_cadence_sends_cd1_rs_not_reset(
     )
     assert not any(
         classify_active_data_frame(frame)
-        in {ActiveFrameKind.CD1_RESET, ActiveFrameKind.CD1_AUTHORIZE}
+        in {
+            ActiveFrameKind.CD1_RESET,
+            ActiveFrameKind.CD1_AUTHORIZE,
+            ActiveFrameKind.CD5_PRICE,
+        }
         for frame in transport.written
     )
     assert summary["authorizationObjectsCreated"] == 0
     assert summary["commandQueueCreated"] is False
+
+
+@pytest.mark.asyncio
+async def test_cd101_cadence_sends_cd101_not_reset_authorize_cd5(
+    tmp_path: Path,
+) -> None:
+    from intelipump_fdc.controller.price_safety import (
+        ActiveFrameKind,
+        classify_active_data_frame,
+    )
+    from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
+
+    transport = FakeBenchTransport()
+    session = _session(
+        transport,
+        tmp_path,
+        duration_seconds=1.0,
+        poll_interval_ms=100,
+        response_timeout_ms=40,
+        max_writes=50,
+        cd101_cadence=True,
+        cd101_every_n_polls=2,
+        cd101_counter_select=1,
+        return_status_sequence=0,
+        ack_timeout_ms=40,
+    )
+    summary = await session.run()
+    assert summary["cd101Cadence"] is True
+    assert _as_int(summary["cd101Sent"]) >= 1
+    assert _as_int(summary["cd101AckMatch"]) >= 1
+    assert transport.cd101_write_count >= 1
+    allowed = {None, ActiveFrameKind.CD101_REQUEST_TOTALS}
+    assert all(
+        frame == build_poll(1) or classify_active_data_frame(frame) in allowed
+        for frame in transport.written
+    )
+    forbidden = {
+        ActiveFrameKind.CD1_RESET,
+        ActiveFrameKind.CD1_AUTHORIZE,
+        ActiveFrameKind.CD5_PRICE,
+        ActiveFrameKind.CD2_AND_CD1_RESET,
+    }
+    assert not any(
+        classify_active_data_frame(frame) in forbidden for frame in transport.written
+    )
+
+
+@pytest.mark.asyncio
+async def test_rs_and_cd101_shared_sequence_and_conflict_deferral(
+    tmp_path: Path,
+) -> None:
+    """RS every 2 + CD101 every 4: conflict slots defer CD101; shared TX#."""
+    from intelipump_fdc.controller.price_safety import (
+        ActiveFrameKind,
+        classify_active_data_frame,
+    )
+    from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
+
+    transport = FakeBenchTransport()
+    session = _session(
+        transport,
+        tmp_path,
+        duration_seconds=1.2,
+        poll_interval_ms=100,
+        response_timeout_ms=40,
+        max_writes=80,
+        return_status_cadence=True,
+        return_status_every_n_polls=2,
+        cd101_cadence=True,
+        cd101_every_n_polls=4,
+        cd101_counter_select=1,
+        return_status_sequence=0,
+        ack_timeout_ms=40,
+    )
+    summary = await session.run()
+    assert _as_int(summary["returnStatusSent"]) >= 1
+    assert _as_int(summary["cd101Sent"]) >= 1
+    kinds: list[ActiveFrameKind | None] = []
+    seq_nibbles: list[int] = []
+    for frame in transport.written:
+        if frame == build_poll(1):
+            kinds.append(None)
+            continue
+        kind = classify_active_data_frame(frame)
+        kinds.append(kind)
+        seq_nibbles.append(frame[1] & 0x0F)
+    assert ActiveFrameKind.CD1_RETURN_STATUS in kinds
+    assert ActiveFrameKind.CD101_REQUEST_TOTALS in kinds
+    # Shared sequence: successive active DATA TX# advance by 1 (mod 16).
+    for prev, cur in pairwise(seq_nibbles):
+        assert cur == (prev + 1) & 0x0F
+    # On conflict (poll 4, 8, ...): RS then deferred CD101 on next free slot —
+    # never two active frames back-to-back without an intervening poll.
+    active_idxs = [i for i, k in enumerate(kinds) if k is not None]
+    for i in range(len(active_idxs) - 1):
+        a, b = active_idxs[i], active_idxs[i + 1]
+        assert b > a + 0  # distinct writes
+        # Between two actives there must be at least one POLL (kinds None).
+        assert any(kinds[j] is None for j in range(a + 1, b))
 
 
 @pytest.mark.asyncio

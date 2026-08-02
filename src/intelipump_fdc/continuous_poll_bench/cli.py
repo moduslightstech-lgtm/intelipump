@@ -37,7 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
             "CONTINUOUS_POLL_BENCH: bounded or until-Ctrl+C status polls on one "
             "RS-485 adapter. Pass --address once or twice (--address 1 "
             "--address 2) to round-robin both sides. Optional gated CD1 "
-            "RETURN_STATUS (no RESET/AUTHORIZE). Stop intelipump.service first."
+            "RETURN_STATUS and/or CD101 cadences (no RESET/AUTHORIZE/CD5). "
+            "Stop intelipump.service first."
         ),
     )
     parser.add_argument("--port", required=True)
@@ -66,15 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=300,
         help=(
-            "Monotonic poll interval (50-1000, default 300; "
-            "real-Wayne minimum 300)"
+            "Monotonic poll interval (50-1000, default 300; real-Wayne "
+            "minimum 300, or 100 with --confirm-owned-lab-fast-poll-100ms). "
+            "response-timeout-ms and ack-timeout-ms must stay < interval "
+            "(e.g. poll 100, response 80, ack 70)"
         ),
     )
     parser.add_argument(
         "--response-timeout-ms",
         type=int,
         default=250,
-        help="Must be < poll-interval-ms (default 250)",
+        help="Must be < poll-interval-ms (default 250; e.g. 80 at 100 ms poll)",
     )
     parser.add_argument(
         "--evidence-dir",
@@ -110,7 +113,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Confirm only verified build_poll status polls will be sent "
-            "(omit when using --confirm-return-status-cadence)"
+            "(omit when using --confirm-return-status-cadence or "
+            "--confirm-cd101-cadence)"
+        ),
+    )
+    parser.add_argument(
+        "--confirm-owned-lab-fast-poll-100ms",
+        action="store_true",
+        help=(
+            "Owned-lab only: allow real-Wayne --poll-interval-ms down to 100 "
+            "(default floor remains 300). Simulator path unchanged (50-1000). "
+            "Not a production default."
         ),
     )
     parser.add_argument(
@@ -146,15 +159,27 @@ def build_parser() -> argparse.ArgumentParser:
             "Interleave gated CD1 RETURN_STATUS with L2 POLL (ePump-like). "
             "Requires --confirm-extended-watch or --confirm-until-ctrl-c, and "
             "--confirm-no-reset-no-authorize. Do not pass --confirm-status-poll-only. "
-            "Never sends RESET/AUTHORIZE."
+            "Combinable with --confirm-cd101-cadence. Never sends RESET/AUTHORIZE/CD5."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-cd101-cadence",
+        action="store_true",
+        help=(
+            "Interleave gated CD101 request-totals with L2 POLL (ePump-like mix). "
+            "Requires --confirm-extended-watch or --confirm-until-ctrl-c, and "
+            "--confirm-no-reset-no-authorize. Combinable with RETURN_STATUS cadence "
+            "(shared per-address L2 sequence; on conflict RS wins, CD101 deferred). "
+            "Never sends RESET/AUTHORIZE/CD5. CD5 remains a separate single-shot tool."
         ),
     )
     parser.add_argument(
         "--confirm-no-reset-no-authorize",
         action="store_true",
         help=(
-            "Confirm this session will not transmit CD1 RESET or AUTHORIZE "
-            "(required with --confirm-return-status-cadence)"
+            "Confirm this session will not transmit CD1 RESET, AUTHORIZE, or CD5 "
+            "(required with --confirm-return-status-cadence or "
+            "--confirm-cd101-cadence)"
         ),
     )
     parser.add_argument(
@@ -167,12 +192,31 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cd101-every-n-polls",
+        type=int,
+        default=4,
+        help=(
+            "After every N status polls, send one gated CD101 "
+            "(default 4; only with --confirm-cd101-cadence)"
+        ),
+    )
+    parser.add_argument(
+        "--cd101-counter-select",
+        type=int,
+        default=1,
+        help=(
+            "CD101 counter select byte (default 1, ePump-like; "
+            "only with --confirm-cd101-cadence)"
+        ),
+    )
+    parser.add_argument(
         "--sequence",
         type=int,
         default=0,
         help=(
-            "Starting DATA sequence nibble for RETURN_STATUS (0-15; "
-            "increments each RS). Only with --confirm-return-status-cadence"
+            "Starting DATA sequence nibble shared by RETURN_STATUS and CD101 "
+            "(0-15; advances for each active DATA TX per address). "
+            "Only with cadence flags"
         ),
     )
     parser.add_argument(
@@ -180,8 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=200,
         help=(
-            "ACK wait after each RETURN_STATUS (default 200; must be < "
-            "poll-interval-ms). Only with --confirm-return-status-cadence"
+            "ACK wait after each RETURN_STATUS or CD101 (default 200; must be < "
+            "poll-interval-ms; e.g. 70 at 100 ms poll). Only with cadence flags"
         ),
     )
     parser.add_argument(
@@ -246,7 +290,9 @@ async def _async_main(args: argparse.Namespace) -> int:
             extended_watch=args.confirm_extended_watch,
             until_ctrl_c=args.confirm_until_ctrl_c,
             return_status_cadence=args.confirm_return_status_cadence,
+            cd101_cadence=args.confirm_cd101_cadence,
             no_reset_no_authorize=args.confirm_no_reset_no_authorize,
+            owned_lab_fast_poll_100ms=args.confirm_owned_lab_fast_poll_100ms,
         ),
         controller_service=args.controller_service,
         lock_dir=Path(args.lock_dir),
@@ -257,6 +303,8 @@ async def _async_main(args: argparse.Namespace) -> int:
         return_status_every_n_polls=int(args.return_status_every_n_polls),
         return_status_sequence=int(args.sequence),
         ack_timeout_ms=int(args.ack_timeout_ms),
+        cd101_every_n_polls=int(args.cd101_every_n_polls),
+        cd101_counter_select=int(args.cd101_counter_select),
     )
 
     app_lock = None
@@ -300,6 +348,9 @@ async def _async_main(args: argparse.Namespace) -> int:
             return_status_sequence=params.return_status_sequence,
             ack_timeout_ms=params.ack_timeout_ms,
             until_ctrl_c=params.until_ctrl_c,
+            cd101_cadence=params.cd101_cadence,
+            cd101_every_n_polls=params.cd101_every_n_polls,
+            cd101_counter_select=params.cd101_counter_select,
         ),
     )
 

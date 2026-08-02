@@ -41,6 +41,8 @@ class ContinuousBenchEvent(StrEnum):
     QUIET_GAP_WAIT = "quiet_gap_wait"
     RETURN_STATUS_SENT = "return_status_sent"
     RETURN_STATUS_ACK = "return_status_ack"
+    CD101_SENT = "cd101_sent"
+    CD101_ACK = "cd101_ack"
     BENCH_STOPPED = "bench_stopped"
     SAFETY_REFUSED = "safety_refused"
 
@@ -126,6 +128,9 @@ class ContinuousSessionStats:
     return_status_sent: int = 0
     return_status_ack_match: int = 0
     return_status_ack_timeout: int = 0
+    cd101_sent: int = 0
+    cd101_ack_match: int = 0
+    cd101_ack_timeout: int = 0
     latencies_ms: list[float] = field(default_factory=list)
     schedule_lags_ms: list[float] = field(default_factory=list)
     last_tx_hex: str | None = None
@@ -360,6 +365,9 @@ def write_markdown_summary(
         f"- RETURN_STATUS sent / ACK match / ACK timeout: "
         f"`{stats.return_status_sent}` / `{stats.return_status_ack_match}` / "
         f"`{stats.return_status_ack_timeout}`",
+        f"- CD101 sent / ACK match / ACK timeout: "
+        f"`{stats.cd101_sent}` / `{stats.cd101_ack_match}` / "
+        f"`{stats.cd101_ack_timeout}`",
         (
             f"- Protocol frames received (validResponses alias): "
             f"`{stats.protocol_frames_received}`"

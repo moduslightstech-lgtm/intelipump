@@ -23,7 +23,9 @@ preserved, but the cycle continues within the bounded response window until a
 `validResponses` is an alias of `protocolFramesReceived` (any recognized frame).
 
 This is **not** production polling. No authorization, transactions, presets,
-price changes, resets, MQTT commands, or daemon mode.
+price changes (CD5), resets, MQTT commands, or daemon mode. Continuous mix is
+**POLL + optional RETURN_STATUS + optional CD101 only**; CD5 remains a
+separate single-shot tool (`intelipump-real-wayne-*`).
 
 ## Environment
 
@@ -80,17 +82,21 @@ Results:
 | Limit | Real Wayne (short) | Real Wayne (`--confirm-extended-watch`) | Simulator short | Simulator extended |
 | --- | --- | --- | --- | --- |
 | Duration | 1–5 s (default 3) | 1–300 s | 1–30 s | 1–300 s |
-| Poll interval | 300–1000 ms (default 300) | same | 50–1000 ms | same |
-| Response timeout | default 250 ms; must be &lt; interval | same | same | same |
+| Poll interval | 300–1000 ms (default 300); **100–1000** with `--confirm-owned-lab-fast-poll-100ms` | same | 50–1000 ms | same |
+| Response timeout | default 250 ms; must be &lt; interval (e.g. 80 at 100 ms poll) | same | same | same |
+| ACK timeout | with cadence: ≥50 and &lt; interval (e.g. 70 at 100 ms poll) | same | same | same |
 | Max writes | 50 | derived, cap 2000 | derived (cap 600) | derived (cap 2000) |
-| Addresses | exactly one | exactly one | exactly one | exactly one |
+| Addresses | 1 or 2 (round-robin) | same | same | same |
 
 Scheduler is monotonic: missed deadlines skip forward (`schedule_lag_ms`);
 never catch up with back-to-back polls. Timeouts do not extend duration.
 SIGINT / SIGTERM stops cleanly (`stopReason=operator_interrupt`).
 
-Still **no RESET / AUTHORIZE / price / daemon** in any path. Option 2 may
-send gated CD1 RETURN_STATUS only when explicitly confirmed.
+Still **no RESET / AUTHORIZE / CD5 / daemon** in any path. Cadence options may
+send gated CD1 RETURN_STATUS and/or CD101 only when explicitly confirmed.
+RS and CD101 share one per-address L2 DATA sequence nibble (`--sequence`);
+when both are due on the same poll slot, RETURN_STATUS wins and CD101 is
+deferred to the next free slot.
 
 ## Extended POLL-only watch (lab)
 
@@ -174,6 +180,60 @@ uv run intelipump-continuous-poll-bench \
   --confirm-authorization-disabled \
   --confirm-until-ctrl-c \
   --confirm-return-status-cadence \
+  --confirm-no-reset-no-authorize
+```
+
+### Owned-lab fast poll (100 ms)
+
+Real Wayne refuses `< 300` ms unless `--confirm-owned-lab-fast-poll-100ms`
+is set (floor then 100 ms). Keep `response-timeout-ms` and `ack-timeout-ms`
+strictly below the interval.
+
+Dual poll until Ctrl+C at 100 ms:
+
+```bash
+uv run intelipump-continuous-poll-bench \
+  --port /dev/intelipump-controller \
+  --address 1 \
+  --address 2 \
+  --poll-interval-ms 100 \
+  --response-timeout-ms 80 \
+  --evidence-dir data/bench/continuous-poll \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-emergency-isolation-ready \
+  --confirm-no-fuel-test \
+  --confirm-authorization-disabled \
+  --confirm-status-poll-only \
+  --confirm-until-ctrl-c \
+  --confirm-owned-lab-fast-poll-100ms
+```
+
+Dual poll at 100 ms with RETURN_STATUS + CD101 cadence (ePump-like mix;
+still no RESET/AUTHORIZE/CD5):
+
+```bash
+uv run intelipump-continuous-poll-bench \
+  --port /dev/intelipump-controller \
+  --address 1 \
+  --address 2 \
+  --poll-interval-ms 100 \
+  --response-timeout-ms 80 \
+  --ack-timeout-ms 70 \
+  --return-status-every-n-polls 2 \
+  --cd101-every-n-polls 4 \
+  --cd101-counter-select 1 \
+  --sequence 0 \
+  --evidence-dir data/bench/continuous-poll \
+  --confirm-owned-lab-pump \
+  --confirm-technician-present \
+  --confirm-emergency-isolation-ready \
+  --confirm-no-fuel-test \
+  --confirm-authorization-disabled \
+  --confirm-until-ctrl-c \
+  --confirm-owned-lab-fast-poll-100ms \
+  --confirm-return-status-cadence \
+  --confirm-cd101-cadence \
   --confirm-no-reset-no-authorize
 ```
 

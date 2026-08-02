@@ -51,10 +51,11 @@ Does not start Phase 11D–11H.
 
 ## Continuous poll bench (CONTINUOUS_POLL_BENCH)
 Bounded status-only polling via `intelipump-continuous-poll-bench`
-(one address; real-Wayne short max 5s / 50 writes; optional extended
-watch max 300s with `--confirm-extended-watch`, Ctrl+C stop; optional
-gated CD1 RETURN_STATUS cadence with `--confirm-return-status-cadence`,
-still no RESET/AUTHORIZE). See `docs/continuous-poll-bench.md`.
+(one or two addresses; real-Wayne short max 5s / 50 writes; optional
+extended watch max 300s with `--confirm-extended-watch`, Ctrl+C stop;
+optional gated CD1 RETURN_STATUS and/or CD101 cadences; owned-lab fast
+poll 100 ms behind `--confirm-owned-lab-fast-poll-100ms`; still no
+RESET/AUTHORIZE/CD5 in the stream). See `docs/continuous-poll-bench.md`.
 Not production polling. Does not start Phase 11D–11H.
 
 ## Real-Wayne CD101 request (lab, gated)
