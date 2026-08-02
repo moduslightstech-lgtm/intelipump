@@ -1,0 +1,24 @@
+{
+  "serial": {
+    "port": "/dev/ttyUSB0",
+    "baudrate": 9600,
+    "parity": "ODD",
+    "bytesize": 8,
+    "stopbits": 1,
+    "read_timeout_sec": 0.05,
+    "quiet_gap_timeout_sec": 0.015,
+    "tx_delay_sec": 0.035,
+    "ack_delay_sec": 0.005
+  },
+  "controller": {
+    "pumps": ["0x50", "0x51"],
+    "poll_interval_sec": 0.04,
+    "max_retries": 3,
+    "price_format": "RAW_BCD_DIGITS",
+    "default_prices": [120],
+    "currency_symbol": "NGN",
+    "offline_missed_poll_threshold": 5,
+    "configured_nozzles_per_pump": 4,
+    "auto_startup_commands": false
+  }
+}

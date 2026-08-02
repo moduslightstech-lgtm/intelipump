@@ -69,3 +69,7 @@ Create virtual serial ports:
 ```
 
 See `docs/development/implementation-plan.md`.
+
+
+scp -r intelipump@100.84.152.50:/home/intelipump/intelipump/intelipump-fdc/tools/passive_dart_capture/reports/lab-002-* \
+  /Users/babatundealaraje/Documents/moduslights/intelipump-fdc/tools/passive_dart_capture/reports
