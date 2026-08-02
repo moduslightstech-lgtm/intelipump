@@ -12,8 +12,11 @@ class SaleLifecycle:
     ABORTED = "ABORTED"
     CLOSED = "CLOSED"
 
+
+# Legal lifecycle state transition matrix based on Wayne DART Rev 2.11 Spec (Page 5)
 LEGAL_LIFECYCLE_TRANSITIONS = {
-    SaleLifecycle.IDLE: [SaleLifecycle.NOZZLE_LIFTED, SaleLifecycle.ABORTED],
+    # IDLE allows transition to COMPLETED for power-on sync / uncleared sale / STOP command
+    SaleLifecycle.IDLE: [SaleLifecycle.NOZZLE_LIFTED, SaleLifecycle.COMPLETED, SaleLifecycle.ABORTED],
     SaleLifecycle.NOZZLE_LIFTED: [SaleLifecycle.AUTHORIZED, SaleLifecycle.NOZZLE_RETURNED, SaleLifecycle.ABORTED, SaleLifecycle.IDLE],
     SaleLifecycle.AUTHORIZED: [SaleLifecycle.FILLING, SaleLifecycle.NOZZLE_RETURNED, SaleLifecycle.ABORTED, SaleLifecycle.IDLE],
     SaleLifecycle.FILLING: [SaleLifecycle.COMPLETED, SaleLifecycle.NOZZLE_RETURNED, SaleLifecycle.ABORTED],
@@ -22,6 +25,7 @@ LEGAL_LIFECYCLE_TRANSITIONS = {
     SaleLifecycle.ABORTED: [SaleLifecycle.IDLE],
     SaleLifecycle.CLOSED: [SaleLifecycle.IDLE]
 }
+
 
 class PumpState:
     """Isolated, edge-deduplicated state container for a single pump address."""
@@ -33,7 +37,7 @@ class PumpState:
         self.consecutive_missed_polls = 0
         
         self.observed_status = "UNKNOWN"
-        self.nozzle_position = "UNKNOWN"
+        self.nozzle_position = "UNKNOWN"  # Starts UNKNOWN to prevent spurious startup events
         self.logical_nozzle = 1
         self.unit_price = 0.0
         self.filled_volume = 0.0
@@ -44,9 +48,10 @@ class PumpState:
         self.sale_completion_latch = False
         self.authorization_pending = False
         
+        # Central event queue per address
         self.event_queue = queue.Queue()
 
-        # Strict Monotonic Timestamps for State Correlation
+        # Independent Monotonic Observation Timestamps
         self.last_status_time = 0.0
         self.last_nozzle_time = 0.0
         self.last_valid_frame_time = 0.0
@@ -57,9 +62,11 @@ class PumpState:
         return self.seq_num
 
     def advance_seq_ctrl(self):
+        """Advances sequence control number (0x30 -> 0x31 -> ... -> 0x3F) after matching ACK."""
         self.seq_num = 0x30 + ((self.seq_num - 0x30 + 1) % 16)
 
     def transition_lifecycle(self, target_state: str) -> bool:
+        """Validates and executes lifecycle state transition."""
         if target_state == self.sale_lifecycle:
             return True
             
@@ -73,6 +80,7 @@ class PumpState:
             return False
 
     def update_nozzle(self, new_pos: str, nozzle_num: int, obs_time: float) -> bool:
+        """Returns True ONLY on validated edge transition (e.g. IN -> OUT)."""
         self.last_nozzle_time = obs_time
         self.last_valid_frame_time = obs_time
 
@@ -87,7 +95,7 @@ class PumpState:
             
             if new_pos == "OUT":
                 self.transition_lifecycle(SaleLifecycle.NOZZLE_LIFTED)
-                self.sale_completion_latch = False
+                self.sale_completion_latch = False  # Unlatch only on new sale start
             elif new_pos == "IN":
                 if self.sale_lifecycle == SaleLifecycle.COMPLETED:
                     self.transition_lifecycle(SaleLifecycle.NOZZLE_RETURNED)
@@ -98,21 +106,29 @@ class PumpState:
         return False
 
     def update_status(self, new_status: str, obs_time: float) -> bool:
-        self.last_status_time = obs_time
-        self.last_valid_frame_time = obs_time
+            self.last_status_time = obs_time
+            self.last_valid_frame_time = obs_time
 
-        if self.observed_status != new_status:
-            self.observed_status = new_status
-            
-            if new_status == "FILLING_COMPLETED":
-                self.transition_lifecycle(SaleLifecycle.COMPLETED)
-            elif new_status == "FILLING":
-                self.transition_lifecycle(SaleLifecycle.FILLING)
-            elif new_status == "AUTHORIZED":
-                self.transition_lifecycle(SaleLifecycle.AUTHORIZED)
-            elif new_status == "RESET":
-                if self.sale_lifecycle in [SaleLifecycle.NOZZLE_RETURNED, SaleLifecycle.ABORTED, SaleLifecycle.COMPLETED]:
-                    self.transition_lifecycle(SaleLifecycle.IDLE)
+            # --- FIX: Assume Nozzle is IN if pump resets and we don't know the nozzle state ---
+            if new_status == "RESET" and self.nozzle_position == "UNKNOWN":
+                self.nozzle_position = "IN"
+                self.logical_nozzle = 1
+
+            if self.observed_status != new_status:
+                self.observed_status = new_status
                 
-            return True
-        return False
+                if new_status == "FILLING_COMPLETED":
+                    if self.sale_lifecycle == SaleLifecycle.ABORTED:
+                        self.transition_lifecycle(SaleLifecycle.IDLE)
+                    else:
+                        self.transition_lifecycle(SaleLifecycle.COMPLETED)
+                elif new_status == "FILLING":
+                    self.transition_lifecycle(SaleLifecycle.FILLING)
+                elif new_status == "AUTHORIZED":
+                    self.transition_lifecycle(SaleLifecycle.AUTHORIZED)
+                elif new_status == "RESET":
+                    if self.sale_lifecycle in [SaleLifecycle.NOZZLE_RETURNED, SaleLifecycle.ABORTED, SaleLifecycle.COMPLETED]:
+                        self.transition_lifecycle(SaleLifecycle.IDLE)
+                    
+                return True
+            return False

@@ -91,7 +91,12 @@ class DARTSerialTransport:
         """Continuous stream accumulator and frame parser loop."""
         while self.running:
             try:
-                data = self.ser.read(64)
+                waiting = self.ser.in_waiting
+
+                if waiting > 0:
+                    data = self.ser.read(min(waiting, 64))
+                else:
+                    data = self.ser.read(1)
                 now = time.monotonic()
 
                 if data:

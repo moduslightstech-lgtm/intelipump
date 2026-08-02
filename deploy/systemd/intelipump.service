@@ -1,6 +1,6 @@
 [Unit]
-Description=InteliPump FDC controller (LISTEN_ONLY)
-Documentation=file:///opt/intelipump-fdc/docs/phase-11-deployment-hardening.md
+Description=InteliPump FDC Controller - LAB LISTEN_ONLY
+Documentation=file:///home/intelipump/intelipump/intelipump-fdc/docs/phase-11-deployment-hardening.md
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -9,32 +9,42 @@ StartLimitBurst=5
 [Service]
 Type=notify
 NotifyAccess=main
+
 User=intelipump
-Group=dialout
-WorkingDirectory=/opt/intelipump-fdc
+Group=intelipump
+SupplementaryGroups=dialout
+
+WorkingDirectory=/home/intelipump/intelipump/intelipump-fdc
 EnvironmentFile=-/etc/intelipump/intelipump.env
+
+Environment=PYTHONUNBUFFERED=1
 Environment=INTELIPUMP_ENVIRONMENT=LAB
 Environment=INTELIPUMP_CONTROLLER__MODE=LISTEN_ONLY
 Environment=INTELIPUMP_SAFETY__ACTIVE_COMMANDS_ENABLED=false
 Environment=INTELIPUMP_SAFETY__REMOTE_AUTHORIZATION_ENABLED=false
 Environment=INTELIPUMP_MQTT__ENABLED=false
 Environment=INTELIPUMP_WATCHDOG__ENABLED=true
-# Continuous run (omit --duration). SIGTERM triggers STOPPING=1 + flush.
-ExecStart=/opt/intelipump-fdc/venv/bin/intelipump-controller \
-  --port ${INTELIPUMP_DART__SERIAL_PORT:-/dev/intelipump-controller} \
-  --addresses ${INTELIPUMP_API__CONTROLLER_ADDRESSES:-1,2} \
+
+ExecStart=/home/intelipump/intelipump/intelipump-fdc/venv/bin/intelipump-controller \
+  --port /dev/intelipump-controller \
+  --addresses 1,2 \
   --baud 9600 \
-  --database-url ${INTELIPUMP_DATABASE__URL:-sqlite+aiosqlite:////var/lib/intelipump/intelipump.db}
+  --mode LISTEN_ONLY \
+  --response-timeout-ms 100 \
+  --database-url sqlite+aiosqlite:////var/lib/intelipump/intelipump.db \
+  --show-recovery-report
+
 WatchdogSec=30s
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 KillSignal=SIGTERM
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=intelipump
+
 NoNewPrivileges=true
-# Do not enable active control or field mode from this unit.
 
 [Install]
 WantedBy=multi-user.target

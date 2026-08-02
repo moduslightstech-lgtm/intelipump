@@ -18,12 +18,12 @@ class ExchangeResult(Enum):
     REJECTED = 4
 
 class WayneDartMaster:
-    """Master controller managing address queues, exchange correlation, and passive wire timing."""
+    """Master controller managing address queues, exchange correlation, and two-phase state confirmation."""
 
     def __init__(self, transport: DARTSerialTransport, max_retries: int = 3, 
                  price_format: str = "RAW_BCD_DIGITS", offline_threshold: int = 5,
                  currency_symbol: str = "NGN", configured_nozzles: int = 4,
-                 passive_monitoring_mode: bool = True):
+                 passive_monitoring_mode: bool = False):
         self.transport = transport
         self.max_retries = max_retries
         self.price_format = price_format
@@ -48,6 +48,7 @@ class WayneDartMaster:
         self.locks[addr_hex] = threading.Lock()
 
     def poll_pump(self, addr: int) -> List[Dict]:
+        """Executes full multi-frame poll exchange until EOT or deadline timeout."""
         if addr not in self.pumps or not self.transport.dispatcher:
             return []
 
@@ -65,11 +66,16 @@ class WayneDartMaster:
                 return []
 
             events = []
-            valid_data_response_seen = False
+            valid_bus_response_seen = False
+            deadline = poll_write_time + 0.12
 
             while time.monotonic() - poll_write_time < 0.12:  # Expanded response window for bench measuring
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
                 try:
-                    frame: Level2Frame = pump_queue.get(timeout=0.01)
+                    frame: Level2Frame = pump_queue.get(timeout=min(0.01, max(remaining, 0.001)))
 
                     if frame.first_byte_time < poll_write_time:
                         self.metrics["stale_frame_count"] += 1
@@ -77,18 +83,19 @@ class WayneDartMaster:
                         continue
 
                     if frame.is_short:
-                        if frame.control == 0x70:
+                        if frame.control == 0x70:  # EOT Turnaround = Pump Alive & Online
+                            valid_bus_response_seen = True
                             break
                         continue
 
                     # Log Passive Timing Delays for Field Calibration
                     t_first_byte = (frame.first_byte_time - poll_write_time) * 1000.0
                     t_last_byte = (frame.last_byte_time - poll_write_time) * 1000.0
-                    logging.debug(f"[PASSIVE TIMING {hex(addr)}] Poll Out -> First Byte: {t_first_byte:.2f}ms | Last Byte: {t_last_byte:.2f}ms")
+                    logging.info(f"[TIMING {hex(addr)}] Poll Out -> First Byte: {t_first_byte:.2f}ms | Last Byte: {t_last_byte:.2f}ms")
 
                     recognized_data_found = self._decode_and_process(pump, frame)
                     if recognized_data_found:
-                        valid_data_response_seen = True
+                        valid_bus_response_seen = True
                         
                         ack_ctrl = 0xC0 | (frame.control & 0x0F)
                         try:
@@ -101,9 +108,10 @@ class WayneDartMaster:
                             events.append(pump.event_queue.get())
 
                 except queue.Empty:
-                    break
+                    continue
 
-            if valid_data_response_seen:
+            # Offline / Synchronization Tracking
+            if valid_bus_response_seen:
                 pump.online = True
                 pump.consecutive_missed_polls = 0
             else:
