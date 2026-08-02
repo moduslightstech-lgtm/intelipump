@@ -13,9 +13,11 @@ import sys
 from pathlib import Path
 
 from tools.passive_dart_capture.analyzer import (
+    DIRECTION_AWARE_WINDOWS,
     DirectionAwareAnalysisResult,
     analyze_path,
     compare_sessions,
+    parse_window_spec,
     resolve_evidence_path,
 )
 from tools.passive_dart_capture.capture import run_capture
@@ -124,6 +126,17 @@ def build_parser() -> argparse.ArgumentParser:
             "<session>-direction-aware-* reports (does not replace legacy analyze)"
         ),
     )
+    an.add_argument(
+        "--window",
+        action="append",
+        default=None,
+        metavar="START-END",
+        help=(
+            "Inclusive frameSequence window for direction-aware reports "
+            "(repeatable). Default when omitted: lab-002 nozzle windows "
+            f"{', '.join(f'{a}-{b}' for a, b in DIRECTION_AWARE_WINDOWS)}"
+        ),
+    )
 
     cmp_ = sub.add_parser("compare", help="Compare two capture sessions")
     cmp_.add_argument("session_a", help="First session id")
@@ -208,11 +221,25 @@ def main(argv: list[str] | None = None) -> int:
         if not path.is_file():
             print(f"Evidence not found: {path}", file=sys.stderr)
             return 1
+        windows = None
+        if args.window:
+            try:
+                windows = tuple(parse_window_spec(w) for w in args.window)
+            except ValueError as exc:
+                print(f"Invalid --window: {exc}", file=sys.stderr)
+                return 1
+            if not args.direction_aware:
+                print(
+                    "--window requires --direction-aware",
+                    file=sys.stderr,
+                )
+                return 1
         result = analyze_path(
             path,
             reports_dir=args.reports_dir,
             session_id=args.session_id,
             direction_aware=bool(args.direction_aware),
+            windows=windows,
         )
         print(f"Analyzed session {result.session_id}")
         if isinstance(result, DirectionAwareAnalysisResult):

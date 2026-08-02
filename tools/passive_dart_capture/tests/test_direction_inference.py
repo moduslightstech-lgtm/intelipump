@@ -8,6 +8,7 @@ import pytest
 from tools.passive_dart_capture.analyzer import (
     analyze_path,
     load_session,
+    parse_window_spec,
 )
 from tools.passive_dart_capture.dart_parser import parse_data_payload
 from tools.passive_dart_capture.direction_inference import (
@@ -276,3 +277,12 @@ def test_lab002_ordered_dc3_on_frame_5999() -> None:
         if (t.get("decoded") or {}).get("kind") == "DC3"
     ]
     assert [t["decoded"]["nozioRawHex"] for t in dc3] == ["11", "01"]
+
+
+def test_parse_window_spec() -> None:
+    assert parse_window_spec("0-250") == (0, 250)
+    assert parse_window_spec("2560-2660") == (2560, 2660)
+    with pytest.raises(ValueError):
+        parse_window_spec("250")
+    with pytest.raises(ValueError):
+        parse_window_spec("10-5")

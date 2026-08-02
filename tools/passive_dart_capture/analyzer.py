@@ -25,12 +25,25 @@ from tools.passive_dart_capture.evidence_writer import (
 )
 
 # Focused lab windows for direction-aware reports (inclusive frameSequence).
+# Default matches lab-002 nozzle-cycle focus; override via analyze --window.
 DIRECTION_AWARE_WINDOWS: tuple[tuple[int, int], ...] = (
     (4070, 4140),
     (4900, 4980),
     (5490, 5570),
     (5960, 6030),
 )
+
+
+def parse_window_spec(spec: str) -> tuple[int, int]:
+    """Parse inclusive ``START-END`` frameSequence window (e.g. ``2560-2660``)."""
+    text = spec.strip()
+    if "-" not in text:
+        raise ValueError(f"window must be START-END, got {spec!r}")
+    left, right = text.split("-", 1)
+    start, end = int(left.strip()), int(right.strip())
+    if start < 0 or end < start:
+        raise ValueError(f"invalid window range {spec!r}")
+    return start, end
 
 
 @dataclass(slots=True)
@@ -259,10 +272,14 @@ def analyze_path(
     reports_dir: Path | None = None,
     session_id: str | None = None,
     direction_aware: bool = False,
+    windows: tuple[tuple[int, int], ...] | None = None,
 ) -> AnalysisResult | DirectionAwareAnalysisResult:
     session = load_session(evidence_path, session_id=session_id)
     if direction_aware:
-        return analyze_session_direction_aware(session, reports_dir=reports_dir)
+        kwargs: dict[str, Any] = {"reports_dir": reports_dir}
+        if windows is not None:
+            kwargs["windows"] = windows
+        return analyze_session_direction_aware(session, **kwargs)
     return analyze_session(session, reports_dir=reports_dir)
 
 
