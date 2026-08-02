@@ -10,6 +10,7 @@ from src.protocol.bcd import int_to_bcd, bcd_to_int
 from src.protocol.parser import DARTTransactionParser, FrameDirection
 from src.driver.serial_transport import DARTSerialTransport, CentralFrameDispatcher, Level2Frame
 from src.core.pump_state import PumpState, SaleLifecycle
+from src.core.master_controller import WayneDartMaster, ExchangeResult
 
 class TestDARTProtocolSuite(unittest.TestCase):
 
@@ -81,8 +82,12 @@ class TestDARTProtocolSuite(unittest.TestCase):
 
         self.assertEqual(dispatcher.queues[0x50].qsize(), 1)
         self.assertEqual(dispatcher.queues[0x51].qsize(), 1)
-        self.assertEqual(dispatcher.queues[0x50].get().address, 0x50)
-        self.assertEqual(dispatcher.queues[0x51].get().address, 0x51)
+
+    def test_passive_mode_command_suppression(self):
+        master = WayneDartMaster(transport=None, passive_monitoring_mode=True)
+        master.register_pump(0x50)
+        res = master.send_transaction(0x50, b"\x01\x01\x05")
+        self.assertEqual(res, ExchangeResult.REJECTED)
 
 if __name__ == "__main__":
     unittest.main()

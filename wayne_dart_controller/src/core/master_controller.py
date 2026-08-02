@@ -18,17 +18,19 @@ class ExchangeResult(Enum):
     REJECTED = 4
 
 class WayneDartMaster:
-    """Master controller managing address queues, frame exchange correlation, and two-phase state confirmation."""
+    """Master controller managing address queues, exchange correlation, and passive wire timing."""
 
     def __init__(self, transport: DARTSerialTransport, max_retries: int = 3, 
                  price_format: str = "RAW_BCD_DIGITS", offline_threshold: int = 5,
-                 currency_symbol: str = "NGN", configured_nozzles: int = 4):
+                 currency_symbol: str = "NGN", configured_nozzles: int = 4,
+                 passive_monitoring_mode: bool = True):
         self.transport = transport
         self.max_retries = max_retries
         self.price_format = price_format
         self.offline_threshold = offline_threshold
         self.currency_symbol = currency_symbol
         self.configured_nozzles = configured_nozzles
+        self.passive_monitoring_mode = passive_monitoring_mode
         
         self.pumps: Dict[int, PumpState] = {}
         self.locks: Dict[int, threading.Lock] = {}
@@ -46,7 +48,6 @@ class WayneDartMaster:
         self.locks[addr_hex] = threading.Lock()
 
     def poll_pump(self, addr: int) -> List[Dict]:
-        """Executes full multi-frame poll exchange until EOT or turnaround timeout."""
         if addr not in self.pumps or not self.transport.dispatcher:
             return []
 
@@ -57,6 +58,7 @@ class WayneDartMaster:
             poll_frame = bytes([addr, 0x20, 0xFA])
             
             try:
+                # Capture actual timestamp from write_frame execution
                 poll_write_time = self.transport.write_frame(poll_frame, is_ack=False)
             except TransportDisconnectedError:
                 pump.online = False
@@ -65,7 +67,7 @@ class WayneDartMaster:
             events = []
             valid_data_response_seen = False
 
-            while time.monotonic() - poll_write_time < 0.08:
+            while time.monotonic() - poll_write_time < 0.12:  # Expanded response window for bench measuring
                 try:
                     frame: Level2Frame = pump_queue.get(timeout=0.01)
 
@@ -78,6 +80,11 @@ class WayneDartMaster:
                         if frame.control == 0x70:
                             break
                         continue
+
+                    # Log Passive Timing Delays for Field Calibration
+                    t_first_byte = (frame.first_byte_time - poll_write_time) * 1000.0
+                    t_last_byte = (frame.last_byte_time - poll_write_time) * 1000.0
+                    logging.debug(f"[PASSIVE TIMING {hex(addr)}] Poll Out -> First Byte: {t_first_byte:.2f}ms | Last Byte: {t_last_byte:.2f}ms")
 
                     recognized_data_found = self._decode_and_process(pump, frame)
                     if recognized_data_found:
@@ -111,7 +118,6 @@ class WayneDartMaster:
             return events
 
     def _decode_and_process(self, pump: PumpState, frame: Level2Frame) -> bool:
-        """Decodes payload using frame receive timestamp. Returns True ONLY if recognized data is found."""
         try:
             txs = DARTTransactionParser.parse_payload(
                 frame.payload, FrameDirection.PUMP_TO_CONTROLLER,
@@ -146,7 +152,10 @@ class WayneDartMaster:
             return False
 
     def send_transaction(self, addr: int, payload: bytes) -> ExchangeResult:
-        """Sends Level 3 command with ACK correlation and pending data preservation."""
+        if self.passive_monitoring_mode:
+            logging.info(f"[PASSIVE MODE BLOCKED] Suppressed active command payload to {hex(addr)}: {payload.hex()}")
+            return ExchangeResult.REJECTED
+
         if addr not in self.pumps or not self.transport.dispatcher:
             return ExchangeResult.REJECTED
 
@@ -166,7 +175,7 @@ class WayneDartMaster:
                 except TransportDisconnectedError:
                     return ExchangeResult.REJECTED
 
-                while time.monotonic() - cmd_write_time < 0.08:
+                while time.monotonic() - cmd_write_time < 0.12:
                     try:
                         rx: Level2Frame = pump_queue.get(timeout=0.01)
 
@@ -199,7 +208,6 @@ class WayneDartMaster:
             return ExchangeResult.TIMED_OUT
 
     def set_unit_prices(self, addr: int, prices: List[int]) -> ExchangeResult:
-        """CD5: Unit Price Update based on configured price format."""
         data = bytearray()
         for p in prices:
             if self.price_format == "RAW_BCD_DIGITS":
@@ -214,7 +222,6 @@ class WayneDartMaster:
         return self.send_transaction(addr, bytes([0x05, len(data)]) + data)
 
     def reset(self, addr: int, confirm_application: bool = False) -> ExchangeResult:
-        """CD1: RESET with optional application confirmation (DC1 == RESET)."""
         res = self.send_transaction(addr, b"\x01\x01\x05")
         if res != ExchangeResult.LINK_ACKNOWLEDGED:
             return res
@@ -223,17 +230,19 @@ class WayneDartMaster:
             return ExchangeResult.LINK_ACKNOWLEDGED
 
         pump = self.pumps[addr]
+        cmd_time = pump.last_command_time
         start_wait = time.monotonic()
-        while time.monotonic() - start_wait < 0.5:
+        
+        while time.monotonic() - start_wait < 0.6:
             self.poll_pump(addr)
-            if pump.observed_status == "RESET":
+            # Require status to be RESET AND observed AFTER command execution timestamp
+            if pump.observed_status == "RESET" and pump.last_status_time > cmd_time:
                 return ExchangeResult.APPLICATION_CONFIRMED
             time.sleep(0.04)
 
         return ExchangeResult.LINK_ACKNOWLEDGED
 
     def authorize(self, addr: int, allowed_nozzles: Optional[List[int]] = None, confirm_application: bool = False) -> ExchangeResult:
-        """CD2 Allowed Nozzles -> CD1 Authorize with optional application confirmation."""
         if allowed_nozzles is None:
             allowed_nozzles = [1]
 
@@ -257,10 +266,13 @@ class WayneDartMaster:
             if not confirm_application:
                 return ExchangeResult.LINK_ACKNOWLEDGED
 
+            cmd_time = pump.last_command_time
             start_wait = time.monotonic()
-            while time.monotonic() - start_wait < 0.5:
+            
+            while time.monotonic() - start_wait < 0.6:
                 self.poll_pump(addr)
-                if pump.observed_status == "AUTHORIZED":
+                # Require status to be AUTHORIZED AND observed AFTER command execution timestamp
+                if pump.observed_status == "AUTHORIZED" and pump.last_status_time > cmd_time:
                     return ExchangeResult.APPLICATION_CONFIRMED
                 time.sleep(0.04)
 

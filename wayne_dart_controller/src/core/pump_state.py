@@ -1,5 +1,6 @@
 import time
 import queue
+import logging
 
 class SaleLifecycle:
     IDLE = "IDLE"
@@ -45,6 +46,7 @@ class PumpState:
         
         self.event_queue = queue.Queue()
 
+        # Strict Monotonic Timestamps for State Correlation
         self.last_status_time = 0.0
         self.last_nozzle_time = 0.0
         self.last_valid_frame_time = 0.0
@@ -63,9 +65,11 @@ class PumpState:
             
         allowed = LEGAL_LIFECYCLE_TRANSITIONS.get(self.sale_lifecycle, [])
         if target_state in allowed:
+            logging.info(f"[LIFECYCLE {hex(self.address)}] {self.sale_lifecycle} -> {target_state}")
             self.sale_lifecycle = target_state
             return True
         else:
+            logging.error(f"[REJECTED TRANSITION {hex(self.address)}] Illegal transition attempted: {self.sale_lifecycle} -> {target_state}")
             return False
 
     def update_nozzle(self, new_pos: str, nozzle_num: int, obs_time: float) -> bool:

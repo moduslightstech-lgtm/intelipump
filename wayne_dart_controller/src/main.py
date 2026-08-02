@@ -18,6 +18,7 @@ def main():
     ser_cfg = config["serial"]
     ctrl_cfg = config["controller"]
     pump_addresses = [int(addr, 16) for addr in ctrl_cfg["pumps"]]
+    passive_mode = ctrl_cfg.get("passive_monitoring_mode", True)
 
     dispatcher = CentralFrameDispatcher(pump_addresses)
     
@@ -44,11 +45,18 @@ def main():
         price_format=ctrl_cfg.get("price_format", "RAW_BCD_DIGITS"),
         offline_threshold=ctrl_cfg.get("offline_missed_poll_threshold", 5),
         currency_symbol=ctrl_cfg.get("currency_symbol", "NGN"),
-        configured_nozzles=ctrl_cfg.get("configured_nozzles_per_pump", 4)
+        configured_nozzles=ctrl_cfg.get("configured_nozzles_per_pump", 4),
+        passive_monitoring_mode=passive_mode
     )
 
     for addr in pump_addresses:
         master.register_pump(addr)
+
+    if passive_mode:
+        logging.info("================================================================")
+        logging.info("   [PASSIVE MONITORING MODE ACTIVE] All Active Commands Blocked  ")
+        logging.info("   Controller will POLL, ACK, and log events (Dry-Run Only)      ")
+        logging.info("================================================================")
 
     logging.info("[*] Synchronizing session state across pumps...")
     for addr in pump_addresses:
@@ -59,18 +67,15 @@ def main():
             if pump.online and pump.observed_status != "UNKNOWN" and pump.nozzle_position != "UNKNOWN":
                 valid_cycles += 1
             else:
-                valid_cycles = 0 # Strictly require consecutive valid polling cycles
+                valid_cycles = 0 # Strictly require 3 CONSECUTIVE valid cycles
             time.sleep(0.04)
 
         if valid_cycles >= 3:
             pump = master.pumps[addr]
             pump.synchronized = True
             logging.info(f"    -> Pump {hex(addr)} SYNCHRONIZED. Status: {pump.observed_status}, Nozzle: {pump.nozzle_position}")
-            if ctrl_cfg.get("auto_startup_commands", False):
-                master.set_unit_prices(addr, ctrl_cfg["default_prices"])
-                master.reset(addr)
 
-    logging.info("[*] Entering Continuous Event Loop...")
+    logging.info("[*] Entering Passive Event Observation Loop...")
     try:
         while True:
             for addr in pump_addresses:
@@ -86,20 +91,20 @@ def main():
                         status_is_recent = (now_t - pump.last_status_time) < 5.0
                         
                         if ev["state"] == "OUT" and pump.observed_status == "RESET" and status_is_recent:
-                            logging.info(f"[EVENT] Nozzle {ev['nozzle']} lifted on Pump {hex(addr)}. Authorizing...")
-                            res = master.authorize(addr, allowed_nozzles=[ev['nozzle']], confirm_application=True)
-                            if res in [ExchangeResult.LINK_ACKNOWLEDGED, ExchangeResult.APPLICATION_CONFIRMED]:
-                                logging.info(f"    -> Pump {hex(addr)} Authorization Result: {res.name}")
+                            logging.info(f"[DRY-RUN LOG] Nozzle {ev['nozzle']} lifted on Pump {hex(addr)}. Authorization WOULD be requested.")
+                            if not passive_mode:
+                                master.authorize(addr, allowed_nozzles=[ev['nozzle']], confirm_application=True)
 
                     elif ev["type"] == "STATUS_CHANGE":
                         logging.info(f"[EVENT] Status change on Pump {hex(addr)}: {ev['status']}")
                         if ev["status"] == "FILLING_COMPLETED" and not pump.sale_completion_latch:
                             pump.sale_completion_latch = True
                             logging.info(
-                                f"    -> Sale Completed on {hex(addr)} "
-                                f"({pump.filled_volume}L, {master.currency_symbol} {pump.filled_amount}). Resetting..."
+                                f"[DRY-RUN LOG] Sale Completed on {hex(addr)} "
+                                f"({pump.filled_volume}L, {master.currency_symbol} {pump.filled_amount}). Reset WOULD be requested."
                             )
-                            master.reset(addr, confirm_application=True)
+                            if not passive_mode:
+                                master.reset(addr, confirm_application=True)
 
             time.sleep(ctrl_cfg["poll_interval_sec"])
 
