@@ -658,18 +658,8 @@ class PumpSession:
             elif prev is not new_pos:
                 self.state.nozzle_position = new_pos
                 if new_pos is NozzlePosition.OUT:
-                    previous_life = self.state.sale_evidence.lifecycle
                     self.state.sale_evidence.note_nozzle_out()
                     self.state.sale_lifecycle = SaleLifecycle.NOZZLE_LIFTED
-                    if previous_life in {
-                        SaleLifecycle.IDLE,
-                        SaleLifecycle.CLOSED,
-                        SaleLifecycle.ABORTED_NO_DELIVERY,
-                        SaleLifecycle.ABORTED,
-                        SaleLifecycle.FILLING_COMPLETED,
-                    }:
-                        self.state.filled_volume_raw = 0
-                        self.state.filled_amount_raw = 0
                 elif new_pos is NozzlePosition.IN:
                     ev = self.state.sale_evidence
                     if ev.lifecycle in {

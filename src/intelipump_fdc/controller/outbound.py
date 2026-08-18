@@ -61,6 +61,18 @@ class OutboundQueue:
         self._items = kept
         return selected
 
+    def drop_for_address(self, address: int) -> int:
+        """Drop pending items for one address. Returns how many were removed."""
+        kept: deque[OutboundDataItem] = deque()
+        dropped = 0
+        for item in self._items:
+            if item.address == address:
+                dropped += 1
+                continue
+            kept.append(item)
+        self._items = kept
+        return dropped
+
     def peek_addresses(self) -> set[int]:
         now = datetime.now(UTC)
         return {i.address for i in self._items if not i.is_expired(now)}

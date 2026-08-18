@@ -176,3 +176,28 @@ def test_listen_only_still_blocks_without_owned_lab_flag() -> None:
     )
     decision = evaluate_outbound_safety(item, _lab())
     assert decision.allowed is False
+
+
+def test_outbound_drop_for_address() -> None:
+    q = OutboundQueue(max_size=4)
+    a = OutboundDataItem.create(
+        address=1,
+        application_payload=b"\x01\x01\x00",
+        command_type=PumpCommand.READ_STATUS,
+        simulator_only=True,
+        idempotency=IdempotencyClass.IDEMPOTENT,
+    )
+    b = OutboundDataItem.create(
+        address=2,
+        application_payload=b"\x01\x01\x00",
+        command_type=PumpCommand.READ_STATUS,
+        simulator_only=True,
+        idempotency=IdempotencyClass.IDEMPOTENT,
+    )
+    q.enqueue(a, _lab())
+    q.enqueue(b, _lab())
+    assert q.drop_for_address(1) == 1
+    assert q.pop_for_address(1) is None
+    leftover = q.pop_for_address(2)
+    assert leftover is not None
+    assert leftover.address == 2

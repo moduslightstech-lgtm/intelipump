@@ -670,3 +670,75 @@ def test_hold_sale_display_until_next_lift() -> None:
     session.state.nozzle_position = NozzlePosition.IN
     session.state.observed_status = ObservedStatus.RESET
     assert loop._should_hold_sale_display(session) is False
+
+
+@pytest.mark.asyncio
+async def test_reset_status_data_confirms_command_without_ack() -> None:
+    ctrl, pump = create_memory_transport_pair()
+    await ctrl.open()
+    await pump.open()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,), response_timeout_ms=150),
+    )
+    loop = ControllerLoop(runtime)
+    loop._start_rx_task()
+    try:
+        session = loop.sessions[1]
+        item = OutboundDataItem.create(
+            address=1,
+            application_payload=bytes((0x01, 0x01, 0x05)),
+            command_type=PumpCommand.RESET,
+            simulator_only=True,
+            idempotency=IdempotencyClass.NON_IDEMPOTENT,
+            expect_status_after_tx=ObservedStatus.RESET.value,
+            max_retries=0,
+        )
+
+        async def _pump_side() -> None:
+            await asyncio.sleep(0.02)
+            await pump.write(build_data_frame(0x50, 0, encode_dc1_status(1)))
+
+        task = asyncio.create_task(_pump_side())
+        result = await loop._send_outbound_once(session, item, seq=0)
+        await task
+        assert result.status is ExchangeResultStatus.APPLICATION_CONFIRMED
+        assert session.state.observed_status is ObservedStatus.RESET
+    finally:
+        await loop._stop_rx_task()
+        await ctrl.close()
+        await pump.close()
+
+
+@pytest.mark.asyncio
+async def test_command_timeout_advances_tx_sequence() -> None:
+    ctrl, pump = create_memory_transport_pair()
+    await ctrl.open()
+    await pump.open()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,), response_timeout_ms=50),
+    )
+    loop = ControllerLoop(runtime)
+    loop._start_rx_task()
+    try:
+        session = loop.sessions[1]
+        item = OutboundDataItem.create(
+            address=1,
+            application_payload=bytes((0x01, 0x01, 0x05)),
+            command_type=PumpCommand.RESET,
+            simulator_only=True,
+            idempotency=IdempotencyClass.NON_IDEMPOTENT,
+            max_retries=0,
+        )
+        runtime.outbound.enqueue(item, runtime.safety)
+        result = await loop._maybe_send_outbound(session)
+        assert result is not None
+        assert result.status is ExchangeResultStatus.TIMED_OUT
+        assert session.state.tx_sequence == 1
+    finally:
+        await loop._stop_rx_task()
+        await ctrl.close()
+        await pump.close()

@@ -694,31 +694,50 @@ class ControllerLoop:
 
         seq = item.sequence if item.sequence is not None else session.state.tx_sequence
         attempts = item.attempts
-        result = await self._send_outbound_once(session, item, seq=seq)
-        result.attempts = attempts + 1
+        while True:
+            result = await self._send_outbound_once(session, item, seq=seq)
+            result.attempts = attempts + 1
+            if result.status in {
+                ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                ExchangeResultStatus.APPLICATION_CONFIRMED,
+            }:
+                self._advance_tx_sequence(session, seq)
+                if (
+                    result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED
+                    and item.expect_status_after_tx
+                ):
+                    confirmed = await self._confirm_application(
+                        session,
+                        expected=ObservedStatus(item.expect_status_after_tx),
+                        not_before_mono=result.command_tx_mono or time.monotonic(),
+                    )
+                    if confirmed:
+                        result.status = ExchangeResultStatus.APPLICATION_CONFIRMED
+                        result.application_confirm_mono = session.state.last_status_time
+                return result
 
-        if result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED:
-            session.state.tx_sequence = next_sequence(
-                seq, self.runtime.config.sequence_policy
-            )
-            if item.expect_status_after_tx:
-                confirmed = await self._confirm_application(
-                    session,
-                    expected=ObservedStatus(item.expect_status_after_tx),
-                    not_before_mono=result.command_tx_mono or time.monotonic(),
-                )
-                if confirmed:
+            if result.status is ExchangeResultStatus.TIMED_OUT:
+                expected = item.expect_status_after_tx
+                if (
+                    expected is not None
+                    and session.state.observed_status.value == expected
+                ):
+                    self._advance_tx_sequence(session, seq)
                     result.status = ExchangeResultStatus.APPLICATION_CONFIRMED
-                    result.application_confirm_mono = session.state.last_status_time
+                    result.detail = "confirmed_after_timeout"
+                    return result
+                if attempts + 1 <= item.max_retries:
+                    attempts += 1
+                    session.state.stats.retry_count += 1
+                    continue
+                # Give up: advance so the next command is not a duplicate TX#.
+                self._advance_tx_sequence(session, seq)
             return result
 
-        if result.status is ExchangeResultStatus.TIMED_OUT and attempts + 1 <= item.max_retries:
-            # Retries reuse the same sequence; do not advance.
-            session.state.stats.retry_count += 1
-            retry = item.with_attempt(sequence=seq, attempts=attempts + 1)
-            with contextlib.suppress(Exception):
-                self.runtime.outbound.enqueue(retry, self.runtime.safety)
-        return result
+    def _advance_tx_sequence(self, session: PumpSession, seq: int) -> None:
+        session.state.tx_sequence = next_sequence(
+            seq, self.runtime.config.sequence_policy
+        )
 
     async def _send_outbound_once(
         self,
@@ -743,21 +762,31 @@ class ControllerLoop:
             )
             if stamped is None:
                 continue
-            if stamped.first_byte_time < write_complete:
+            frame = stamped.frame
+            stale_by_last_byte = stamped.last_byte_time < write_complete
+            if stale_by_last_byte:
                 self.demux.stale_frame_count += 1
                 session.state.stats.stale_frame_count += 1
-                if stamped.frame.control_type is ControlType.DATA:
+                if frame.control_type is ControlType.DATA:
                     ack = session.handle_response_frame(
-                        stamped.frame, capture_mono=stamped.first_byte_time
+                        frame, capture_mono=stamped.first_byte_time
                     )
                     preserved += 1
                     if ack is not None:
                         await self._write_frame(
                             ack, address=session.address, note="ACK_STALE"
                         )
+                    confirmed = self._command_status_met(
+                        session,
+                        item,
+                        command_tx_mono=write_complete,
+                        sequence=seq,
+                        preserved=preserved,
+                    )
+                    if confirmed is not None:
+                        return confirmed
                 continue
 
-            frame = stamped.frame
             if (
                 frame.control_type is ControlType.ACK
                 and frame.sequence == seq
@@ -798,6 +827,15 @@ class ControllerLoop:
                 preserved += 1
                 if ack is not None:
                     await self._write_frame(ack, address=session.address, note="ACK")
+                confirmed = self._command_status_met(
+                    session,
+                    item,
+                    command_tx_mono=write_complete,
+                    sequence=seq,
+                    preserved=preserved,
+                )
+                if confirmed is not None:
+                    return confirmed
                 continue
 
             if frame.control_type is ControlType.EOT:
@@ -806,6 +844,16 @@ class ControllerLoop:
                 )
                 continue
 
+        late = self._command_status_met(
+            session,
+            item,
+            command_tx_mono=write_complete,
+            sequence=seq,
+            preserved=preserved,
+        )
+        if late is not None:
+            late.detail = "status_after_ack_timeout"
+            return late
         session.state.stats.timeout_count += 1
         session.state.pending_exchange = False
         return ExchangeResult(
@@ -816,6 +864,32 @@ class ControllerLoop:
             command_tx_mono=write_complete,
             detail="ack_timeout",
             preserved_event_count=preserved,
+        )
+
+    def _command_status_met(
+        self,
+        session: PumpSession,
+        item: OutboundDataItem,
+        *,
+        command_tx_mono: float | None = None,
+        sequence: int | None = None,
+        preserved: int = 0,
+    ) -> ExchangeResult | None:
+        expected = item.expect_status_after_tx
+        if expected is None:
+            return None
+        if session.state.observed_status.value != expected:
+            return None
+        session.note_link_ack(ack_mono=time.monotonic())
+        return ExchangeResult(
+            status=ExchangeResultStatus.APPLICATION_CONFIRMED,
+            address=session.address,
+            sequence=sequence,
+            correlation_id=item.correlation_id,
+            command_tx_mono=command_tx_mono,
+            application_confirm_mono=session.state.last_status_time,
+            preserved_event_count=preserved,
+            detail="status_in_command_window",
         )
 
     async def _confirm_application(
@@ -1005,10 +1079,8 @@ class ControllerLoop:
 
     async def _owned_lab_authorize(self, session: PumpSession) -> None:
         addr = session.address
-        if (
-            session.state.observed_status is not ObservedStatus.RESET
-            and not session.should_skip_reset()
-        ):
+        await self._drain_pending_data(session)
+        if session.state.observed_status is not ObservedStatus.RESET:
             reset = await self._run_owned_command(
                 session,
                 encode_cd1_command(PumpControlCommand.RESET),
@@ -1034,7 +1106,7 @@ class ControllerLoop:
             idempotency=IdempotencyClass.NON_IDEMPOTENT,
         )
         print(f"[OWNED-LAB addr={addr}] CD2 result={cd2_res.status.value}")
-        if cd2_res.status is not ExchangeResultStatus.LINK_ACKNOWLEDGED:
+        if not cd2_res.link_acknowledged:
             return
         auth = await self._run_owned_command(
             session,
@@ -1081,6 +1153,7 @@ class ControllerLoop:
                 address=session.address,
                 detail=",".join(decision.reasons),
             )
+        self.runtime.outbound.drop_for_address(session.address)
         try:
             self.runtime.outbound.enqueue(item, self.runtime.safety)
         except OutboundRejectedError as exc:
