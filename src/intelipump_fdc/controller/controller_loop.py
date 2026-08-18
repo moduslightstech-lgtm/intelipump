@@ -471,9 +471,13 @@ class ControllerLoop:
         if outcome != "timeout":
             self.runtime.liveness.mark_successful_poll()
         self._report_observed_changes(session)
-        # Commands after EOT/short bus only — DATA without EOT means the pump
-        # still owns the line (Wayne replies to RESET/CD2 on the next POLL).
-        if outcome in {"eot", "short_bus"}:
+        # Prefer a quiet bus (EOT / short / timeout) before CD5/RESET/AUTH.
+        # Still tick while DC1/NOZIO are UNKNOWN so RETURN_STATUS can run.
+        unknown = (
+            session.state.observed_status is ObservedStatus.UNKNOWN
+            or session.state.nozzle_position is NozzlePosition.UNKNOWN
+        )
+        if outcome in {"eot", "short_bus", "timeout"} or unknown:
             await self._owned_lab_tick(session)
         self._refresh_totals()
 
@@ -1029,10 +1033,11 @@ class ControllerLoop:
         prev_pos = self._last_nozzle.get(addr)
         prev_status = self._last_status.get(addr)
         if prev_pos is not pos:
-            print(
-                f"[NOZIO addr={addr}] {prev_pos.value if prev_pos else 'UNKNOWN'} "
-                f"-> {pos.value}"
-            )
+            if prev_pos is not None or pos is not NozzlePosition.UNKNOWN:
+                print(
+                    f"[NOZIO addr={addr}] {prev_pos.value if prev_pos else 'UNKNOWN'} "
+                    f"-> {pos.value}"
+                )
             if prev_pos is NozzlePosition.OUT and pos is NozzlePosition.IN:
                 self._auth_this_lift.discard(addr)
             if (
@@ -1043,10 +1048,11 @@ class ControllerLoop:
                 self._defer_post_sale_auth.add(addr)
             self._last_nozzle[addr] = pos
         if prev_status is not status:
-            print(
-                f"[DC1 addr={addr}] "
-                f"{prev_status.value if prev_status else 'UNKNOWN'} -> {status.value}"
-            )
+            if prev_status is not None or status is not ObservedStatus.UNKNOWN:
+                print(
+                    f"[DC1 addr={addr}] "
+                    f"{prev_status.value if prev_status else 'UNKNOWN'} -> {status.value}"
+                )
             self._last_status[addr] = status
         price = session.state.unit_price_raw
         if price is not None and self._last_unit_price.get(addr) != price:

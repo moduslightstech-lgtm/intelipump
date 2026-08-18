@@ -780,6 +780,21 @@ async def test_command_timeout_advances_tx_sequence() -> None:
         await pump.close()
 
 
+def test_initial_unknown_status_is_not_logged(capsys) -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    loop = ControllerLoop(
+        ControllerRuntime(
+            transport=ctrl,
+            safety=_lab_safety(),
+            config=PollSchedulerConfig(addresses=(1,)),
+        )
+    )
+    loop._report_observed_changes(loop.sessions[1])
+    out = capsys.readouterr().out
+    assert "[NOZIO" not in out
+    assert "[DC1" not in out
+
+
 def test_lift_after_held_sale_defers_reset() -> None:
     ctrl, _pump = create_memory_transport_pair()
     loop = ControllerLoop(
