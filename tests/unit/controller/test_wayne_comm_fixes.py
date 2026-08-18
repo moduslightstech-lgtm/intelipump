@@ -778,3 +778,50 @@ async def test_command_timeout_advances_tx_sequence() -> None:
         await loop._stop_rx_task()
         await ctrl.close()
         await pump.close()
+
+
+def test_lift_after_held_sale_defers_reset() -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    loop = ControllerLoop(
+        ControllerRuntime(
+            transport=ctrl,
+            safety=_lab_safety(),
+            config=PollSchedulerConfig(addresses=(1,)),
+        )
+    )
+    session = loop.sessions[1]
+    loop._sale_display_held.add(1)
+    loop._last_nozzle[1] = NozzlePosition.IN
+    session.state.nozzle_position = NozzlePosition.OUT
+    loop._report_observed_changes(session)
+    assert 1 in loop._defer_post_sale_auth
+
+
+@pytest.mark.asyncio
+async def test_recover_reset_when_dc1_already_observed() -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    await ctrl.open()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,), response_timeout_ms=50),
+    )
+    loop = ControllerLoop(runtime)
+    session = loop.sessions[1]
+    session.state.observed_status = ObservedStatus.RESET
+    session.state.last_status_time = time.monotonic()
+    item = OutboundDataItem.create(
+        address=1,
+        application_payload=bytes((0x01, 0x01, 0x05)),
+        command_type=PumpCommand.RESET,
+        simulator_only=True,
+        idempotency=IdempotencyClass.NON_IDEMPOTENT,
+        expect_status_after_tx=ObservedStatus.RESET.value,
+        max_retries=0,
+    )
+    result = await loop._recover_command_after_timeout(
+        session, item, seq=0, not_before=time.monotonic() - 1.0
+    )
+    assert result is not None
+    assert result.status is ExchangeResultStatus.APPLICATION_CONFIRMED
+    await ctrl.close()

@@ -168,6 +168,7 @@ class PumpSessionState:
     last_nozio_time: float | None = None
     last_command_time: float | None = None
     last_ack_time: float | None = None
+    last_rx_ack_sequence: int | None = None
     missed_bus_responses: int = 0
     stale_application_data: bool = False
     pending_exchange: bool = False

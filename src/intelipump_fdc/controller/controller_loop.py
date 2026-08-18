@@ -155,6 +155,7 @@ class ControllerLoop:
         self._last_unit_price: dict[int, int] = {}
         self._last_completed_sale: dict[int, dict[str, int | None]] = {}
         self._sale_display_held: set[int] = set()
+        self._defer_post_sale_auth: set[int] = set()
         self._price_programmed: set[int] = set()
         self._startup_reset_done: set[int] = set()
         self._auth_this_lift: set[int] = set()
@@ -470,7 +471,10 @@ class ControllerLoop:
         if outcome != "timeout":
             self.runtime.liveness.mark_successful_poll()
         self._report_observed_changes(session)
-        await self._owned_lab_tick(session)
+        # Commands after EOT/short bus only — DATA without EOT means the pump
+        # still owns the line (Wayne replies to RESET/CD2 on the next POLL).
+        if outcome in {"eot", "short_bus"}:
+            await self._owned_lab_tick(session)
         self._refresh_totals()
 
     async def _read_poll_session(
@@ -722,16 +726,16 @@ class ControllerLoop:
                 return result
 
             if result.status is ExchangeResultStatus.TIMED_OUT:
-                await self._drain_pending_data(session)
-                expected = item.expect_status_after_tx
-                if (
-                    expected is not None
-                    and session.state.observed_status.value == expected
-                ):
+                recovered = await self._recover_command_after_timeout(
+                    session,
+                    item,
+                    seq=seq,
+                    not_before=exchange_start or result.write_start_mono or time.monotonic(),
+                )
+                if recovered is not None:
+                    recovered.attempts = result.attempts
                     self._advance_tx_sequence(session, seq)
-                    result.status = ExchangeResultStatus.APPLICATION_CONFIRMED
-                    result.detail = "confirmed_after_timeout"
-                    return result
+                    return recovered
                 if attempts + 1 <= item.max_retries:
                     attempts += 1
                     session.state.stats.retry_count += 1
@@ -744,6 +748,77 @@ class ControllerLoop:
         session.state.tx_sequence = next_sequence(
             seq, self.runtime.config.sequence_policy
         )
+
+    def _command_ack_seen(
+        self, session: PumpSession, seq: int, *, not_before: float
+    ) -> bool:
+        if session.state.last_rx_ack_sequence != seq:
+            return False
+        ack_at = session.state.last_ack_time
+        return ack_at is not None and ack_at >= not_before
+
+    async def _recover_command_after_timeout(
+        self,
+        session: PumpSession,
+        item: OutboundDataItem,
+        *,
+        seq: int,
+        not_before: float,
+    ) -> ExchangeResult | None:
+        """Wayne often answers DATA commands on the next POLL, not with an ACK.
+
+        Poll after ACK timeout to pick up DC1 / a late matching ACK.
+        """
+        await self._drain_pending_data(session)
+        expected = item.expect_status_after_tx
+        if expected is not None:
+            confirmed = await self._confirm_application(
+                session,
+                expected=ObservedStatus(expected),
+                not_before_mono=not_before,
+            )
+            if confirmed or session.state.observed_status.value == expected:
+                print(
+                    f"[OWNED-LAB addr={session.address}] "
+                    f"{item.command_type.value} confirmed by poll DC1"
+                )
+                return ExchangeResult(
+                    status=ExchangeResultStatus.APPLICATION_CONFIRMED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    detail="confirmed_by_poll",
+                    write_start_mono=not_before,
+                )
+        else:
+            for _ in range(self.runtime.config.application_confirm_max_polls):
+                if self._command_ack_seen(session, seq, not_before=not_before):
+                    print(f"RX ACK addr={session.address} seq={seq} (late)")
+                    return ExchangeResult(
+                        status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                        address=session.address,
+                        sequence=seq,
+                        correlation_id=item.correlation_id,
+                        detail="ack_on_poll",
+                        write_start_mono=not_before,
+                    )
+                write_start, _complete = await self._write_frame(
+                    session.build_poll(),
+                    address=session.address,
+                    note="POLL_CONFIRM",
+                )
+                await self._read_poll_session(session, not_before_mono=write_start)
+            if self._command_ack_seen(session, seq, not_before=not_before):
+                print(f"RX ACK addr={session.address} seq={seq} (late)")
+                return ExchangeResult(
+                    status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    detail="ack_on_poll",
+                    write_start_mono=not_before,
+                )
+        return None
 
     async def _send_outbound_once(
         self,
@@ -761,10 +836,6 @@ class ControllerLoop:
         expected_ack = build_ack(session.wire_address, seq)
         ack_floor = ack_not_before if ack_not_before is not None else write_start
         timeout_ms = self.runtime.config.response_timeout_ms
-        if self._bus_delays_enabled():
-            timeout_ms = max(
-                timeout_ms, self.runtime.config.command_response_timeout_ms
-            )
         deadline = write_complete + (timeout_ms / 1000.0)
         preserved = 0
 
@@ -781,7 +852,7 @@ class ControllerLoop:
             )
             if matching_ack and stamped.last_byte_time >= ack_floor:
                 print(f"RX ACK addr={session.address} seq={seq}")
-                session.note_link_ack(ack_mono=stamped.first_byte_time)
+                session.note_link_ack(ack_mono=stamped.first_byte_time, sequence=seq)
                 return ExchangeResult(
                     status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
                     address=session.address,
@@ -964,6 +1035,12 @@ class ControllerLoop:
             )
             if prev_pos is NozzlePosition.OUT and pos is NozzlePosition.IN:
                 self._auth_this_lift.discard(addr)
+            if (
+                prev_pos is NozzlePosition.IN
+                and pos is NozzlePosition.OUT
+                and addr in self._sale_display_held
+            ):
+                self._defer_post_sale_auth.add(addr)
             self._last_nozzle[addr] = pos
         if prev_status is not status:
             print(
@@ -1064,6 +1141,14 @@ class ControllerLoop:
                 )
             return
         self._sale_display_held.discard(session.address)
+
+        if addr in self._defer_post_sale_auth:
+            self._defer_post_sale_auth.discard(addr)
+            print(
+                f"[OWNED-LAB addr={addr}] lift after sale; waiting one quiet poll "
+                "before RESET"
+            )
+            return
 
         if (
             flags.automatic_startup_price_programming

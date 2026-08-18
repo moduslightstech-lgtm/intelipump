@@ -229,9 +229,11 @@ class PumpSession:
         self.state.pending_exchange = True
         self.state.pending_command_events.clear()
 
-    def note_link_ack(self, *, ack_mono: float) -> None:
+    def note_link_ack(self, *, ack_mono: float, sequence: int | None = None) -> None:
         self.state.last_ack_time = ack_mono
         self.state.pending_exchange = False
+        if sequence is not None:
+            self.state.last_rx_ack_sequence = sequence
 
     def should_skip_reset(self) -> bool:
         """Skip redundant RESET when already RESET and synchronized."""
@@ -385,6 +387,10 @@ class PumpSession:
         if frame.control_type is ControlType.ACK:
             # Short ACK observed on poll bus — link alive, not application DATA.
             self.note_short_bus_response(capture_mono=capture_mono)
+            self.state.last_rx_ack_sequence = frame.sequence
+            self.state.last_ack_time = (
+                capture_mono if capture_mono is not None else time.monotonic()
+            )
             return None
         self._record_persistent_fault(f"unexpected_control_{frame.control_type.value}")
         return None
