@@ -1,8 +1,20 @@
+# OWNED LAB ONLY. Authorizes on nozzle lift after RESET.
+# Remote authorization and MQTT stay off. Not for field stations.
+#
+# Install:
+#   sudo cp deploy/systemd/intelipump.service /etc/systemd/system/intelipump.service
+#   sudo cp -n deploy/systemd/intelipump.env.example /etc/intelipump/intelipump.env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now intelipump.service
+
 [Unit]
-Description=InteliPump FDC Controller - LAB LISTEN_ONLY
+Description=InteliPump FDC Controller - owned-lab dispense (BENCH_CONTROL)
 Documentation=file:///home/intelipump/intelipump/intelipump-fdc/docs/phase-11-deployment-hardening.md
 After=network-online.target
 Wants=network-online.target
+# USB-RS485 often appears as ttyUSB0 on this lab Pi.
+After=dev-ttyUSB0.device
+Wants=dev-ttyUSB0.device
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -18,21 +30,28 @@ WorkingDirectory=/home/intelipump/intelipump/intelipump-fdc
 EnvironmentFile=-/etc/intelipump/intelipump.env
 
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/intelipump/.local/bin:/usr/bin:/bin
 Environment=INTELIPUMP_ENVIRONMENT=LAB
-Environment=INTELIPUMP_CONTROLLER__MODE=LISTEN_ONLY
-Environment=INTELIPUMP_SAFETY__ACTIVE_COMMANDS_ENABLED=false
+Environment=INTELIPUMP_CONTROLLER__MODE=BENCH_CONTROL
 Environment=INTELIPUMP_SAFETY__REMOTE_AUTHORIZATION_ENABLED=false
 Environment=INTELIPUMP_MQTT__ENABLED=false
 Environment=INTELIPUMP_WATCHDOG__ENABLED=true
 
-ExecStart=/home/intelipump/intelipump/intelipump-fdc/venv/bin/intelipump-controller \
-  --port /dev/intelipump-controller \
+# uv .venv from `uv sync --dev` in WorkingDirectory.
+ExecStart=/home/intelipump/intelipump/intelipump-fdc/.venv/bin/intelipump-controller \
+  --port /dev/ttyUSB0 \
   --addresses 1,2 \
   --baud 9600 \
-  --mode LISTEN_ONLY \
-  --response-timeout-ms 100 \
-  --database-url sqlite+aiosqlite:////var/lib/intelipump/intelipump.db \
-  --show-recovery-report
+  --mode BENCH_CONTROL \
+  --response-timeout-ms 200 \
+  --confirm-owned-lab-dispense-session \
+  --enable-active-commands \
+  --confirm-physical-control-enable \
+  --price 1175 \
+  --logical-nozzle-count 1 \
+  --confirm-logical-nozzle-mapping \
+  --confirm-price-scale-raw-bcd \
+  --database-url sqlite+aiosqlite:////var/lib/intelipump/intelipump.db
 
 WatchdogSec=30s
 Restart=on-failure

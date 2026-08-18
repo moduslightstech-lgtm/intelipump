@@ -440,8 +440,7 @@ class ControllerLoop:
                 await asyncio.sleep(0)
 
     async def _reconnect(self) -> None:
-        """Bounded exponential reconnect; never issues dispenser commands."""
-        assert self.runtime.safety.active_commands_enabled is False
+        """Bounded exponential reconnect; reopens serial only, no dispenser TX."""
         delay = self.serial_health.state.current_reconnect_delay_s
         if delay <= 0:
             delay = self.serial_health.observe_open_failure("port_not_open")

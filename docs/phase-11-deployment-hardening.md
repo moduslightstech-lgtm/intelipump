@@ -55,6 +55,9 @@ sudo install -d -o intelipump -g intelipump -m 0750 /var/lib/intelipump
 sudo install -d -o root -g root -m 0755 /etc/intelipump
 sudo cp -n deploy/systemd/intelipump.env.example /etc/intelipump/intelipump.env
 sudo cp deploy/systemd/intelipump.service /etc/systemd/system/intelipump.service
+sudo cp -n deploy/systemd/intelipump.env.example /etc/intelipump/intelipump.env
+# Owned lab: ExecStart in the unit uses BENCH_CONTROL + confirm flags.
+# LISTEN_ONLY default for other installs is no longer in this unit.
 sudo systemctl daemon-reload
 sudo systemctl enable intelipump.service
 sudo systemctl start intelipump.service
