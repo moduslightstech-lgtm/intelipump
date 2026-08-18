@@ -11,7 +11,7 @@ from intelipump_fdc.controller.controller_loop import ControllerLoop, Controller
 from intelipump_fdc.controller.exchange_result import ExchangeResultStatus
 from intelipump_fdc.controller.poll_scheduler import PollSchedulerConfig
 from intelipump_fdc.controller.pump_session import PumpSession
-from intelipump_fdc.controller.rx_demux import AddressFrameDemux
+from intelipump_fdc.controller.rx_demux import AddressFrameDemux, TimestampedFrame
 from intelipump_fdc.controller.safety import ControllerSafetyContext
 from intelipump_fdc.controller.sale_lifecycle import SaleEvidence, SaleLifecycle
 from intelipump_fdc.controller.session_events import EventBus
@@ -518,3 +518,53 @@ def test_poll_bytes() -> None:
 
 def test_default_response_timeout_120() -> None:
     assert PollSchedulerConfig().response_timeout_ms == 120
+
+
+@pytest.mark.asyncio
+async def test_stale_data_is_acked_and_applied() -> None:
+    """CRC-valid DATA that arrived before this poll write is still ACKed."""
+    ctrl, pump = create_memory_transport_pair()
+    await ctrl.open()
+    await pump.open()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(
+            addresses=(1,),
+            response_timeout_ms=50,
+            inter_poll_delay_ms=0,
+            idle_sleep_ms=0,
+            max_retries=0,
+            tx_delay_ms=0,
+            ack_delay_ms=0,
+            apply_bus_delays_on_virtual=False,
+        ),
+    )
+    loop = ControllerLoop(runtime)
+    session = loop.sessions[1]
+    raw = build_data_frame(
+        0x50,
+        0,
+        encode_dc3_nozzle_price(price_raw=120, logical_nozzle=1, nozzle_out=True),
+    )
+    frame = _parse(raw)
+    now = time.monotonic()
+    loop.demux._queues[0x50].put_nowait(
+        TimestampedFrame(
+            frame=frame,
+            raw=raw,
+            first_byte_time=now - 1.0,
+            last_byte_time=now - 1.0,
+            wire_address=0x50,
+            logical_address=1,
+        )
+    )
+    try:
+        outcome = await loop._read_poll_session(session, not_before_mono=now)
+        assert outcome == "data"
+        assert session.state.nozzle_position is NozzlePosition.OUT
+        ack = await asyncio.wait_for(pump.read(16), timeout=1.0)
+        assert ack == build_ack(0x50, 0)
+    finally:
+        await ctrl.close()
+        await pump.close()

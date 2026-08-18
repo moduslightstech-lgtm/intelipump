@@ -12,6 +12,14 @@ _ACTIVE_COMMANDS: frozenset[PumpCommand] = frozenset(NON_IDEMPOTENT_COMMANDS)
 _READ_COMMANDS: frozenset[PumpCommand] = frozenset(
     {PumpCommand.READ_STATUS, PumpCommand.READ_TOTALS}
 )
+_OWNED_LAB_COMMANDS: frozenset[PumpCommand] = frozenset(
+    {
+        PumpCommand.READ_STATUS,
+        PumpCommand.SET_PRICE,
+        PumpCommand.RESET,
+        PumpCommand.AUTHORIZE,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +37,8 @@ class ControllerSafetyContext:
     physical_enable_present: bool = False
     allow_virtual_polling: bool = True
     allow_lab_simulator_commands: bool = False
+    # Explicit owned-lab physical session (CD5/RESET/AUTHORIZE). Default OFF.
+    owned_lab_active_session: bool = False
 
 
 def evaluate_outbound_safety(
@@ -61,6 +71,8 @@ def evaluate_outbound_safety(
         )
 
     if item.command_type in _READ_COMMANDS:
+        if ctx.owned_lab_active_session:
+            return _evaluate_owned_lab_active(item, ctx)
         if not item.simulator_only:
             reasons.append("read_requests_must_be_simulator_only_in_phase6")
         if env != "LAB":
@@ -68,6 +80,9 @@ def evaluate_outbound_safety(
         if ctx.mode not in {ControllerMode.LISTEN_ONLY, ControllerMode.BENCH_CONTROL}:
             reasons.append(f"mode_{ctx.mode.value}_blocks_reads")
         return SafetyDecision(allowed=not reasons, reasons=tuple(reasons))
+
+    if ctx.owned_lab_active_session:
+        return _evaluate_owned_lab_active(item, ctx)
 
     # Phase 8 LAB simulator active commands (API-gated virtual transport).
     if (
@@ -93,6 +108,25 @@ def evaluate_outbound_safety(
     if item.command_type in _ACTIVE_COMMANDS:
         reasons.append("non_idempotent_command")
     return SafetyDecision(allowed=False, reasons=tuple(dict.fromkeys(reasons)))
+
+
+def _evaluate_owned_lab_active(
+    item: OutboundDataItem,
+    ctx: ControllerSafetyContext,
+) -> SafetyDecision:
+    """Allow a narrow command set on an explicitly confirmed owned-lab session."""
+    reasons: list[str] = []
+    if ctx.environment.upper() != "LAB":
+        reasons.append("owned_lab_requires_LAB")
+    if ctx.mode is not ControllerMode.BENCH_CONTROL:
+        reasons.append("owned_lab_requires_BENCH_CONTROL")
+    if not ctx.active_commands_enabled:
+        reasons.append("active_commands_enabled_is_false")
+    if ctx.require_physical_control_enable and not ctx.physical_enable_present:
+        reasons.append("physical_enable_required")
+    if item.command_type not in _OWNED_LAB_COMMANDS:
+        reasons.append(f"owned_lab_blocks_{item.command_type.value}")
+    return SafetyDecision(allowed=not reasons, reasons=tuple(reasons))
 
 
 def evaluate_polling_allowed(ctx: ControllerSafetyContext) -> SafetyDecision:

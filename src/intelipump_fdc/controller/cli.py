@@ -92,6 +92,48 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable SQLite persistence (Phase 6-compatible)",
     )
+    parser.add_argument(
+        "--confirm-owned-lab-dispense-session",
+        action="store_true",
+        help=(
+            "OWNED LAB ONLY: enable CD5 price, RESET, and authorize-on-lift. "
+            "Requires --mode BENCH_CONTROL, --price, and the other confirm flags. "
+            "Default remains poll-and-observe / LISTEN_ONLY."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-physical-control-enable",
+        action="store_true",
+        help="Operator confirms the physical control-enable signal is present.",
+    )
+    parser.add_argument(
+        "--enable-active-commands",
+        action="store_true",
+        help="Allow CD5/RESET/AUTHORIZE for this process only (not persisted).",
+    )
+    parser.add_argument(
+        "--price",
+        type=int,
+        default=None,
+        help="Startup unit price as raw BCD digits (e.g. 120 for 00 01 20).",
+    )
+    parser.add_argument(
+        "--logical-nozzle-count",
+        type=int,
+        default=1,
+        choices=(1, 2),
+        help="CD5 nozzle count (default 1).",
+    )
+    parser.add_argument(
+        "--confirm-logical-nozzle-mapping",
+        action="store_true",
+        help="Technician confirms PRI1 is logical nozzle 1.",
+    )
+    parser.add_argument(
+        "--confirm-price-scale-raw-bcd",
+        action="store_true",
+        help="Confirm --price is raw BCD digits (not inferred decimals).",
+    )
     return parser
 
 
@@ -112,6 +154,35 @@ def resolve_duration(duration: float | None) -> float | None:
     return duration
 
 
+def _owned_lab_dispense_or_exit(args: argparse.Namespace, settings) -> None:
+    """Refuse incomplete owned-lab active sessions; keep LISTEN_ONLY default."""
+    if not args.confirm_owned_lab_dispense_session:
+        if args.enable_active_commands or args.confirm_physical_control_enable:
+            raise SystemExit(
+                "active-command flags require --confirm-owned-lab-dispense-session"
+            )
+        return
+    missing: list[str] = []
+    if ControllerMode(args.mode) is not ControllerMode.BENCH_CONTROL:
+        missing.append("--mode BENCH_CONTROL")
+    if settings.environment.upper() != "LAB":
+        missing.append("INTELIPUMP_ENVIRONMENT=LAB")
+    if not args.enable_active_commands:
+        missing.append("--enable-active-commands")
+    if not args.confirm_physical_control_enable:
+        missing.append("--confirm-physical-control-enable")
+    if args.price is None:
+        missing.append("--price N")
+    if not args.confirm_logical_nozzle_mapping:
+        missing.append("--confirm-logical-nozzle-mapping")
+    if not args.confirm_price_scale_raw_bcd:
+        missing.append("--confirm-price-scale-raw-bcd")
+    if missing:
+        raise SystemExit(
+            "owned-lab dispense session refused; missing: " + ", ".join(missing)
+        )
+
+
 def run(argv: list[str] | None = None) -> None:
     settings = get_settings()
     parser = build_parser()
@@ -128,7 +199,8 @@ def run(argv: list[str] | None = None) -> None:
 
     mode = ControllerMode(args.mode)
     if mode is ControllerMode.FIELD_CONTROL:
-        raise SystemExit("FIELD_CONTROL is not permitted in Phase 7")
+        raise SystemExit("FIELD_CONTROL is not permitted")
+    _owned_lab_dispense_or_exit(args, settings)
 
     if args.reset_lab_database:
         if settings.environment.upper() != "LAB":
@@ -149,13 +221,16 @@ def run(argv: list[str] | None = None) -> None:
         print(f"LAB database reset: {args.database_url}")
 
     async def _main() -> None:
+        owned = bool(args.confirm_owned_lab_dispense_session)
         safety = ControllerSafetyContext(
             environment=settings.environment,
             mode=mode,
-            active_commands_enabled=False,
+            active_commands_enabled=bool(args.enable_active_commands) and owned,
             require_physical_control_enable=True,
-            physical_enable_present=False,
+            physical_enable_present=bool(args.confirm_physical_control_enable)
+            and owned,
             allow_virtual_polling=True,
+            owned_lab_active_session=owned,
         )
         # Keep default LAB helper available for tests; CLI always overrides.
         _ = default_lab_safety
@@ -188,21 +263,17 @@ def run(argv: list[str] | None = None) -> None:
             log_frames=args.log_frames,
             log_dart_timing=args.log_dart_timing,
             feature_flags=WayneFeatureFlags(
-                poll_and_observe=settings.safety.poll_and_observe,
-                automatic_startup_price_programming=(
-                    settings.safety.automatic_startup_price_programming
-                ),
-                automatic_reset=settings.safety.automatic_reset,
-                automatic_authorization=(
-                    settings.safety.automatic_authorization_enabled
-                ),
-                automatic_transaction_publishing=(
-                    settings.safety.automatic_transaction_publishing
-                ),
+                poll_and_observe=not owned,
+                automatic_startup_price_programming=owned,
+                automatic_reset=owned,
+                automatic_authorization=owned,
+                automatic_transaction_publishing=False,
             ),
             liveness=liveness,
             notifier=notifier,
             status_interval_s=settings.watchdog.status_interval_s,
+            startup_unit_price=args.price if owned else None,
+            logical_nozzle_count=args.logical_nozzle_count,
         )
         loop_ctrl = ControllerLoop(runtime)
         persistence = None
@@ -246,6 +317,12 @@ def run(argv: list[str] | None = None) -> None:
             f"db={args.database_url if not args.no_persistence else 'disabled'} "
             f"watchdog={notifier.enabled}"
         )
+        if owned:
+            print(
+                "[OWNED-LAB] dispense session ON: CD5 "
+                f"price={args.price} RESET=yes AUTHORIZE-on-lift=yes "
+                "(this process only; not persisted)"
+            )
         # READY only after config, safety, DB recovery, and serial runtime init.
         notifier.ready(
             status=(
@@ -290,8 +367,12 @@ def run(argv: list[str] | None = None) -> None:
             for addr, info in pumps.items():
                 assert isinstance(info, dict)
                 print(
-                    f"  pump {addr}: state={info['state']} "
-                    f"comm={info['communication']} err={info['last_error']}"
+                    f"  pump {addr}: comm={info.get('communication')} "
+                    f"sync={info.get('state_synchronized')} "
+                    f"dc1={info.get('observed_status')} "
+                    f"nozio={info.get('nozzle_position')} "
+                    f"sale={info.get('sale_lifecycle')} "
+                    f"err={info.get('last_error')}"
                 )
             if persistence is not None and args.show_recovery_report:
                 print(

@@ -20,12 +20,13 @@ from intelipump_fdc.controller.exchange_result import (
     ExchangeResultStatus,
 )
 from intelipump_fdc.controller.feature_flags import WayneFeatureFlags
-from intelipump_fdc.controller.outbound import OutboundQueue
+from intelipump_fdc.controller.outbound import OutboundQueue, OutboundRejectedError
 from intelipump_fdc.controller.poll_scheduler import PollSchedulerConfig
 from intelipump_fdc.controller.pump_session import PumpSession
-from intelipump_fdc.controller.rx_demux import AddressFrameDemux
+from intelipump_fdc.controller.rx_demux import AddressFrameDemux, TimestampedFrame
 from intelipump_fdc.controller.safety import (
     ControllerSafetyContext,
+    evaluate_outbound_safety,
     evaluate_polling_allowed,
 )
 from intelipump_fdc.controller.session_events import (
@@ -35,6 +36,7 @@ from intelipump_fdc.controller.session_events import (
 )
 from intelipump_fdc.controller.session_models import (
     IdempotencyClass,
+    NozzlePosition,
     ObservedStatus,
     OutboundDataItem,
 )
@@ -42,13 +44,14 @@ from intelipump_fdc.core.config import ControllerMode
 from intelipump_fdc.core.liveness import LivenessSnapshot, LivenessTracker
 from intelipump_fdc.core.systemd_notify import Notifier, NullNotifier
 from intelipump_fdc.domain.pump_command import PumpCommand
+from intelipump_fdc.protocol.cd2 import build_cd2_allowed_nozzles
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import build_ack, build_data_frame
 from intelipump_fdc.protocol.dart.transport.base import ByteTransport
 from intelipump_fdc.simulator.config import next_sequence
-from intelipump_fdc.simulator.encoding import encode_cd1_command
+from intelipump_fdc.simulator.encoding import encode_cd1_command, encode_cd5_price_update
 
 
 @dataclass
@@ -79,6 +82,8 @@ class ControllerRuntime:
     status_interval_s: float = 15.0
     serial_health: SerialHealthMonitor | None = None
     health_transitions: HealthTransitionLog = field(default_factory=HealthTransitionLog)
+    startup_unit_price: int | None = None
+    logical_nozzle_count: int = 1
 
 
 class ControllerLoop:
@@ -134,6 +139,12 @@ class ControllerLoop:
         self._last_status_mono: float | None = None
         self._ever_opened = False
         self._rx_task: asyncio.Task[None] | None = None
+        self._last_nozzle: dict[int, NozzlePosition] = {}
+        self._last_status: dict[int, ObservedStatus] = {}
+        self._price_programmed: set[int] = set()
+        self._startup_reset_done: set[int] = set()
+        self._auth_this_lift: set[int] = set()
+        self._rs_poll_counter: dict[int, int] = {}
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
         self.runtime.liveness.notify_socket_present = (
@@ -437,6 +448,8 @@ class ControllerLoop:
         session.tick_awaiting_completion()
         if outcome != "timeout":
             self.runtime.liveness.mark_successful_poll()
+        self._report_observed_changes(session)
+        await self._owned_lab_tick(session)
         self._refresh_totals()
 
     async def _read_poll_session(
@@ -448,7 +461,8 @@ class ControllerLoop:
         """Wait through empty queue reads until EOT, deadline, or no response.
 
         Processes all correlated DATA for the address until EOT or timeout.
-        Temporary emptiness does not end the exchange.
+        Temporary emptiness does not end the exchange. Leftover/stale CRC-valid
+        DATA is still applied and ACKed so the pump is not left repeating.
         """
         wire = session.wire_address
         timeout_ms = self.runtime.config.response_timeout_ms
@@ -463,74 +477,133 @@ class ControllerLoop:
                 wire, timeout_s=min(0.01, max(0.0, remaining))
             )
             if stamped is None:
-                # Temporary empty ≠ end of exchange.
                 continue
-            if stamped.first_byte_time < not_before_mono:
-                self.demux.stale_frame_count += 1
-                session.state.stats.stale_frame_count += 1
-                if self.runtime.log_dart_timing:
-                    print(
-                        f"RX stale addr={session.address} "
-                        f"first={stamped.first_byte_time:.6f} "
-                        f"tx={not_before_mono:.6f} {stamped.raw.hex(' ')}"
-                    )
+            terminal, saw_data, first_byte_marked = await self._ingest_poll_frame(
+                session,
+                stamped,
+                not_before_mono=not_before_mono,
+                first_byte_marked=first_byte_marked,
+            )
+            if saw_data:
+                got_data = True
+            if terminal == "skip":
                 continue
-
-            if not first_byte_marked:
-                first_byte_marked = True
-                latency_ms = (stamped.first_byte_time - not_before_mono) * 1000.0
-                self.runtime.events.publish(
-                    ControllerEvent(
-                        type=ControllerEventType.FIRST_RESPONSE_BYTE,
-                        address=session.address,
-                        timestamp=datetime.now(UTC),
-                        payload={
-                            "first_byte_monotonic_s": stamped.first_byte_time,
-                            "last_byte_monotonic_s": stamped.last_byte_time,
-                            "latency_ms": latency_ms,
-                            "raw_hex": stamped.raw.hex(" "),
-                        },
-                    )
-                )
-                if self.runtime.log_dart_timing:
-                    print(
-                        f"RX first-byte addr={session.address} "
-                        f"latency_ms={latency_ms:.1f}"
-                    )
-
             got_response = True
-            frame = stamped.frame
-            if self.runtime.log_frames:
-                print(f"RX frame {frame.control_type} {stamped.raw.hex(' ')}")
-
-            if frame.control_type is ControlType.EOT:
-                session.handle_response_frame(
-                    frame, capture_mono=stamped.first_byte_time
-                )
+            if terminal == "eot":
                 return "eot"
 
-            if frame.control_type is ControlType.DATA:
+        # Grace drain: frame finished assembling after the software deadline.
+        while True:
+            extra = self.demux.get_nowait(wire)
+            if extra is None:
+                break
+            terminal, saw_data, first_byte_marked = await self._ingest_poll_frame(
+                session,
+                extra,
+                not_before_mono=not_before_mono,
+                first_byte_marked=first_byte_marked,
+            )
+            if saw_data:
                 got_data = True
+            if terminal == "skip":
+                continue
+            got_response = True
+            if terminal == "eot":
+                return "eot"
+
+        if got_data:
+            return "data"
+        if not got_response:
+            return "timeout"
+        return "short_bus"
+
+    async def _ingest_poll_frame(
+        self,
+        session: PumpSession,
+        stamped: TimestampedFrame,
+        *,
+        not_before_mono: float,
+        first_byte_marked: bool,
+    ) -> tuple[str, bool, bool]:
+        """Apply one demuxed frame. Returns (terminal, saw_data, first_byte_marked).
+
+        terminal: ``eot`` | ``data`` | ``short`` | ``skip``
+        """
+        stale = stamped.last_byte_time < not_before_mono
+        frame = stamped.frame
+        if stale:
+            self.demux.stale_frame_count += 1
+            session.state.stats.stale_frame_count += 1
+            if frame.control_type is ControlType.DATA:
                 ack = session.handle_response_frame(
                     frame, capture_mono=stamped.first_byte_time
                 )
                 if ack is not None:
-                    await self._write_frame(ack, address=session.address, note="ACK")
-                continue
+                    await self._write_frame(
+                        ack, address=session.address, note="ACK_STALE"
+                    )
+                if self.runtime.log_frames or self.runtime.log_dart_timing:
+                    print(
+                        f"RX stale-applied DATA addr={session.address} "
+                        f"{stamped.raw.hex(' ')}"
+                    )
+                return ("more", True, first_byte_marked)
+            if self.runtime.log_dart_timing:
+                print(
+                    f"RX stale addr={session.address} "
+                    f"first={stamped.first_byte_time:.6f} "
+                    f"tx={not_before_mono:.6f} {stamped.raw.hex(' ')}"
+                )
+            return ("skip", False, first_byte_marked)
 
-            # Recognized short bus response — keep online, continue until EOT/deadline.
+        if not first_byte_marked:
+            first_byte_marked = True
+            latency_ms = (stamped.first_byte_time - not_before_mono) * 1000.0
+            self.runtime.events.publish(
+                ControllerEvent(
+                    type=ControllerEventType.FIRST_RESPONSE_BYTE,
+                    address=session.address,
+                    timestamp=datetime.now(UTC),
+                    payload={
+                        "first_byte_monotonic_s": stamped.first_byte_time,
+                        "last_byte_monotonic_s": stamped.last_byte_time,
+                        "latency_ms": latency_ms,
+                        "raw_hex": stamped.raw.hex(" "),
+                    },
+                )
+            )
+            if self.runtime.log_dart_timing:
+                print(
+                    f"RX first-byte addr={session.address} "
+                    f"latency_ms={latency_ms:.1f}"
+                )
+
+        if self.runtime.log_frames:
+            print(f"RX frame {frame.control_type} {stamped.raw.hex(' ')}")
+
+        if frame.control_type is ControlType.EOT:
             session.handle_response_frame(
                 frame, capture_mono=stamped.first_byte_time
             )
+            return ("eot", False, first_byte_marked)
 
-        if not got_response:
-            return "timeout"
-        if got_data:
-            return "data"
-        # Short bus activity without EOT still counts as a response (not offline).
-        return "short_bus"
+        if frame.control_type is ControlType.DATA:
+            ack = session.handle_response_frame(
+                frame, capture_mono=stamped.first_byte_time
+            )
+            if ack is not None:
+                await self._write_frame(ack, address=session.address, note="ACK")
+            return ("more", True, first_byte_marked)
+
+        session.handle_response_frame(frame, capture_mono=stamped.first_byte_time)
+        return ("short", False, first_byte_marked)
 
     async def _handle_timeout_with_retries(self, session: PumpSession) -> None:
+        # Leftover DATA from the timed-out window may still be in the queue.
+        leftover = await self._drain_pending_data(session)
+        if leftover:
+            self.runtime.liveness.mark_successful_poll()
+            return
         session.note_missed_bus_response()
         for _ in range(self.runtime.config.max_retries):
             if self._stop.is_set():
@@ -544,7 +617,28 @@ class ControllerLoop:
             if outcome != "timeout":
                 self.runtime.liveness.mark_successful_poll()
                 return
+            leftover = await self._drain_pending_data(session)
+            if leftover:
+                self.runtime.liveness.mark_successful_poll()
+                return
             session.note_missed_bus_response()
+
+    async def _drain_pending_data(self, session: PumpSession) -> bool:
+        """ACK/apply any queued DATA for this address. True if DATA was applied."""
+        applied = False
+        while True:
+            stamped = self.demux.get_nowait(session.wire_address)
+            if stamped is None:
+                return applied
+            terminal, saw_data, _ = await self._ingest_poll_frame(
+                session,
+                stamped,
+                not_before_mono=0.0,
+                first_byte_marked=True,
+            )
+            if saw_data or terminal in {"eot", "data"}:
+                applied = True
+        return applied
 
     async def _maybe_send_outbound(self, session: PumpSession) -> ExchangeResult | None:
         # Feature flags: never auto-issue actives from poll-and-observe defaults.
@@ -622,6 +716,15 @@ class ControllerLoop:
             if stamped.first_byte_time < write_complete:
                 self.demux.stale_frame_count += 1
                 session.state.stats.stale_frame_count += 1
+                if stamped.frame.control_type is ControlType.DATA:
+                    ack = session.handle_response_frame(
+                        stamped.frame, capture_mono=stamped.first_byte_time
+                    )
+                    preserved += 1
+                    if ack is not None:
+                        await self._write_frame(
+                            ack, address=session.address, note="ACK_STALE"
+                        )
                 continue
 
             frame = stamped.frame
@@ -704,6 +807,198 @@ class ControllerLoop:
             if session.status_observed_after(expected, not_before_mono=not_before_mono):
                 return True
         return False
+
+    def _report_observed_changes(self, session: PumpSession) -> None:
+        addr = session.address
+        pos = session.state.nozzle_position
+        status = session.state.observed_status
+        prev_pos = self._last_nozzle.get(addr)
+        prev_status = self._last_status.get(addr)
+        if prev_pos is not pos:
+            print(
+                f"[NOZIO addr={addr}] {prev_pos.value if prev_pos else 'UNKNOWN'} "
+                f"-> {pos.value}"
+            )
+            if prev_pos is NozzlePosition.OUT and pos is NozzlePosition.IN:
+                self._auth_this_lift.discard(addr)
+            self._last_nozzle[addr] = pos
+        if prev_status is not status:
+            print(
+                f"[DC1 addr={addr}] "
+                f"{prev_status.value if prev_status else 'UNKNOWN'} -> {status.value}"
+            )
+            self._last_status[addr] = status
+
+    async def _owned_lab_tick(self, session: PumpSession) -> None:
+        flags = self.runtime.feature_flags
+        if not self.runtime.safety.owned_lab_active_session:
+            return
+        addr = session.address
+        unknown = (
+            session.state.observed_status is ObservedStatus.UNKNOWN
+            or session.state.nozzle_position is NozzlePosition.UNKNOWN
+        )
+        if unknown:
+            n = self._rs_poll_counter.get(addr, 0) + 1
+            self._rs_poll_counter[addr] = n
+            if n % 5 == 1:
+                result = await self._run_owned_command(
+                    session,
+                    encode_cd1_command(PumpControlCommand.RETURN_STATUS),
+                    PumpCommand.READ_STATUS,
+                    idempotency=IdempotencyClass.IDEMPOTENT,
+                )
+                print(
+                    f"[OWNED-LAB addr={addr}] RETURN_STATUS result={result.status.value}"
+                    f"{':' + result.detail if result.detail else ''}"
+                )
+            return
+
+        if (
+            flags.automatic_startup_price_programming
+            and addr not in self._price_programmed
+            and self.runtime.startup_unit_price is not None
+        ):
+            payload = encode_cd5_price_update(
+                prices_raw=[self.runtime.startup_unit_price]
+                * self.runtime.logical_nozzle_count
+            )
+            result = await self._run_owned_command(
+                session,
+                payload,
+                PumpCommand.SET_PRICE,
+                idempotency=IdempotencyClass.NON_IDEMPOTENT,
+            )
+            print(
+                f"[OWNED-LAB addr={addr}] CD5 price "
+                f"{self.runtime.startup_unit_price} result={result.status.value}"
+            )
+            if result.status in {
+                ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                ExchangeResultStatus.APPLICATION_CONFIRMED,
+            }:
+                self._price_programmed.add(addr)
+
+        if flags.automatic_reset and addr not in self._startup_reset_done:
+            if session.should_skip_reset():
+                self._startup_reset_done.add(addr)
+                print(f"[OWNED-LAB addr={addr}] RESET skipped (already RESET)")
+            else:
+                result = await self._run_owned_command(
+                    session,
+                    encode_cd1_command(PumpControlCommand.RESET),
+                    PumpCommand.RESET,
+                    expect_status=ObservedStatus.RESET,
+                    idempotency=IdempotencyClass.NON_IDEMPOTENT,
+                )
+                print(f"[OWNED-LAB addr={addr}] RESET result={result.status.value}")
+                if result.status in {
+                    ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                    ExchangeResultStatus.APPLICATION_CONFIRMED,
+                }:
+                    self._startup_reset_done.add(addr)
+
+        if (
+            flags.automatic_authorization
+            and session.state.nozzle_position is NozzlePosition.OUT
+            and addr not in self._auth_this_lift
+        ):
+            await self._owned_lab_authorize(session)
+
+    async def _owned_lab_authorize(self, session: PumpSession) -> None:
+        addr = session.address
+        if (
+            session.state.observed_status is not ObservedStatus.RESET
+            and not session.should_skip_reset()
+        ):
+            reset = await self._run_owned_command(
+                session,
+                encode_cd1_command(PumpControlCommand.RESET),
+                PumpCommand.RESET,
+                expect_status=ObservedStatus.RESET,
+                idempotency=IdempotencyClass.NON_IDEMPOTENT,
+            )
+            print(
+                f"[OWNED-LAB addr={addr}] pre-auth RESET "
+                f"result={reset.status.value}"
+            )
+            if reset.status not in {
+                ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                ExchangeResultStatus.APPLICATION_CONFIRMED,
+            }:
+                return
+        nozzle = session.state.logical_nozzle or 1
+        cd2 = build_cd2_allowed_nozzles([nozzle])
+        cd2_res = await self._run_owned_command(
+            session,
+            cd2.application_payload,
+            PumpCommand.AUTHORIZE,
+            idempotency=IdempotencyClass.NON_IDEMPOTENT,
+        )
+        print(f"[OWNED-LAB addr={addr}] CD2 result={cd2_res.status.value}")
+        if cd2_res.status is not ExchangeResultStatus.LINK_ACKNOWLEDGED:
+            return
+        auth = await self._run_owned_command(
+            session,
+            encode_cd1_command(PumpControlCommand.AUTHORIZE),
+            PumpCommand.AUTHORIZE,
+            expect_status=ObservedStatus.AUTHORIZED,
+            idempotency=IdempotencyClass.NON_IDEMPOTENT,
+        )
+        print(f"[OWNED-LAB addr={addr}] AUTHORIZE result={auth.status.value}")
+        if auth.status in {
+            ExchangeResultStatus.LINK_ACKNOWLEDGED,
+            ExchangeResultStatus.APPLICATION_CONFIRMED,
+        }:
+            self._auth_this_lift.add(addr)
+
+    async def _run_owned_command(
+        self,
+        session: PumpSession,
+        payload: bytes,
+        command_type: PumpCommand,
+        *,
+        expect_status: ObservedStatus | None = None,
+        idempotency: IdempotencyClass,
+    ) -> ExchangeResult:
+        item = OutboundDataItem.create(
+            address=session.address,
+            application_payload=payload,
+            command_type=command_type,
+            simulator_only=False,
+            idempotency=idempotency,
+            ttl_ms=30_000,
+            expect_status_after_tx=(
+                expect_status.value if expect_status is not None else None
+            ),
+        )
+        decision = evaluate_outbound_safety(item, self.runtime.safety)
+        if not decision.allowed:
+            print(
+                f"[OWNED-LAB addr={session.address}] blocked {command_type.value}: "
+                f"{','.join(decision.reasons)}"
+            )
+            return ExchangeResult(
+                status=ExchangeResultStatus.REJECTED,
+                address=session.address,
+                detail=",".join(decision.reasons),
+            )
+        try:
+            self.runtime.outbound.enqueue(item, self.runtime.safety)
+        except OutboundRejectedError as exc:
+            return ExchangeResult(
+                status=ExchangeResultStatus.REJECTED,
+                address=session.address,
+                detail=",".join(exc.reasons),
+            )
+        result = await self._maybe_send_outbound(session)
+        if result is None:
+            return ExchangeResult(
+                status=ExchangeResultStatus.REJECTED,
+                address=session.address,
+                detail="outbound_not_sent",
+            )
+        return result
 
     async def _write_frame(self, data: bytes, *, address: int, note: str) -> float:
         """Write frame; return write-complete monotonic timestamp."""
