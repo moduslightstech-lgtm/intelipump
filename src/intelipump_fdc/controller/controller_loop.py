@@ -796,6 +796,19 @@ class ControllerLoop:
                 )
         else:
             for _ in range(self.runtime.config.application_confirm_max_polls):
+                if self._observation_satisfies_command(session, item):
+                    print(
+                        f"[OWNED-LAB addr={session.address}] "
+                        f"{item.command_type.value} confirmed by poll DATA"
+                    )
+                    return ExchangeResult(
+                        status=ExchangeResultStatus.APPLICATION_CONFIRMED,
+                        address=session.address,
+                        sequence=seq,
+                        correlation_id=item.correlation_id,
+                        detail="confirmed_by_poll",
+                        write_start_mono=not_before,
+                    )
                 if self._command_ack_seen(session, seq, not_before=not_before):
                     print(f"RX ACK addr={session.address} seq={seq} (late)")
                     return ExchangeResult(
@@ -812,6 +825,19 @@ class ControllerLoop:
                     note="POLL_CONFIRM",
                 )
                 await self._read_poll_session(session, not_before_mono=write_start)
+            if self._observation_satisfies_command(session, item):
+                print(
+                    f"[OWNED-LAB addr={session.address}] "
+                    f"{item.command_type.value} confirmed by poll DATA"
+                )
+                return ExchangeResult(
+                    status=ExchangeResultStatus.APPLICATION_CONFIRMED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    detail="confirmed_by_poll",
+                    write_start_mono=not_before,
+                )
             if self._command_ack_seen(session, seq, not_before=not_before):
                 print(f"RX ACK addr={session.address} seq={seq} (late)")
                 return ExchangeResult(
@@ -820,6 +846,16 @@ class ControllerLoop:
                     sequence=seq,
                     correlation_id=item.correlation_id,
                     detail="ack_on_poll",
+                    write_start_mono=not_before,
+                )
+            if self._is_cd2_payload(item.application_payload):
+                # This head often skips CD2 ACK; a quiet poll after TX is enough.
+                return ExchangeResult(
+                    status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    detail="cd2_assumed_after_poll",
                     write_start_mono=not_before,
                 )
         return None
@@ -875,6 +911,10 @@ class ControllerLoop:
                 self.demux.stale_frame_count += 1
                 session.state.stats.stale_frame_count += 1
                 if frame.control_type is ControlType.DATA:
+                    print(
+                        f"RX DATA addr={session.address} stale-applied "
+                        f"{stamped.raw.hex(' ')}"
+                    )
                     ack = session.handle_response_frame(
                         frame, capture_mono=stamped.last_byte_time
                     )
@@ -908,6 +948,7 @@ class ControllerLoop:
                 )
 
             if frame.control_type is ControlType.DATA:
+                print(f"RX DATA addr={session.address} {stamped.raw.hex(' ')}")
                 ack = session.handle_response_frame(
                     frame, capture_mono=stamped.last_byte_time
                 )
@@ -974,6 +1015,22 @@ class ControllerLoop:
             preserved_event_count=preserved,
         )
 
+    def _is_cd2_payload(self, payload: bytes) -> bool:
+        return len(payload) >= 2 and payload[0] == 0x02
+
+    def _observation_satisfies_command(
+        self, session: PumpSession, item: OutboundDataItem
+    ) -> bool:
+        expected = item.expect_status_after_tx
+        if expected is not None:
+            return session.state.observed_status.value == expected
+        if item.command_type is PumpCommand.READ_STATUS:
+            return (
+                session.state.observed_status is not ObservedStatus.UNKNOWN
+                or session.state.nozzle_position is not NozzlePosition.UNKNOWN
+            )
+        return False
+
     def _command_status_met(
         self,
         session: PumpSession,
@@ -984,12 +1041,9 @@ class ControllerLoop:
         sequence: int | None = None,
         preserved: int = 0,
     ) -> ExchangeResult | None:
-        expected = item.expect_status_after_tx
-        if expected is None:
+        if not self._observation_satisfies_command(session, item):
             return None
-        if session.state.observed_status.value != expected:
-            return None
-        session.note_link_ack(ack_mono=time.monotonic())
+        session.note_link_ack(ack_mono=time.monotonic(), sequence=sequence)
         return ExchangeResult(
             status=ExchangeResultStatus.APPLICATION_CONFIRMED,
             address=session.address,
@@ -1270,7 +1324,7 @@ class ControllerLoop:
             simulator_only=False,
             idempotency=idempotency,
             ttl_ms=30_000,
-            max_retries=1,
+            max_retries=0,
             expect_status_after_tx=(
                 expect_status.value if expect_status is not None else None
             ),

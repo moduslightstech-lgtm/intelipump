@@ -475,7 +475,10 @@ async def test_data_during_command_wait_processed_and_acked() -> None:
         t = asyncio.create_task(_pump_side())
         result = await loop._send_outbound_once(session, item, seq=0)
         await t
-        assert result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED
+        assert result.status in {
+            ExchangeResultStatus.LINK_ACKNOWLEDGED,
+            ExchangeResultStatus.APPLICATION_CONFIRMED,
+        }
         assert result.preserved_event_count >= 1
         assert session.state.stats.data_count >= 1
         assert session.state.stats.ack_sent_count >= 1
@@ -832,6 +835,35 @@ async def test_recover_reset_when_dc1_already_observed() -> None:
         simulator_only=True,
         idempotency=IdempotencyClass.NON_IDEMPOTENT,
         expect_status_after_tx=ObservedStatus.RESET.value,
+        max_retries=0,
+    )
+    result = await loop._recover_command_after_timeout(
+        session, item, seq=0, not_before=time.monotonic() - 1.0
+    )
+    assert result is not None
+    assert result.status is ExchangeResultStatus.APPLICATION_CONFIRMED
+    await ctrl.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_return_status_when_dc1_known() -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    await ctrl.open()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,), response_timeout_ms=50),
+    )
+    loop = ControllerLoop(runtime)
+    session = loop.sessions[1]
+    session.state.observed_status = ObservedStatus.RESET
+    session.state.nozzle_position = NozzlePosition.IN
+    item = OutboundDataItem.create(
+        address=1,
+        application_payload=bytes((0x01, 0x01, 0x00)),
+        command_type=PumpCommand.READ_STATUS,
+        simulator_only=True,
+        idempotency=IdempotencyClass.IDEMPOTENT,
         max_retries=0,
     )
     result = await loop._recover_command_after_timeout(
