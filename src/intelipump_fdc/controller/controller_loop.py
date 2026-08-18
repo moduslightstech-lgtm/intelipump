@@ -471,12 +471,12 @@ class ControllerLoop:
         if outcome != "timeout":
             self.runtime.liveness.mark_successful_poll()
         self._report_observed_changes(session)
-        # Prefer a quiet bus (EOT / short / timeout) before CD5/RESET/AUTH.
-        # Still tick while DC1/NOZIO are UNKNOWN so RETURN_STATUS can run.
         unknown = (
             session.state.observed_status is ObservedStatus.UNKNOWN
             or session.state.nozzle_position is NozzlePosition.UNKNOWN
         )
+        if unknown and outcome != "eot":
+            print(f"[BUS addr={address}] poll={outcome}")
         if outcome in {"eot", "short_bus", "timeout"} or unknown:
             await self._owned_lab_tick(session)
         self._refresh_totals()
@@ -773,6 +773,10 @@ class ControllerLoop:
 
         Poll after ACK timeout to pick up DC1 / a late matching ACK.
         """
+        print(
+            f"[OWNED-LAB addr={session.address}] polling after "
+            f"{item.command_type.value} (no link ACK yet)"
+        )
         await self._drain_pending_data(session)
         expected = item.expect_status_after_tx
         if expected is not None:
@@ -1187,9 +1191,18 @@ class ControllerLoop:
                 )
                 print(
                     f"[OWNED-LAB addr={addr}] RETURN_STATUS result={result.status.value}"
-                    f"{':' + result.detail if result.detail else ''}"
+                    f"{':' + result.detail if result.detail else ''} "
+                    f"dc1={session.state.observed_status.value} "
+                    f"nozio={session.state.nozzle_position.value}"
                 )
-            return
+            still_blank = (
+                session.state.observed_status is ObservedStatus.UNKNOWN
+                and session.state.nozzle_position is NozzlePosition.UNKNOWN
+            )
+            if still_blank and n < 6:
+                return
+            # Idle Wayne is EOT-only; after a few RS attempts still send CD5/RESET
+            # so a later DC1 can confirm. Do not block forever in RETURN_STATUS.
 
         if self._should_hold_sale_display(session):
             self._startup_reset_done.add(addr)
