@@ -699,15 +699,24 @@ def test_hold_sale_display_until_next_lift() -> None:
     session = loop.sessions[1]
     session.state.nozzle_position = NozzlePosition.IN
     session.state.observed_status = ObservedStatus.FILLING_COMPLETED
+    session.state.sale_lifecycle = SaleLifecycle.FILLING_COMPLETED
+    session.state.sale_evidence.lifecycle = SaleLifecycle.FILLING_COMPLETED
+    session.state.sale_evidence.peak_volume_raw = 833
+    session.state.sale_evidence.peak_amount_raw = 100000
     session.state.filled_volume_raw = 833
     assert loop._should_hold_sale_display(session) is True
-    session.state.filled_volume_raw = 0
-    assert loop._should_hold_sale_display(session) is False
-    session.state.filled_volume_raw = 833
     session.state.nozzle_position = NozzlePosition.OUT
+    session.state.sale_lifecycle = SaleLifecycle.NOZZLE_LIFTED
+    session.state.sale_evidence.lifecycle = SaleLifecycle.NOZZLE_LIFTED
     assert loop._should_hold_sale_display(session) is False
     session.state.nozzle_position = NozzlePosition.IN
     session.state.observed_status = ObservedStatus.RESET
+    session.state.sale_lifecycle = SaleLifecycle.IDLE
+    assert loop._should_hold_sale_display(session) is False
+    session.state.observed_status = ObservedStatus.FILLING_COMPLETED
+    session.state.sale_lifecycle = SaleLifecycle.ABORTED_NO_DELIVERY
+    session.state.sale_evidence.lifecycle = SaleLifecycle.ABORTED_NO_DELIVERY
+    session.state.filled_volume_raw = 833
     assert loop._should_hold_sale_display(session) is False
 
 
@@ -798,7 +807,7 @@ def test_initial_unknown_status_is_not_logged(capsys) -> None:
     assert "[DC1" not in out
 
 
-def test_lift_after_held_sale_defers_reset() -> None:
+def test_lift_after_held_sale_does_not_defer_reset() -> None:
     ctrl, _pump = create_memory_transport_pair()
     loop = ControllerLoop(
         ControllerRuntime(
@@ -812,7 +821,7 @@ def test_lift_after_held_sale_defers_reset() -> None:
     loop._last_nozzle[1] = NozzlePosition.IN
     session.state.nozzle_position = NozzlePosition.OUT
     loop._report_observed_changes(session)
-    assert 1 in loop._defer_post_sale_auth
+    assert loop._should_hold_sale_display(session) is False
 
 
 @pytest.mark.asyncio

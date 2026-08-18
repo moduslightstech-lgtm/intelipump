@@ -155,7 +155,6 @@ class ControllerLoop:
         self._last_unit_price: dict[int, int] = {}
         self._last_completed_sale: dict[int, dict[str, int | None]] = {}
         self._sale_display_held: set[int] = set()
-        self._defer_post_sale_auth: set[int] = set()
         self._startup_price_attempted: set[int] = set()
         self._startup_reset_attempted: set[int] = set()
         self._bus_silent_warned: set[int] = set()
@@ -469,7 +468,9 @@ class ControllerLoop:
             session, not_before_mono=_write_start
         )
         if outcome == "timeout":
-            await self._handle_timeout_with_retries(session)
+            recovered = await self._handle_timeout_with_retries(session)
+            if recovered:
+                outcome = "data"
         session.tick_awaiting_completion()
         if outcome != "timeout":
             self.runtime.liveness.mark_successful_poll()
@@ -478,9 +479,14 @@ class ControllerLoop:
             session.state.observed_status is ObservedStatus.UNKNOWN
             or session.state.nozzle_position is NozzlePosition.UNKNOWN
         )
+        silent = (
+            outcome == "timeout"
+            and unknown
+            and session.state.nozzle_position is not NozzlePosition.OUT
+        )
         if unknown and outcome != "eot":
             print(f"[BUS addr={address}] poll={outcome}")
-        if outcome == "timeout":
+        if silent:
             if address not in self._bus_silent_warned:
                 self._bus_silent_warned.add(address)
                 print(
@@ -489,9 +495,6 @@ class ControllerLoop:
                 )
         else:
             self._bus_silent_warned.discard(address)
-        if outcome in {"eot", "short_bus", "data"} or (
-            unknown and outcome != "timeout"
-        ):
             await self._owned_lab_tick(session)
         self._refresh_totals()
 
@@ -650,16 +653,16 @@ class ControllerLoop:
         session.handle_response_frame(frame, capture_mono=stamped.first_byte_time)
         return ("short", False, first_byte_marked)
 
-    async def _handle_timeout_with_retries(self, session: PumpSession) -> None:
-        # Leftover DATA from the timed-out window may still be in the queue.
+    async def _handle_timeout_with_retries(self, session: PumpSession) -> bool:
+        """True if leftover DATA or a retry recovered the poll."""
         leftover = await self._drain_pending_data(session)
         if leftover:
             self.runtime.liveness.mark_successful_poll()
-            return
+            return True
         session.note_missed_bus_response()
         for _ in range(self.runtime.config.max_retries):
             if self._stop.is_set():
-                return
+                return False
             _write_start, _write_complete = await self._write_frame(
                 session.build_poll(), address=session.address, note="POLL_RETRY"
             )
@@ -668,12 +671,13 @@ class ControllerLoop:
             )
             if outcome != "timeout":
                 self.runtime.liveness.mark_successful_poll()
-                return
+                return True
             leftover = await self._drain_pending_data(session)
             if leftover:
                 self.runtime.liveness.mark_successful_poll()
-                return
+                return True
             session.note_missed_bus_response()
+        return False
 
     async def _drain_pending_data(self, session: PumpSession) -> bool:
         """ACK/apply any queued DATA for this address. True if DATA was applied."""
@@ -1112,12 +1116,6 @@ class ControllerLoop:
                 )
             if prev_pos is NozzlePosition.OUT and pos is NozzlePosition.IN:
                 self._auth_this_lift.discard(addr)
-            if (
-                prev_pos is NozzlePosition.IN
-                and pos is NozzlePosition.OUT
-                and addr in self._sale_display_held
-            ):
-                self._defer_post_sale_auth.add(addr)
             self._last_nozzle[addr] = pos
         if prev_status is not status:
             if prev_status is not None or status is not ObservedStatus.UNKNOWN:
@@ -1172,16 +1170,28 @@ class ControllerLoop:
         Normal Wayne / ePump sequence: hang-up shows volume and amount; RESET
         (which clears the display) runs only when the nozzle is lifted again.
         Do not copy the working-controller immediate RESET on completion.
+        Do not hold after a zero-delivery hang-up (ABORTED_NO_DELIVERY).
         """
         if session.state.nozzle_position is not NozzlePosition.IN:
+            return False
+        if session.state.sale_lifecycle in {
+            SaleLifecycle.ABORTED_NO_DELIVERY,
+            SaleLifecycle.ABORTED,
+            SaleLifecycle.NOZZLE_LIFTED,
+            SaleLifecycle.AUTHORIZED,
+            SaleLifecycle.FILLING,
+        }:
+            return False
+        if session.state.sale_lifecycle not in {
+            SaleLifecycle.FILLING_COMPLETED,
+            SaleLifecycle.CLOSED,
+        }:
             return False
         if session.state.observed_status not in {
             ObservedStatus.FILLING_COMPLETED,
             ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
         }:
             return False
-        if session.state.filled_volume_raw > 0:
-            return True
         return session.state.sale_evidence.has_positive_delivery
 
     async def _owned_lab_tick(self, session: PumpSession) -> None:
@@ -1228,14 +1238,6 @@ class ControllerLoop:
                 )
             return
         self._sale_display_held.discard(session.address)
-
-        if addr in self._defer_post_sale_auth:
-            self._defer_post_sale_auth.discard(addr)
-            print(
-                f"[OWNED-LAB addr={addr}] lift after sale; waiting one quiet poll "
-                "before RESET"
-            )
-            return
 
         if (
             flags.automatic_startup_price_programming
