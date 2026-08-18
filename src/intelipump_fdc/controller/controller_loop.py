@@ -34,6 +34,7 @@ from intelipump_fdc.controller.session_events import (
     ControllerEventType,
     EventBus,
 )
+from intelipump_fdc.controller.sale_lifecycle import SaleLifecycle
 from intelipump_fdc.controller.session_models import (
     IdempotencyClass,
     NozzlePosition,
@@ -65,6 +66,13 @@ class ControllerTotals:
     duplicate_count: int = 0
     stale_frame_count: int = 0
     malformed_count: int = 0
+
+
+def format_raw_as_2dp(raw: int) -> str:
+    """Display-only 2-decimal view of a packed-BCD integer (DC7 decimals unknown)."""
+    sign = "-" if raw < 0 else ""
+    magnitude = abs(raw)
+    return f"{sign}{magnitude // 100}.{magnitude % 100:02d}"
 
 
 @dataclass
@@ -142,6 +150,10 @@ class ControllerLoop:
         self._rx_task: asyncio.Task[None] | None = None
         self._last_nozzle: dict[int, NozzlePosition] = {}
         self._last_status: dict[int, ObservedStatus] = {}
+        self._last_dc2: dict[int, tuple[int, int]] = {}
+        self._last_sale: dict[int, SaleLifecycle] = {}
+        self._last_unit_price: dict[int, int] = {}
+        self._last_completed_sale: dict[int, dict[str, int | None]] = {}
         self._price_programmed: set[int] = set()
         self._startup_reset_done: set[int] = set()
         self._auth_this_lift: set[int] = set()
@@ -584,11 +596,9 @@ class ControllerLoop:
             latency_for_print = None
 
         if frame.control_type is ControlType.DATA:
-            extra = (
-                f" latency_ms={latency_for_print:.1f}"
-                if latency_for_print is not None
-                else ""
-            )
+            extra = ""
+            if latency_for_print is not None and latency_for_print >= 0:
+                extra = f" latency_ms={latency_for_print:.1f}"
             print(
                 f"RX DATA addr={session.address}{extra} {stamped.raw.hex(' ')}"
             )
@@ -847,6 +857,45 @@ class ControllerLoop:
                 f"{prev_status.value if prev_status else 'UNKNOWN'} -> {status.value}"
             )
             self._last_status[addr] = status
+        price = session.state.unit_price_raw
+        if price is not None and self._last_unit_price.get(addr) != price:
+            print(f"[DC3 addr={addr}] unit_price_raw={price}")
+            self._last_unit_price[addr] = price
+        vol = session.state.filled_volume_raw
+        amt = session.state.filled_amount_raw
+        prev_dc2 = self._last_dc2.get(addr)
+        if prev_dc2 != (vol, amt) and (vol > 0 or amt > 0 or prev_dc2 is not None):
+            print(
+                f"[DC2 addr={addr}] volume_raw={vol} amount_raw={amt} "
+                f"volume={format_raw_as_2dp(vol)} amount={format_raw_as_2dp(amt)}"
+            )
+            self._last_dc2[addr] = (vol, amt)
+        life = session.state.sale_lifecycle
+        prev_life = self._last_sale.get(addr)
+        if life is not prev_life:
+            if life in {
+                SaleLifecycle.FILLING_COMPLETED,
+                SaleLifecycle.CLOSED,
+                SaleLifecycle.ABORTED_NO_DELIVERY,
+                SaleLifecycle.ABORTED,
+            }:
+                ev = session.state.sale_evidence
+                peak_vol = ev.peak_volume_raw
+                peak_amt = ev.peak_amount_raw
+                print(
+                    f"[SALE addr={addr}] {life.value} "
+                    f"volume_raw={peak_vol} amount_raw={peak_amt} "
+                    f"volume={format_raw_as_2dp(peak_vol)} "
+                    f"amount={format_raw_as_2dp(peak_amt)} "
+                    f"unit_price_raw={price}"
+                )
+                if life in {SaleLifecycle.FILLING_COMPLETED, SaleLifecycle.CLOSED}:
+                    self._last_completed_sale[addr] = {
+                        "volume_raw": peak_vol,
+                        "amount_raw": peak_amt,
+                        "unit_price_raw": price,
+                    }
+            self._last_sale[addr] = life
 
     async def _owned_lab_tick(self, session: PumpSession) -> None:
         flags = self.runtime.feature_flags
@@ -1117,6 +1166,10 @@ class ControllerLoop:
                     "observed_status": s.state.observed_status.value,
                     "nozzle_position": s.state.nozzle_position.value,
                     "sale_lifecycle": s.state.sale_lifecycle.value,
+                    "filled_volume_raw": s.state.filled_volume_raw,
+                    "filled_amount_raw": s.state.filled_amount_raw,
+                    "unit_price_raw": s.state.unit_price_raw,
+                    "last_completed_sale": self._last_completed_sale.get(addr),
                     "stats": {
                         "poll": s.state.stats.poll_count,
                         "eot": s.state.stats.eot_count,

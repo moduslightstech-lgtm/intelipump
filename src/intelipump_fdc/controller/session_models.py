@@ -162,6 +162,7 @@ class PumpSessionState:
     logical_nozzle: int | None = None
     filled_volume_raw: int = 0
     filled_amount_raw: int = 0
+    unit_price_raw: int | None = None
     last_valid_frame_time: float | None = None
     last_status_time: float | None = None
     last_nozio_time: float | None = None

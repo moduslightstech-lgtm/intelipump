@@ -586,3 +586,63 @@ def test_quiet_bus_logs_skip_idle_poll() -> None:
     assert loop._log_tx_note("DATA_OUT") is True
     runtime.log_all_frames = True
     assert loop._log_tx_note("POLL") is True
+
+
+def test_format_raw_as_2dp() -> None:
+    from intelipump_fdc.controller.controller_loop import format_raw_as_2dp
+
+    assert format_raw_as_2dp(833) == "8.33"
+    assert format_raw_as_2dp(100000) == "1000.00"
+    assert format_raw_as_2dp(0) == "0.00"
+
+
+def test_report_observed_changes_prints_dc2_and_sale(capsys) -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    loop = ControllerLoop(
+        ControllerRuntime(
+            transport=ctrl,
+            safety=_lab_safety(),
+            config=PollSchedulerConfig(addresses=(1,)),
+        )
+    )
+    session = loop.sessions[1]
+    session.state.filled_volume_raw = 833
+    session.state.filled_amount_raw = 100000
+    session.state.unit_price_raw = 120
+    session.state.sale_lifecycle = SaleLifecycle.FILLING_COMPLETED
+    session.state.sale_evidence.lifecycle = SaleLifecycle.FILLING_COMPLETED
+    session.state.sale_evidence.peak_volume_raw = 833
+    session.state.sale_evidence.peak_amount_raw = 100000
+    loop._report_observed_changes(session)
+    out = capsys.readouterr().out
+    assert "[DC3 addr=1] unit_price_raw=120" in out
+    assert "[DC2 addr=1] volume_raw=833 amount_raw=100000 volume=8.33 amount=1000.00" in out
+    assert "[SALE addr=1] FILLING_COMPLETED" in out
+    assert "volume=8.33 amount=1000.00 unit_price_raw=120" in out
+
+
+def test_dispense_hangup_frame_keeps_final_dc2_totals() -> None:
+    session = PumpSession(address=1, pump_id="p1", events=EventBus())
+    now = time.monotonic()
+    filling = build_data_frame(
+        0x50, 0, bytes.fromhex("01 01 04 03 04 00 01 20 11")
+    )
+    session.handle_response_frame(_parse(filling), capture_mono=now)
+    mid = build_data_frame(
+        0x50, 1, bytes.fromhex("02 08 00 00 08 33 00 09 99 60")
+    )
+    session.handle_response_frame(_parse(mid), capture_mono=now + 0.1)
+    hang = build_data_frame(
+        0x50,
+        2,
+        bytes.fromhex(
+            "03 04 00 01 20 01 02 08 00 00 08 33 00 10 00 00 01 01 06 01 01 05"
+        ),
+    )
+    session.handle_response_frame(_parse(hang), capture_mono=now + 0.2)
+    assert session.state.filled_volume_raw == 833
+    assert session.state.filled_amount_raw == 100000
+    assert session.state.unit_price_raw == 120
+    assert session.state.sale_evidence.peak_volume_raw == 833
+    assert session.state.sale_evidence.peak_amount_raw == 100000
+    assert session.state.sale_lifecycle is SaleLifecycle.FILLING_COMPLETED

@@ -645,6 +645,8 @@ class PumpSession:
                     }:
                         self.state.sale_lifecycle = SaleLifecycle.IDLE
                         self.state.sale_evidence.reset_attempt()
+                        self.state.filled_volume_raw = 0
+                        self.state.filled_amount_raw = 0
             except ValueError:
                 pass
         if mapped.nozzle_out is not None:
@@ -656,8 +658,18 @@ class PumpSession:
             elif prev is not new_pos:
                 self.state.nozzle_position = new_pos
                 if new_pos is NozzlePosition.OUT:
+                    previous_life = self.state.sale_evidence.lifecycle
                     self.state.sale_evidence.note_nozzle_out()
                     self.state.sale_lifecycle = SaleLifecycle.NOZZLE_LIFTED
+                    if previous_life in {
+                        SaleLifecycle.IDLE,
+                        SaleLifecycle.CLOSED,
+                        SaleLifecycle.ABORTED_NO_DELIVERY,
+                        SaleLifecycle.ABORTED,
+                        SaleLifecycle.FILLING_COMPLETED,
+                    }:
+                        self.state.filled_volume_raw = 0
+                        self.state.filled_amount_raw = 0
                 elif new_pos is NozzlePosition.IN:
                     ev = self.state.sale_evidence
                     if ev.lifecycle in {
@@ -671,6 +683,8 @@ class PumpSession:
                 self.state.logical_nozzle = mapped.logical_nozzle_raw
             elif mapped.selected_nozzle is not None:
                 self.state.logical_nozzle = mapped.selected_nozzle
+        if mapped.filling_price_raw is not None:
+            self.state.unit_price_raw = mapped.filling_price_raw
         self.state.sale_lifecycle = self.state.sale_evidence.lifecycle
         self.evaluate_synchronized()
 

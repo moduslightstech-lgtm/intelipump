@@ -385,6 +385,10 @@ def run(argv: list[str] | None = None) -> None:
                     f"dc1={info.get('observed_status')} "
                     f"nozio={info.get('nozzle_position')} "
                     f"sale={info.get('sale_lifecycle')} "
+                    f"vol={info.get('filled_volume_raw')} "
+                    f"amt={info.get('filled_amount_raw')} "
+                    f"price={info.get('unit_price_raw')} "
+                    f"completed={info.get('last_completed_sale')} "
                     f"err={info.get('last_error')}"
                 )
             if persistence is not None and args.show_recovery_report:
