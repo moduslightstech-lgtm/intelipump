@@ -646,3 +646,27 @@ def test_dispense_hangup_frame_keeps_final_dc2_totals() -> None:
     assert session.state.sale_evidence.peak_volume_raw == 833
     assert session.state.sale_evidence.peak_amount_raw == 100000
     assert session.state.sale_lifecycle is SaleLifecycle.FILLING_COMPLETED
+
+
+def test_hold_sale_display_until_next_lift() -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    loop = ControllerLoop(
+        ControllerRuntime(
+            transport=ctrl,
+            safety=_lab_safety(),
+            config=PollSchedulerConfig(addresses=(1,)),
+        )
+    )
+    session = loop.sessions[1]
+    session.state.nozzle_position = NozzlePosition.IN
+    session.state.observed_status = ObservedStatus.FILLING_COMPLETED
+    session.state.filled_volume_raw = 833
+    assert loop._should_hold_sale_display(session) is True
+    session.state.filled_volume_raw = 0
+    assert loop._should_hold_sale_display(session) is False
+    session.state.filled_volume_raw = 833
+    session.state.nozzle_position = NozzlePosition.OUT
+    assert loop._should_hold_sale_display(session) is False
+    session.state.nozzle_position = NozzlePosition.IN
+    session.state.observed_status = ObservedStatus.RESET
+    assert loop._should_hold_sale_display(session) is False

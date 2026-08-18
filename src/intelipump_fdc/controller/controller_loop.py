@@ -154,6 +154,7 @@ class ControllerLoop:
         self._last_sale: dict[int, SaleLifecycle] = {}
         self._last_unit_price: dict[int, int] = {}
         self._last_completed_sale: dict[int, dict[str, int | None]] = {}
+        self._sale_display_held: set[int] = set()
         self._price_programmed: set[int] = set()
         self._startup_reset_done: set[int] = set()
         self._auth_this_lift: set[int] = set()
@@ -897,6 +898,24 @@ class ControllerLoop:
                     }
             self._last_sale[addr] = life
 
+    def _should_hold_sale_display(self, session: PumpSession) -> bool:
+        """Keep FILLING_COMPLETED totals on the pump until the next lift.
+
+        Normal Wayne / ePump sequence: hang-up shows volume and amount; RESET
+        (which clears the display) runs only when the nozzle is lifted again.
+        Do not copy the working-controller immediate RESET on completion.
+        """
+        if session.state.nozzle_position is not NozzlePosition.IN:
+            return False
+        if session.state.observed_status not in {
+            ObservedStatus.FILLING_COMPLETED,
+            ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+        }:
+            return False
+        if session.state.filled_volume_raw > 0:
+            return True
+        return session.state.sale_evidence.has_positive_delivery
+
     async def _owned_lab_tick(self, session: PumpSession) -> None:
         flags = self.runtime.feature_flags
         if not self.runtime.safety.owned_lab_active_session:
@@ -921,6 +940,17 @@ class ControllerLoop:
                     f"{':' + result.detail if result.detail else ''}"
                 )
             return
+
+        if self._should_hold_sale_display(session):
+            self._startup_reset_done.add(addr)
+            if addr not in self._sale_display_held:
+                self._sale_display_held.add(addr)
+                print(
+                    f"[OWNED-LAB addr={addr}] holding pump display until next lift "
+                    "(RESET deferred)"
+                )
+            return
+        self._sale_display_held.discard(session.address)
 
         if (
             flags.automatic_startup_price_programming

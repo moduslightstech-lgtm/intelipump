@@ -127,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--price",
         type=int,
         default=None,
-        help="Startup unit price as raw BCD digits (e.g. 120 for 00 01 20).",
+        help="Startup unit price as raw BCD digits (e.g. 1175 for 00 11 75).",
     )
     parser.add_argument(
         "--logical-nozzle-count",
@@ -333,7 +333,8 @@ def run(argv: list[str] | None = None) -> None:
         if owned:
             print(
                 "[OWNED-LAB] dispense session ON: CD5 "
-                f"price={args.price} RESET=yes AUTHORIZE-on-lift=yes "
+                f"price={args.price} hold-display-until-lift=yes "
+                "RESET-on-next-lift=yes AUTHORIZE-on-lift=yes "
                 "(this process only; not persisted)"
             )
         # READY only after config, safety, DB recovery, and serial runtime init.
