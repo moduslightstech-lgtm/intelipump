@@ -568,3 +568,21 @@ async def test_stale_data_is_acked_and_applied() -> None:
     finally:
         await ctrl.close()
         await pump.close()
+
+
+def test_quiet_bus_logs_skip_idle_poll() -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,)),
+    )
+    loop = ControllerLoop(runtime)
+    assert loop._log_tx_note("POLL") is False
+    assert loop._log_tx_note("POLL_RETRY") is False
+    assert loop._log_tx_note("POLL_CONFIRM") is False
+    assert loop._log_tx_note("ACK") is True
+    assert loop._log_tx_note("ACK_STALE") is True
+    assert loop._log_tx_note("DATA_OUT") is True
+    runtime.log_all_frames = True
+    assert loop._log_tx_note("POLL") is True

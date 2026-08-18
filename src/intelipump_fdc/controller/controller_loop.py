@@ -76,6 +76,7 @@ class ControllerRuntime:
     outbound: OutboundQueue = field(default_factory=OutboundQueue)
     log_frames: bool = False
     log_dart_timing: bool = False
+    log_all_frames: bool = False
     feature_flags: WayneFeatureFlags = field(default_factory=WayneFeatureFlags)
     liveness: LivenessTracker = field(default_factory=LivenessTracker)
     notifier: Notifier = field(default_factory=NullNotifier)
@@ -285,6 +286,14 @@ class ControllerLoop:
             return True
         return self.runtime.config.apply_bus_delays_on_virtual
 
+    def _log_all_bus(self) -> bool:
+        return self.runtime.log_all_frames
+
+    def _log_tx_note(self, note: str) -> bool:
+        if self._log_all_bus():
+            return True
+        return note not in {"POLL", "POLL_RETRY", "POLL_CONFIRM"}
+
     async def run(self, *, duration_s: float | None = None) -> None:
         """Run the poll loop until stop, optional deadline, or transport close."""
         if duration_s is not None:
@@ -341,8 +350,7 @@ class ControllerLoop:
                             )
                             self._mark_all_pumps_disconnected()
                             break
-                        if self.runtime.log_frames:
-                            print(f"pump {address} error: {exc}")
+                        print(f"pump {address} error: {exc}")
                     await asyncio.sleep(self.runtime.config.inter_poll_delay_ms / 1000)
                 self._on_loop_progress()
                 await asyncio.sleep(self.runtime.config.idle_sleep_ms / 1000)
@@ -375,13 +383,13 @@ class ControllerLoop:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if self.runtime.log_frames:
+                if self.runtime.log_all_frames:
                     print(f"RX error: {exc}")
                 await asyncio.sleep(0.01)
                 continue
             now = time.monotonic()
             if chunk:
-                if self.runtime.log_frames:
+                if self.runtime.log_all_frames:
                     print(f"RX raw {chunk.hex(' ')}")
                 for diag in self.demux.feed(chunk, capture_mono=now):
                     self.runtime.events.publish(
@@ -395,7 +403,7 @@ class ControllerLoop:
                             },
                         )
                     )
-                    if self.runtime.log_dart_timing:
+                    if self.runtime.log_all_frames:
                         print(
                             f"RX diag {diag.kind.value} {diag.message} "
                             f"{diag.raw.hex(' ')}"
@@ -542,13 +550,12 @@ class ControllerLoop:
                     await self._write_frame(
                         ack, address=session.address, note="ACK_STALE"
                     )
-                if self.runtime.log_frames or self.runtime.log_dart_timing:
-                    print(
-                        f"RX stale-applied DATA addr={session.address} "
-                        f"{stamped.raw.hex(' ')}"
-                    )
+                print(
+                    f"RX DATA addr={session.address} stale-applied "
+                    f"{stamped.raw.hex(' ')}"
+                )
                 return ("more", True, first_byte_marked)
-            if self.runtime.log_dart_timing:
+            if self._log_all_bus():
                 print(
                     f"RX stale addr={session.address} "
                     f"first={stamped.first_byte_time:.6f} "
@@ -572,13 +579,25 @@ class ControllerLoop:
                     },
                 )
             )
-            if self.runtime.log_dart_timing:
+            latency_for_print = latency_ms
+        else:
+            latency_for_print = None
+
+        if frame.control_type is ControlType.DATA:
+            extra = (
+                f" latency_ms={latency_for_print:.1f}"
+                if latency_for_print is not None
+                else ""
+            )
+            print(
+                f"RX DATA addr={session.address}{extra} {stamped.raw.hex(' ')}"
+            )
+        elif self._log_all_bus():
+            if latency_for_print is not None:
                 print(
                     f"RX first-byte addr={session.address} "
-                    f"latency_ms={latency_ms:.1f}"
+                    f"latency_ms={latency_for_print:.1f}"
                 )
-
-        if self.runtime.log_frames:
             print(f"RX frame {frame.control_type} {stamped.raw.hex(' ')}")
 
         if frame.control_type is ControlType.EOT:
@@ -1026,9 +1045,9 @@ class ControllerLoop:
                 },
             )
         )
-        if self.runtime.log_frames:
+        if self._log_tx_note(note):
             print(f"TX [{note}] addr={address} {data.hex(' ')}")
-        if self.runtime.log_dart_timing:
+        if self._log_all_bus() and self.runtime.log_dart_timing:
             print(
                 f"TX timing [{note}] addr={address} "
                 f"start={write_start_s:.6f} complete={write_complete_s:.6f}"

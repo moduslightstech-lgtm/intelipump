@@ -50,6 +50,14 @@ def test_cli_parser_duration_positive() -> None:
     assert args.duration == 12.5
 
 
+def test_cli_parser_log_all_frames_default_off() -> None:
+    parser = build_parser()
+    args = parser.parse_args([])
+    assert args.log_all_frames is False
+    verbose = parser.parse_args(["--log-all-frames"])
+    assert verbose.log_all_frames is True
+
+
 @pytest.mark.asyncio
 async def test_controller_loop_timed_run_closes_transport() -> None:
     a, _b = create_memory_transport_pair()

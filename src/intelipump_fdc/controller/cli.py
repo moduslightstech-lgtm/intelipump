@@ -49,11 +49,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional run duration in seconds. Omit to run continuously.",
     )
-    parser.add_argument("--log-frames", action="store_true")
+    parser.add_argument(
+        "--log-frames",
+        action="store_true",
+        help=(
+            "Deprecated: kept for compatibility. Idle POLL/EOT/raw bytes are "
+            "not printed. Use --log-all-frames for a full bus dump."
+        ),
+    )
+    parser.add_argument(
+        "--log-all-frames",
+        action="store_true",
+        help="Print every POLL, EOT, RX raw chunk, and TX/RX timing.",
+    )
     parser.add_argument(
         "--log-dart-timing",
         action="store_true",
-        help="Verbose DART TX/RX timing and frame diagnostics",
+        help="With --log-all-frames, also print TX complete timestamps.",
     )
     parser.add_argument(
         "--mode",
@@ -262,6 +274,7 @@ def run(argv: list[str] | None = None) -> None:
             ),
             log_frames=args.log_frames,
             log_dart_timing=args.log_dart_timing,
+            log_all_frames=args.log_all_frames,
             feature_flags=WayneFeatureFlags(
                 poll_and_observe=not owned,
                 automatic_startup_price_programming=owned,
