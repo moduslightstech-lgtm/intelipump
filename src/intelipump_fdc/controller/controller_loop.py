@@ -156,6 +156,9 @@ class ControllerLoop:
         self._last_completed_sale: dict[int, dict[str, int | None]] = {}
         self._sale_display_held: set[int] = set()
         self._defer_post_sale_auth: set[int] = set()
+        self._startup_price_attempted: set[int] = set()
+        self._startup_reset_attempted: set[int] = set()
+        self._bus_silent_warned: set[int] = set()
         self._price_programmed: set[int] = set()
         self._startup_reset_done: set[int] = set()
         self._auth_this_lift: set[int] = set()
@@ -477,7 +480,18 @@ class ControllerLoop:
         )
         if unknown and outcome != "eot":
             print(f"[BUS addr={address}] poll={outcome}")
-        if outcome in {"eot", "short_bus", "timeout"} or unknown:
+        if outcome == "timeout":
+            if address not in self._bus_silent_warned:
+                self._bus_silent_warned.add(address)
+                print(
+                    f"[BUS addr={address}] no response (check port, dialout, "
+                    "one master only); skipping commands until poll succeeds"
+                )
+        else:
+            self._bus_silent_warned.discard(address)
+        if outcome in {"eot", "short_bus", "data"} or (
+            unknown and outcome != "timeout"
+        ):
             await self._owned_lab_tick(session)
         self._refresh_totals()
 
@@ -1226,8 +1240,10 @@ class ControllerLoop:
         if (
             flags.automatic_startup_price_programming
             and addr not in self._price_programmed
+            and addr not in self._startup_price_attempted
             and self.runtime.startup_unit_price is not None
         ):
+            self._startup_price_attempted.add(addr)
             payload = encode_cd5_price_update(
                 prices_raw=[self.runtime.startup_unit_price]
                 * self.runtime.logical_nozzle_count
@@ -1252,7 +1268,8 @@ class ControllerLoop:
             if session.should_skip_reset():
                 self._startup_reset_done.add(addr)
                 print(f"[OWNED-LAB addr={addr}] RESET skipped (already RESET)")
-            else:
+            elif addr not in self._startup_reset_attempted:
+                self._startup_reset_attempted.add(addr)
                 result = await self._run_owned_command(
                     session,
                     encode_cd1_command(PumpControlCommand.RESET),
