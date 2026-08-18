@@ -13,6 +13,7 @@ from intelipump_fdc.controller.controller_loop import (
     ControllerRuntime,
     default_lab_safety,
 )
+from intelipump_fdc.controller.feature_flags import WayneFeatureFlags
 from intelipump_fdc.controller.poll_scheduler import PollSchedulerConfig
 from intelipump_fdc.controller.safety import ControllerSafetyContext
 from intelipump_fdc.core.config import ControllerMode, get_settings
@@ -50,11 +51,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--log-frames", action="store_true")
     parser.add_argument(
+        "--log-dart-timing",
+        action="store_true",
+        help="Verbose DART TX/RX timing and frame diagnostics",
+    )
+    parser.add_argument(
         "--mode",
         default=ControllerMode.LISTEN_ONLY.value,
         choices=[m.value for m in ControllerMode],
     )
-    parser.add_argument("--response-timeout-ms", type=int, default=25)
+    parser.add_argument(
+        "--response-timeout-ms",
+        type=int,
+        default=120,
+        help="Software poll/command response deadline in ms (default 120)",
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--database-url",
@@ -175,6 +186,20 @@ def run(argv: list[str] | None = None) -> None:
                 dc2_stability_window_s=settings.controller.dc2_stability_window_s,
             ),
             log_frames=args.log_frames,
+            log_dart_timing=args.log_dart_timing,
+            feature_flags=WayneFeatureFlags(
+                poll_and_observe=settings.safety.poll_and_observe,
+                automatic_startup_price_programming=(
+                    settings.safety.automatic_startup_price_programming
+                ),
+                automatic_reset=settings.safety.automatic_reset,
+                automatic_authorization=(
+                    settings.safety.automatic_authorization_enabled
+                ),
+                automatic_transaction_publishing=(
+                    settings.safety.automatic_transaction_publishing
+                ),
+            ),
             liveness=liveness,
             notifier=notifier,
             status_interval_s=settings.watchdog.status_interval_s,

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from uuid import uuid4
 
+from intelipump_fdc.controller.sale_lifecycle import SaleEvidence, SaleLifecycle
 from intelipump_fdc.domain.pump_command import PumpCommand
 from intelipump_fdc.domain.pump_state import PumpState
 
@@ -24,6 +25,24 @@ class IdempotencyClass(StrEnum):
     NON_IDEMPOTENT = "NON_IDEMPOTENT"
 
 
+class NozzlePosition(StrEnum):
+    UNKNOWN = "UNKNOWN"
+    IN = "IN"
+    OUT = "OUT"
+
+
+class ObservedStatus(StrEnum):
+    UNKNOWN = "UNKNOWN"
+    NOT_PROGRAMMED = "NOT_PROGRAMMED"
+    RESET = "RESET"
+    AUTHORIZED = "AUTHORIZED"
+    FILLING = "FILLING"
+    FILLING_COMPLETED = "FILLING_COMPLETED"
+    MAX_AMOUNT_VOLUME_REACHED = "MAX_AMOUNT_VOLUME_REACHED"
+    SWITCHED_OFF = "SWITCHED_OFF"
+    SUSPENDED = "SUSPENDED"
+
+
 @dataclass(frozen=True, slots=True)
 class OutboundDataItem:
     """Queued controller→pump DATA (LAB / simulator-only in Phase 6)."""
@@ -37,8 +56,10 @@ class OutboundDataItem:
     max_retries: int
     simulator_only: bool
     command_type: PumpCommand
-    sequence: int | None = None  # assigned at send time
+    sequence: int | None = None  # assigned at send time; reused on retry
     attempts: int = 0
+    # Optional application-confirm expectation (DC1 name after TX time).
+    expect_status_after_tx: str | None = None
 
     @staticmethod
     def create(
@@ -50,6 +71,9 @@ class OutboundDataItem:
         idempotency: IdempotencyClass,
         ttl_ms: int = 5_000,
         max_retries: int = 2,
+        expect_status_after_tx: str | None = None,
+        sequence: int | None = None,
+        attempts: int = 0,
     ) -> OutboundDataItem:
         now = datetime.now(UTC)
         return OutboundDataItem(
@@ -62,11 +86,30 @@ class OutboundDataItem:
             max_retries=max_retries,
             simulator_only=simulator_only,
             command_type=command_type,
+            sequence=sequence,
+            attempts=attempts,
+            expect_status_after_tx=expect_status_after_tx,
         )
 
     def is_expired(self, now: datetime | None = None) -> bool:
         current = now or datetime.now(UTC)
         return current >= self.expires_at
+
+    def with_attempt(self, *, sequence: int, attempts: int) -> OutboundDataItem:
+        return OutboundDataItem(
+            correlation_id=self.correlation_id,
+            address=self.address,
+            application_payload=self.application_payload,
+            created_at=self.created_at,
+            expires_at=self.expires_at,
+            idempotency=self.idempotency,
+            max_retries=self.max_retries,
+            simulator_only=self.simulator_only,
+            command_type=self.command_type,
+            sequence=sequence,
+            attempts=attempts,
+            expect_status_after_tx=self.expect_status_after_tx,
+        )
 
 
 @dataclass
@@ -82,6 +125,9 @@ class PumpSessionStats:
     sequence_error_count: int = 0
     address_mismatch_count: int = 0
     retry_count: int = 0
+    stale_frame_count: int = 0
+    short_bus_response_count: int = 0
+    seq_resync_count: int = 0
 
 
 @dataclass
@@ -108,3 +154,23 @@ class PumpSessionState:
     pending_ack_for_seq: int | None = None
     last_state: PumpState = PumpState.DISCONNECTED
     stats: PumpSessionStats = field(default_factory=PumpSessionStats)
+    # --- Per-address observed state (online ≠ synchronized) ---
+    communication_online: bool = False
+    state_synchronized: bool = False
+    observed_status: ObservedStatus = ObservedStatus.UNKNOWN
+    nozzle_position: NozzlePosition = NozzlePosition.UNKNOWN
+    logical_nozzle: int | None = None
+    filled_volume_raw: int = 0
+    filled_amount_raw: int = 0
+    last_valid_frame_time: float | None = None
+    last_status_time: float | None = None
+    last_nozio_time: float | None = None
+    last_command_time: float | None = None
+    last_ack_time: float | None = None
+    missed_bus_responses: int = 0
+    stale_application_data: bool = False
+    pending_exchange: bool = False
+    sale_lifecycle: SaleLifecycle = SaleLifecycle.IDLE
+    sale_evidence: SaleEvidence = field(default_factory=SaleEvidence)
+    # Events preserved while waiting for command ACK (non-ACK DATA handled).
+    pending_command_events: list[str] = field(default_factory=list)

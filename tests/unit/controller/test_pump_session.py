@@ -76,8 +76,21 @@ def test_duplicate_data_not_applied_twice() -> None:
     assert s.machine.context.state_version == version
 
 
-def test_sequence_mismatch() -> None:
+def test_sequence_mismatch_soft_resync_acks() -> None:
     s = _session()
+    frame = _parse(build_data_frame(encode_wire_address(1), 5, encode_dc1_status(1)))
+    ack = s.handle_response_frame(frame)
+    assert ack is not None
+    assert s.state.stats.sequence_error_count == 1
+    assert s.state.stats.seq_resync_count == 1
+    assert s.state.last_accepted_rx_sequence == 5
+    assert s.state.expected_rx_sequence == 6
+
+
+def test_sequence_mismatch_strict_rejects() -> None:
+    s = PumpSession(
+        address=1, pump_id="p1", events=EventBus(), soft_rx_sequence=False
+    )
     frame = _parse(build_data_frame(encode_wire_address(1), 5, encode_dc1_status(1)))
     assert s.handle_response_frame(frame) is None
     assert s.state.stats.sequence_error_count == 1

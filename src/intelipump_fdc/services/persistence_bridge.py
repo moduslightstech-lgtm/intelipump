@@ -47,6 +47,7 @@ class PersistenceBridge:
         events: EventBus,
         live_broker: EventBroker | None = None,
         fill_book: FillPublishBook | None = None,
+        automatic_transaction_publishing: bool = False,
     ) -> None:
         self._factory = session_factory
         self._station_id = station_id
@@ -58,6 +59,7 @@ class PersistenceBridge:
         self._events = events
         self._live = live_broker
         self._fill_book = fill_book
+        self._auto_publish_sales = automatic_transaction_publishing
         self._tx_by_address: dict[int, str] = {}
 
     def attach(self) -> None:
@@ -371,6 +373,47 @@ class PersistenceBridge:
 
             if new_state in {PumpState.FILLING_COMPLETE, PumpState.LIMIT_REACHED}:
                 complete_uuid = active_tx_s or self._tx_by_address.get(address)
+                may_publish = detail_payload.get("may_publish_sale")
+                filled_vol = detail_payload.get("filled_volume_raw")
+                filled_amt = detail_payload.get("filled_amount_raw")
+                dispensed = detail_payload.get("dispensed_volume_raw")
+                vol_raw = (
+                    filled_vol
+                    if isinstance(filled_vol, int)
+                    else (dispensed if isinstance(dispensed, int) else 0)
+                )
+                amt_raw = filled_amt if isinstance(filled_amt, int) else 0
+                sale_lifecycle = detail_payload.get("sale_lifecycle")
+                suppress = (
+                    may_publish is False
+                    or sale_lifecycle == "ABORTED_NO_DELIVERY"
+                    or event_name == "SALE_SUPPRESSED"
+                    or (
+                        may_publish is True
+                        and vol_raw <= 0
+                        and amt_raw <= 0
+                    )
+                )
+                if suppress:
+                    await uow.audit.append(
+                        actor="controller",
+                        source="state_machine",
+                        action="SALE_SUPPRESSED_NO_DELIVERY",
+                        station_id=self._station_id,
+                        pump_id=pump_db,
+                        previous_state=str(prev_state_s) if prev_state_s else None,
+                        resulting_state=new_state_s,
+                        result="ABORTED_NO_DELIVERY",
+                        details={
+                            "active_transaction_id": active_tx_s,
+                            "sale_lifecycle": sale_lifecycle,
+                            "filled_volume_raw": vol_raw,
+                            "filled_amount_raw": amt_raw,
+                            "may_publish_sale": may_publish,
+                            "warnings": list(warn_tuple),
+                        },
+                    )
+                    return
                 if complete_uuid and not awaiting:
                     key = (
                         completion_key_s
@@ -382,8 +425,8 @@ class PersistenceBridge:
                         CompleteTransactionRequest(
                             transaction_uuid=complete_uuid,
                             source_completion_key=key,
-                            raw_volume=0,
-                            raw_amount=0,
+                            raw_volume=vol_raw,
+                            raw_amount=amt_raw,
                             source_frame_ref=detail_payload.get("source_frame_ref"),
                             completion_inferred=completion_inferred,
                             completion_warnings=warn_tuple,
@@ -412,7 +455,9 @@ class PersistenceBridge:
                                 "warnings": list(warn_tuple),
                             },
                         )
-                    if newly and self._live is not None:
+                    # Cloud/MQTT publish deferred unless automatic_transaction_publishing
+                    # is enabled on the controller feature flags (default OFF).
+                    if newly and self._live is not None and self._auto_publish_sales:
                         self._live.publish_typed(
                             LiveEventType.TRANSACTION_COMPLETED,
                             station_id=self._station_id,

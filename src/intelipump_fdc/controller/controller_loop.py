@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -14,9 +15,15 @@ from intelipump_fdc.controller.comm_health import (
     pump_health_counts,
     pump_health_summary,
 )
+from intelipump_fdc.controller.exchange_result import (
+    ExchangeResult,
+    ExchangeResultStatus,
+)
+from intelipump_fdc.controller.feature_flags import WayneFeatureFlags
 from intelipump_fdc.controller.outbound import OutboundQueue
 from intelipump_fdc.controller.poll_scheduler import PollSchedulerConfig
 from intelipump_fdc.controller.pump_session import PumpSession
+from intelipump_fdc.controller.rx_demux import AddressFrameDemux
 from intelipump_fdc.controller.safety import (
     ControllerSafetyContext,
     evaluate_polling_allowed,
@@ -26,7 +33,11 @@ from intelipump_fdc.controller.session_events import (
     ControllerEventType,
     EventBus,
 )
-from intelipump_fdc.controller.session_models import IdempotencyClass, OutboundDataItem
+from intelipump_fdc.controller.session_models import (
+    IdempotencyClass,
+    ObservedStatus,
+    OutboundDataItem,
+)
 from intelipump_fdc.core.config import ControllerMode
 from intelipump_fdc.core.liveness import LivenessSnapshot, LivenessTracker
 from intelipump_fdc.core.systemd_notify import Notifier, NullNotifier
@@ -34,12 +45,7 @@ from intelipump_fdc.domain.pump_command import PumpCommand
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.control import ControlType
-from intelipump_fdc.protocol.dart.line.frame_builder import build_data_frame
-from intelipump_fdc.protocol.dart.line.legacy_stream import (
-    AssemblerEventKind,
-    LegacyIgemStreamAssembler,
-)
-from intelipump_fdc.protocol.dart.line.models import DartLineFrame
+from intelipump_fdc.protocol.dart.line.frame_builder import build_ack, build_data_frame
 from intelipump_fdc.protocol.dart.transport.base import ByteTransport
 from intelipump_fdc.simulator.config import next_sequence
 from intelipump_fdc.simulator.encoding import encode_cd1_command
@@ -54,6 +60,8 @@ class ControllerTotals:
     timeouts: int = 0
     nak_count: int = 0
     duplicate_count: int = 0
+    stale_frame_count: int = 0
+    malformed_count: int = 0
 
 
 @dataclass
@@ -64,6 +72,8 @@ class ControllerRuntime:
     events: EventBus = field(default_factory=EventBus)
     outbound: OutboundQueue = field(default_factory=OutboundQueue)
     log_frames: bool = False
+    log_dart_timing: bool = False
+    feature_flags: WayneFeatureFlags = field(default_factory=WayneFeatureFlags)
     liveness: LivenessTracker = field(default_factory=LivenessTracker)
     notifier: Notifier = field(default_factory=NullNotifier)
     status_interval_s: float = 15.0
@@ -110,15 +120,20 @@ class ControllerLoop:
                 dc2_stability_window=timedelta(
                     seconds=runtime.config.dc2_stability_window_s
                 ),
+                soft_rx_sequence=runtime.config.soft_rx_sequence,
             )
             for addr in runtime.config.addresses
         }
-        self.assembler = LegacyIgemStreamAssembler()
+        wires = tuple(encode_wire_address(a) for a in runtime.config.addresses)
+        self.demux = AddressFrameDemux(
+            wire_addresses=wires,
+            quiet_gap_timeout_s=runtime.config.quiet_gap_timeout_s,
+        )
         self.totals = ControllerTotals()
         self._stop = asyncio.Event()
         self._last_status_mono: float | None = None
         self._ever_opened = False
-        # Align liveness metadata with safety context.
+        self._rx_task: asyncio.Task[None] | None = None
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
         self.runtime.liveness.notify_socket_present = (
@@ -154,11 +169,7 @@ class ControllerLoop:
         )
 
     def health_diagnostic_snapshot(self) -> dict[str, object]:
-        """Read-only in-process health view for a future health CLI.
-
-        Does not write to the database, send protocol frames, or mutate state
-        beyond refreshing aggregate counters already used for STATUS=.
-        """
+        """Read-only in-process health view for a future health CLI."""
         snap = self.liveness_snapshot()
         return {
             "overall": {
@@ -170,12 +181,35 @@ class ControllerLoop:
                     self.runtime.safety.mode.value == ControllerMode.LISTEN_ONLY.value
                 ),
                 "environment": self.runtime.safety.environment,
+                "poll_and_observe": self.runtime.feature_flags.poll_and_observe,
+                "feature_flags": {
+                    "automatic_startup_price_programming": (
+                        self.runtime.feature_flags.automatic_startup_price_programming
+                    ),
+                    "automatic_reset": self.runtime.feature_flags.automatic_reset,
+                    "automatic_authorization": (
+                        self.runtime.feature_flags.automatic_authorization
+                    ),
+                    "automatic_transaction_publishing": (
+                        self.runtime.feature_flags.automatic_transaction_publishing
+                    ),
+                },
             },
             "liveness": snap.to_dict(),
             "serial": self.serial_health.state.to_dict(),
+            "demux": {
+                "malformed_count": self.demux.malformed_count,
+                "stale_frame_count": self.demux.stale_frame_count,
+                "queue_overflow_count": self.demux.queue_overflow_count,
+            },
             "pumps": {
                 str(addr): {
                     "communication": s.state.communication.value,
+                    "communication_online": s.state.communication_online,
+                    "state_synchronized": s.state.state_synchronized,
+                    "observed_status": s.state.observed_status.value,
+                    "nozzle_position": s.state.nozzle_position.value,
+                    "sale_lifecycle": s.state.sale_lifecycle.value,
                     "last_poll_mono": s.state.last_poll_mono,
                     "last_valid_eot_mono": s.state.last_valid_eot_mono,
                     "last_valid_data_mono": s.state.last_valid_data_mono,
@@ -191,6 +225,7 @@ class ControllerLoop:
                     "duplicate_count": s.state.stats.duplicate_count,
                     "address_mismatch_count": s.state.stats.address_mismatch_count,
                     "sequence_mismatch_count": s.state.stats.sequence_error_count,
+                    "missed_bus_responses": s.state.missed_bus_responses,
                     "transient_error": s.state.last_transient_error,
                     "persistent_fault": s.state.last_persistent_fault,
                 }
@@ -206,6 +241,7 @@ class ControllerLoop:
                 ),
                 "reconnect_min_delay_s": self.thresholds.reconnect_min_delay_s,
                 "reconnect_max_delay_s": self.thresholds.reconnect_max_delay_s,
+                "response_timeout_ms": self.runtime.config.response_timeout_ms,
             },
         }
 
@@ -219,7 +255,6 @@ class ControllerLoop:
             session.mark_serial_lost()
 
     def _on_loop_progress(self) -> None:
-        """Mark iteration complete and feed systemd watchdog from real progress."""
         self.runtime.liveness.mark_loop_progress()
         self.runtime.notifier.watchdog()
         self._maybe_status()
@@ -233,13 +268,14 @@ class ControllerLoop:
         snap = self.liveness_snapshot()
         self.runtime.notifier.status(snap.status_line())
 
-    async def run(self, *, duration_s: float | None = None) -> None:
-        """Run the poll loop until stop, optional deadline, or transport close.
+    def _bus_delays_enabled(self) -> bool:
+        kind = self.runtime.transport.metadata.kind
+        if kind == "serial_physical":
+            return True
+        return self.runtime.config.apply_bus_delays_on_virtual
 
-        ``duration_s=None`` runs continuously until ``request_stop()`` (SIGINT /
-        SIGTERM from the CLI). Positive ``duration_s`` stops after that many
-        seconds. Zero and negative values are rejected.
-        """
+    async def run(self, *, duration_s: float | None = None) -> None:
+        """Run the poll loop until stop, optional deadline, or transport close."""
         if duration_s is not None:
             if duration_s < 0:
                 raise ValueError("duration_s must not be negative")
@@ -255,10 +291,10 @@ class ControllerLoop:
             await self.runtime.transport.open()
             self.serial_health.observe_open_success(is_reconnect=False)
             self._ever_opened = True
+            self._start_rx_task()
         except Exception as exc:
             self.serial_health.observe_open_failure(f"{type(exc).__name__}:{exc}")
             self._mark_all_pumps_disconnected()
-            # Backoff sleep is performed in _reconnect (no busy-loop, no crash).
         self._sync_serial_status()
         deadline = (
             None
@@ -274,10 +310,12 @@ class ControllerLoop:
                     break
                 if not self.runtime.transport.is_open:
                     self._sync_serial_status()
+                    await self._stop_rx_task()
                     await self._reconnect()
-                    # Feed watchdog only from bounded reconnect-recovery progress.
                     self._on_loop_progress()
                     continue
+                if self._rx_task is None or self._rx_task.done():
+                    self._start_rx_task()
                 for address in self.runtime.config.addresses:
                     if self._stop.is_set():
                         break
@@ -286,7 +324,6 @@ class ControllerLoop:
                     except Exception as exc:
                         session = self.sessions[address]
                         session.state.last_error = f"poll_error:{type(exc).__name__}:{exc}"
-                        # Transport errors may close the port mid-cycle.
                         if not self.runtime.transport.is_open:
                             self.serial_health.observe_closed(
                                 reason=f"{type(exc).__name__}:{exc}"
@@ -296,13 +333,76 @@ class ControllerLoop:
                         if self.runtime.log_frames:
                             print(f"pump {address} error: {exc}")
                     await asyncio.sleep(self.runtime.config.inter_poll_delay_ms / 1000)
-                # Full round-robin iteration completed — feed liveness + watchdog.
                 self._on_loop_progress()
                 await asyncio.sleep(self.runtime.config.idle_sleep_ms / 1000)
         finally:
+            await self._stop_rx_task()
             await self.runtime.transport.close()
             self.serial_health.observe_closed(reason="shutdown")
             self._sync_serial_status()
+
+    def _start_rx_task(self) -> None:
+        if self._rx_task is not None and not self._rx_task.done():
+            return
+        self._rx_task = asyncio.create_task(self._rx_forever(), name="controller-rx")
+
+    async def _stop_rx_task(self) -> None:
+        task = self._rx_task
+        self._rx_task = None
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _rx_forever(self) -> None:
+        """Sole continuous reader: feed demux; never discard by address here."""
+        chunk_size = self.runtime.config.read_chunk_size
+        while not self._stop.is_set() and self.runtime.transport.is_open:
+            try:
+                chunk = await self.runtime.transport.read(chunk_size)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self.runtime.log_frames:
+                    print(f"RX error: {exc}")
+                await asyncio.sleep(0.01)
+                continue
+            now = time.monotonic()
+            if chunk:
+                if self.runtime.log_frames:
+                    print(f"RX raw {chunk.hex(' ')}")
+                for diag in self.demux.feed(chunk, capture_mono=now):
+                    self.runtime.events.publish(
+                        ControllerEvent(
+                            type=ControllerEventType.FRAME_REJECTED,
+                            timestamp=datetime.now(UTC),
+                            detail=diag.kind.value,
+                            payload={
+                                "raw_hex": diag.raw.hex(" "),
+                                "message": diag.message,
+                            },
+                        )
+                    )
+                    if self.runtime.log_dart_timing:
+                        print(
+                            f"RX diag {diag.kind.value} {diag.message} "
+                            f"{diag.raw.hex(' ')}"
+                        )
+            else:
+                for diag in self.demux.maybe_expire_partial(now=now):
+                    self.runtime.events.publish(
+                        ControllerEvent(
+                            type=ControllerEventType.FRAME_REJECTED,
+                            timestamp=datetime.now(UTC),
+                            detail=diag.kind.value,
+                            payload={
+                                "raw_hex": diag.raw.hex(" "),
+                                "message": diag.message,
+                            },
+                        )
+                    )
+                await asyncio.sleep(0)
 
     async def _reconnect(self) -> None:
         """Bounded exponential reconnect; never issues dispenser commands."""
@@ -319,81 +419,301 @@ class ControllerLoop:
             return
         self.serial_health.observe_open_success(is_reconnect=self._ever_opened)
         self._ever_opened = True
-        # Assembler may hold partial bytes from a previous connection.
-        self.assembler = LegacyIgemStreamAssembler()
+        self.demux.reset()
+        self._start_rx_task()
 
     async def _poll_one(self, address: int) -> None:
         session = self.sessions[address]
         await self._maybe_send_outbound(session)
 
-        await self._write_frame(session.build_poll(), address=address, note="POLL")
-
-        frame = await self._read_one_frame(
-            self.runtime.config.response_timeout_ms, address=address
+        write_complete = await self._write_frame(
+            session.build_poll(), address=address, note="POLL"
         )
-        if frame is None:
+        outcome = await self._read_poll_session(
+            session, not_before_mono=write_complete
+        )
+        if outcome == "timeout":
             await self._handle_timeout_with_retries(session)
-            session.tick_awaiting_completion()
-            self._refresh_totals()
-            return
-
-        if frame.address != encode_wire_address(address):
-            session.handle_response_frame(frame)  # records address_mismatch/FAULTED
-            session.tick_awaiting_completion()
-            self._refresh_totals()
-            return
-
-        ack = session.handle_response_frame(frame)
-        if ack is not None:
-            await self._write_frame(ack, address=address, note="ACK")
         session.tick_awaiting_completion()
-        self.runtime.liveness.mark_successful_poll()
+        if outcome != "timeout":
+            self.runtime.liveness.mark_successful_poll()
         self._refresh_totals()
 
+    async def _read_poll_session(
+        self,
+        session: PumpSession,
+        *,
+        not_before_mono: float,
+    ) -> str:
+        """Wait through empty queue reads until EOT, deadline, or no response.
+
+        Processes all correlated DATA for the address until EOT or timeout.
+        Temporary emptiness does not end the exchange.
+        """
+        wire = session.wire_address
+        timeout_ms = self.runtime.config.response_timeout_ms
+        deadline = not_before_mono + (timeout_ms / 1000.0)
+        got_response = False
+        got_data = False
+        first_byte_marked = False
+
+        while time.monotonic() < deadline and not self._stop.is_set():
+            remaining = deadline - time.monotonic()
+            stamped = await self.demux.get(
+                wire, timeout_s=min(0.01, max(0.0, remaining))
+            )
+            if stamped is None:
+                # Temporary empty ≠ end of exchange.
+                continue
+            if stamped.first_byte_time < not_before_mono:
+                self.demux.stale_frame_count += 1
+                session.state.stats.stale_frame_count += 1
+                if self.runtime.log_dart_timing:
+                    print(
+                        f"RX stale addr={session.address} "
+                        f"first={stamped.first_byte_time:.6f} "
+                        f"tx={not_before_mono:.6f} {stamped.raw.hex(' ')}"
+                    )
+                continue
+
+            if not first_byte_marked:
+                first_byte_marked = True
+                latency_ms = (stamped.first_byte_time - not_before_mono) * 1000.0
+                self.runtime.events.publish(
+                    ControllerEvent(
+                        type=ControllerEventType.FIRST_RESPONSE_BYTE,
+                        address=session.address,
+                        timestamp=datetime.now(UTC),
+                        payload={
+                            "first_byte_monotonic_s": stamped.first_byte_time,
+                            "last_byte_monotonic_s": stamped.last_byte_time,
+                            "latency_ms": latency_ms,
+                            "raw_hex": stamped.raw.hex(" "),
+                        },
+                    )
+                )
+                if self.runtime.log_dart_timing:
+                    print(
+                        f"RX first-byte addr={session.address} "
+                        f"latency_ms={latency_ms:.1f}"
+                    )
+
+            got_response = True
+            frame = stamped.frame
+            if self.runtime.log_frames:
+                print(f"RX frame {frame.control_type} {stamped.raw.hex(' ')}")
+
+            if frame.control_type is ControlType.EOT:
+                session.handle_response_frame(
+                    frame, capture_mono=stamped.first_byte_time
+                )
+                return "eot"
+
+            if frame.control_type is ControlType.DATA:
+                got_data = True
+                ack = session.handle_response_frame(
+                    frame, capture_mono=stamped.first_byte_time
+                )
+                if ack is not None:
+                    await self._write_frame(ack, address=session.address, note="ACK")
+                continue
+
+            # Recognized short bus response — keep online, continue until EOT/deadline.
+            session.handle_response_frame(
+                frame, capture_mono=stamped.first_byte_time
+            )
+
+        if not got_response:
+            return "timeout"
+        if got_data:
+            return "data"
+        # Short bus activity without EOT still counts as a response (not offline).
+        return "short_bus"
+
     async def _handle_timeout_with_retries(self, session: PumpSession) -> None:
-        session.on_timeout()
+        session.note_missed_bus_response()
         for _ in range(self.runtime.config.max_retries):
             if self._stop.is_set():
                 return
-            await self._write_frame(
+            write_complete = await self._write_frame(
                 session.build_poll(), address=session.address, note="POLL_RETRY"
             )
-            frame = await self._read_one_frame(
-                self.runtime.config.response_timeout_ms, address=session.address
+            outcome = await self._read_poll_session(
+                session, not_before_mono=write_complete
             )
-            if frame is not None and frame.address == session.wire_address:
-                ack = session.handle_response_frame(frame)
-                if ack is not None:
-                    await self._write_frame(
-                        ack, address=session.address, note="ACK"
-                    )
+            if outcome != "timeout":
                 self.runtime.liveness.mark_successful_poll()
                 return
-            session.on_timeout()
+            session.note_missed_bus_response()
 
-    async def _maybe_send_outbound(self, session: PumpSession) -> None:
+    async def _maybe_send_outbound(self, session: PumpSession) -> ExchangeResult | None:
+        # Feature flags: never auto-issue actives from poll-and-observe defaults.
+        flags = self.runtime.feature_flags
+        if flags.poll_and_observe and not flags.any_automatic_command_enabled():
+            # Still allow explicitly queued simulator/lab items via outbound API.
+            pass
+
         item = self.runtime.outbound.pop_for_address(session.address)
         if item is None:
-            return
-        seq = session.state.tx_sequence
-        wire = build_data_frame(
-            session.wire_address, seq, item.application_payload
-        )
-        await self._write_frame(wire, address=session.address, note="DATA_OUT")
-        resp = await self._read_one_frame(
-            self.runtime.config.response_timeout_ms, address=session.address
-        )
-        if resp is None:
-            session.state.stats.timeout_count += 1
-            return
-        if resp.control_type is ControlType.ACK and resp.sequence == seq:
+            return None
+
+        # Skip redundant RESET when already RESET / application-confirmed.
+        if (
+            item.expect_status_after_tx == ObservedStatus.RESET.value
+            and session.should_skip_reset()
+        ):
+            return ExchangeResult(
+                status=ExchangeResultStatus.APPLICATION_CONFIRMED,
+                address=session.address,
+                detail="skip_reset_already_reset",
+            )
+
+        seq = item.sequence if item.sequence is not None else session.state.tx_sequence
+        attempts = item.attempts
+        result = await self._send_outbound_once(session, item, seq=seq)
+        result.attempts = attempts + 1
+
+        if result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED:
             session.state.tx_sequence = next_sequence(
                 seq, self.runtime.config.sequence_policy
             )
-        elif resp.control_type is ControlType.NAK:
-            session.state.stats.nak_count += 1
+            if item.expect_status_after_tx:
+                confirmed = await self._confirm_application(
+                    session,
+                    expected=ObservedStatus(item.expect_status_after_tx),
+                    not_before_mono=result.command_tx_mono or time.monotonic(),
+                )
+                if confirmed:
+                    result.status = ExchangeResultStatus.APPLICATION_CONFIRMED
+                    result.application_confirm_mono = session.state.last_status_time
+            return result
 
-    async def _write_frame(self, data: bytes, *, address: int, note: str) -> None:
+        if result.status is ExchangeResultStatus.TIMED_OUT and attempts + 1 <= item.max_retries:
+            # Retries reuse the same sequence; do not advance.
+            session.state.stats.retry_count += 1
+            retry = item.with_attempt(sequence=seq, attempts=attempts + 1)
+            with contextlib.suppress(Exception):
+                self.runtime.outbound.enqueue(retry, self.runtime.safety)
+        return result
+
+    async def _send_outbound_once(
+        self,
+        session: PumpSession,
+        item: OutboundDataItem,
+        *,
+        seq: int,
+    ) -> ExchangeResult:
+        wire = build_data_frame(session.wire_address, seq, item.application_payload)
+        write_complete = await self._write_frame(
+            wire, address=session.address, note="DATA_OUT"
+        )
+        session.note_command_tx(tx_mono=write_complete)
+        expected_ack = build_ack(session.wire_address, seq)
+        deadline = write_complete + (self.runtime.config.response_timeout_ms / 1000.0)
+        preserved = 0
+
+        while time.monotonic() < deadline and not self._stop.is_set():
+            remaining = deadline - time.monotonic()
+            stamped = await self.demux.get(
+                session.wire_address, timeout_s=min(0.01, max(0.0, remaining))
+            )
+            if stamped is None:
+                continue
+            if stamped.first_byte_time < write_complete:
+                self.demux.stale_frame_count += 1
+                session.state.stats.stale_frame_count += 1
+                continue
+
+            frame = stamped.frame
+            if (
+                frame.control_type is ControlType.ACK
+                and frame.sequence == seq
+                and (
+                    stamped.raw == expected_ack
+                    or frame.address == session.wire_address
+                )
+            ):
+                session.note_link_ack(ack_mono=stamped.first_byte_time)
+                return ExchangeResult(
+                    status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    command_tx_mono=write_complete,
+                    link_ack_mono=stamped.first_byte_time,
+                    preserved_event_count=preserved,
+                )
+
+            if frame.control_type is ControlType.NAK and frame.sequence == seq:
+                session.state.stats.nak_count += 1
+                session.state.pending_exchange = False
+                return ExchangeResult(
+                    status=ExchangeResultStatus.REJECTED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    command_tx_mono=write_complete,
+                    detail="nak",
+                    preserved_event_count=preserved,
+                )
+
+            # Do not silently discard non-ACK: process/ACK valid DATA, keep waiting.
+            if frame.control_type is ControlType.DATA:
+                ack = session.handle_response_frame(
+                    frame, capture_mono=stamped.first_byte_time
+                )
+                preserved += 1
+                if ack is not None:
+                    await self._write_frame(ack, address=session.address, note="ACK")
+                continue
+
+            if frame.control_type is ControlType.EOT:
+                session.handle_response_frame(
+                    frame, capture_mono=stamped.first_byte_time
+                )
+                continue
+
+        session.state.stats.timeout_count += 1
+        session.state.pending_exchange = False
+        return ExchangeResult(
+            status=ExchangeResultStatus.TIMED_OUT,
+            address=session.address,
+            sequence=seq,
+            correlation_id=item.correlation_id,
+            command_tx_mono=write_complete,
+            detail="ack_timeout",
+            preserved_event_count=preserved,
+        )
+
+    async def _confirm_application(
+        self,
+        session: PumpSession,
+        *,
+        expected: ObservedStatus,
+        not_before_mono: float,
+    ) -> bool:
+        """Poll until expected DC1 is observed strictly after command TX time."""
+        max_polls = self.runtime.config.application_confirm_max_polls
+        for _ in range(max_polls):
+            if session.status_observed_after(expected, not_before_mono=not_before_mono):
+                return True
+            write_complete = await self._write_frame(
+                session.build_poll(), address=session.address, note="POLL_CONFIRM"
+            )
+            await self._read_poll_session(session, not_before_mono=write_complete)
+            if session.status_observed_after(expected, not_before_mono=not_before_mono):
+                return True
+        return False
+
+    async def _write_frame(self, data: bytes, *, address: int, note: str) -> float:
+        """Write frame; return write-complete monotonic timestamp."""
+        if self._bus_delays_enabled():
+            if note == "ACK":
+                delay_ms = self.runtime.config.ack_delay_ms
+            else:
+                delay_ms = self.runtime.config.tx_delay_ms
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000.0)
         write_start_s = time.monotonic()
         await self.runtime.transport.write(data)
         await self.runtime.transport.drain()
@@ -413,65 +733,12 @@ class ControllerLoop:
         )
         if self.runtime.log_frames:
             print(f"TX [{note}] addr={address} {data.hex(' ')}")
-
-    async def _read_one_frame(
-        self, timeout_ms: int, *, address: int | None = None
-    ) -> DartLineFrame | None:
-        """Read until one frame or software deadline.
-
-        The deadline is ``timeout_ms`` (configured bench/protocol timeout).
-        Transport read timeout must stay short so pyserial returns as soon as
-        bytes arrive; it must not equal this deadline or every sample clusters
-        near the timeout.
-        """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + (timeout_ms / 1000)
-        first_byte_marked = False
-        while loop.time() < deadline:
-            chunk = await self.runtime.transport.read(
-                self.runtime.config.read_chunk_size
+        if self.runtime.log_dart_timing:
+            print(
+                f"TX timing [{note}] addr={address} "
+                f"start={write_start_s:.6f} complete={write_complete_s:.6f}"
             )
-            if chunk:
-                if not first_byte_marked and address is not None:
-                    first_byte_marked = True
-                    self.runtime.events.publish(
-                        ControllerEvent(
-                            type=ControllerEventType.FIRST_RESPONSE_BYTE,
-                            address=address,
-                            timestamp=datetime.now(UTC),
-                            payload={
-                                "first_byte_monotonic_s": time.monotonic(),
-                                "raw_hex": chunk.hex(" "),
-                            },
-                        )
-                    )
-                if self.runtime.log_frames:
-                    print(f"RX raw {chunk.hex(' ')}")
-                for event in self.assembler.feed(chunk):
-                    if event.kind is AssemblerEventKind.FRAME and event.frame is not None:
-                        if self.runtime.log_frames:
-                            print(
-                                f"RX frame {event.frame.control_type} "
-                                f"{event.raw.hex(' ')}"
-                            )
-                        return event.frame
-                    if event.kind in {
-                        AssemblerEventKind.REJECTED,
-                        AssemblerEventKind.OVERFLOW,
-                        AssemblerEventKind.NOISE,
-                    }:
-                        self.runtime.events.publish(
-                            ControllerEvent(
-                                type=ControllerEventType.FRAME_REJECTED,
-                                timestamp=datetime.now(UTC),
-                                detail=event.kind.value,
-                                payload={"raw_hex": event.raw.hex(" ")},
-                            )
-                        )
-            else:
-                # Transport read already blocked up to read_timeout_s; yield only.
-                await asyncio.sleep(0)
-        return None
+        return write_complete_s
 
     def _refresh_totals(self) -> None:
         self.totals = ControllerTotals(
@@ -486,6 +753,8 @@ class ControllerLoop:
             duplicate_count=sum(
                 s.state.stats.duplicate_count for s in self.sessions.values()
             ),
+            stale_frame_count=self.demux.stale_frame_count,
+            malformed_count=self.demux.malformed_count,
         )
 
     def enqueue_status_request(self, address: int) -> None:
@@ -509,11 +778,31 @@ class ControllerLoop:
                 "timeouts": self.totals.timeouts,
                 "nak_count": self.totals.nak_count,
                 "duplicate_count": self.totals.duplicate_count,
+                "stale_frame_count": self.totals.stale_frame_count,
+                "malformed_count": self.totals.malformed_count,
+            },
+            "feature_flags": {
+                "poll_and_observe": self.runtime.feature_flags.poll_and_observe,
+                "automatic_startup_price_programming": (
+                    self.runtime.feature_flags.automatic_startup_price_programming
+                ),
+                "automatic_reset": self.runtime.feature_flags.automatic_reset,
+                "automatic_authorization": (
+                    self.runtime.feature_flags.automatic_authorization
+                ),
+                "automatic_transaction_publishing": (
+                    self.runtime.feature_flags.automatic_transaction_publishing
+                ),
             },
             "pumps": {
                 str(addr): {
                     "state": s.state.last_state.value,
                     "communication": s.state.communication.value,
+                    "communication_online": s.state.communication_online,
+                    "state_synchronized": s.state.state_synchronized,
+                    "observed_status": s.state.observed_status.value,
+                    "nozzle_position": s.state.nozzle_position.value,
+                    "sale_lifecycle": s.state.sale_lifecycle.value,
                     "stats": {
                         "poll": s.state.stats.poll_count,
                         "eot": s.state.stats.eot_count,

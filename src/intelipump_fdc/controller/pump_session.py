@@ -6,6 +6,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 from intelipump_fdc.controller.comm_health import HealthThresholds, HealthTransitionLog
+from intelipump_fdc.controller.sale_lifecycle import SaleLifecycle
 from intelipump_fdc.controller.session_events import (
     ControllerEvent,
     ControllerEventType,
@@ -13,12 +14,15 @@ from intelipump_fdc.controller.session_events import (
 )
 from intelipump_fdc.controller.session_models import (
     CommunicationHealth,
+    NozzlePosition,
+    ObservedStatus,
     PumpSessionState,
 )
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
 from intelipump_fdc.protocol.dart.application.constants import MessageDirection
 from intelipump_fdc.protocol.dart.application.decoder import decode_data_payload
+from intelipump_fdc.protocol.dart.application.status import WaynePumpStatus
 from intelipump_fdc.protocol.dart.line.addressing import encode_wire_address
 from intelipump_fdc.protocol.dart.line.control import ControlType
 from intelipump_fdc.protocol.dart.line.frame_builder import build_ack, build_poll
@@ -62,6 +66,7 @@ class PumpSession:
             DEFAULT_AWAITING_FILLING_COMPLETE_TIMEOUT
         ),
         dc2_stability_window: timedelta = DEFAULT_DC2_STABILITY_WINDOW,
+        soft_rx_sequence: bool = True,
     ) -> None:
         self.state = PumpSessionState(address=address, pump_id=pump_id)
         self.events = events
@@ -70,6 +75,7 @@ class PumpSession:
         self.transitions = transitions
         self.awaiting_filling_complete_timeout = awaiting_filling_complete_timeout
         self.dc2_stability_window = dc2_stability_window
+        self.soft_rx_sequence = soft_rx_sequence
         self.machine = PumpStateMachine(
             PumpContext(
                 pump_id=pump_id,
@@ -188,16 +194,80 @@ class PumpSession:
             self.state.last_error = None
         self.state.last_transient_error = None
 
-    def _mark_valid_response(self, *, kind: str) -> None:
-        now_mono = time.monotonic()
+    def _mark_valid_response(self, *, kind: str, capture_mono: float | None = None) -> None:
+        now_mono = capture_mono if capture_mono is not None else time.monotonic()
         self.state.last_valid_response_mono = now_mono
+        self.state.last_valid_frame_time = now_mono
         self.state.last_response_at = datetime.now(UTC)
         self.state.consecutive_timeouts = 0
         self.state.consecutive_protocol_faults = 0
+        self.state.missed_bus_responses = 0
+        self.state.communication_online = True
         if kind == "EOT":
             self.state.last_valid_eot_mono = now_mono
+            self.state.stats.short_bus_response_count += 1
         elif kind == "DATA":
             self.state.last_valid_data_mono = now_mono
+            self.state.stale_application_data = False
+        elif kind == "SHORT_BUS":
+            self.state.stats.short_bus_response_count += 1
+        self.evaluate_synchronized()
+
+    def note_short_bus_response(self, *, capture_mono: float | None = None) -> None:
+        """Recognized short bus response (EOT/ACK/NAK) keeps link online."""
+        self._mark_valid_response(kind="SHORT_BUS", capture_mono=capture_mono)
+        self._set_communication(CommunicationHealth.HEALTHY)
+        self._clear_transient_communication_error()
+
+    def note_missed_bus_response(self) -> None:
+        """No correlated response in the poll window (empty ≠ temporary Empty)."""
+        self.state.missed_bus_responses += 1
+        self.on_timeout()
+
+    def note_command_tx(self, *, tx_mono: float) -> None:
+        self.state.last_command_time = tx_mono
+        self.state.pending_exchange = True
+        self.state.pending_command_events.clear()
+
+    def note_link_ack(self, *, ack_mono: float) -> None:
+        self.state.last_ack_time = ack_mono
+        self.state.pending_exchange = False
+
+    def should_skip_reset(self) -> bool:
+        """Skip redundant RESET when already RESET and synchronized."""
+        return (
+            self.state.observed_status is ObservedStatus.RESET
+            and self.state.state_synchronized
+            and not self.state.pending_exchange
+        )
+
+    def evaluate_synchronized(self) -> bool:
+        """Sync requires recent valid correlated response + known DC1 + NOZIO.
+
+        Bus activity alone (EOT) is not sufficient.
+        """
+        known_dc1 = self.state.observed_status is not ObservedStatus.UNKNOWN
+        known_nozio = self.state.nozzle_position is not NozzlePosition.UNKNOWN
+        recent = self.state.last_valid_data_mono is not None
+        unresolved = self.state.pending_exchange
+        synced = bool(
+            self.state.communication_online
+            and known_dc1
+            and known_nozio
+            and recent
+            and not unresolved
+        )
+        self.state.state_synchronized = synced
+        return synced
+
+    def status_observed_after(
+        self, expected: ObservedStatus, *, not_before_mono: float
+    ) -> bool:
+        if self.state.observed_status is not expected:
+            return False
+        if self.state.last_status_time is None:
+            return False
+        return self.state.last_status_time > not_before_mono
 
     def _record_persistent_fault(self, code: str) -> None:
         self.state.last_persistent_fault = code
@@ -280,10 +350,17 @@ class PumpSession:
             self._persisted_for_reconcile = ctx
             self._needs_restart_reconcile = True
 
-    def handle_response_frame(self, frame: DartLineFrame) -> bytes | None:
+    def handle_response_frame(
+        self,
+        frame: DartLineFrame,
+        *,
+        capture_mono: float | None = None,
+    ) -> bytes | None:
         """Process a pump response. Return optional ACK frame bytes to send."""
         self.state.last_raw_frame = frame.raw_frame
         self.state.last_response_at = datetime.now(UTC)
+        if capture_mono is not None:
+            self.state.last_valid_frame_time = capture_mono
         self.events.publish(
             ControllerEvent(
                 type=ControllerEventType.FRAME_RECEIVED,
@@ -300,19 +377,25 @@ class PumpSession:
             return None
 
         if frame.control_type is ControlType.EOT:
-            return self._on_eot(frame)
+            return self._on_eot(frame, capture_mono=capture_mono)
         if frame.control_type is ControlType.DATA:
-            return self._on_data(frame)
+            return self._on_data(frame, capture_mono=capture_mono)
         if frame.control_type is ControlType.NAK:
             return self._on_nak(frame)
+        if frame.control_type is ControlType.ACK:
+            # Short ACK observed on poll bus — link alive, not application DATA.
+            self.note_short_bus_response(capture_mono=capture_mono)
+            return None
         self._record_persistent_fault(f"unexpected_control_{frame.control_type.value}")
         return None
 
-    def _on_eot(self, frame: DartLineFrame) -> bytes | None:
+    def _on_eot(
+        self, frame: DartLineFrame, *, capture_mono: float | None = None
+    ) -> bytes | None:
         del frame
         self.state.stats.eot_count += 1
         self.state.last_valid_frame = self.state.last_raw_frame
-        self._mark_valid_response(kind="EOT")
+        self._mark_valid_response(kind="EOT", capture_mono=capture_mono)
         self._set_communication(CommunicationHealth.HEALTHY)
         self._clear_transient_communication_error()
         if self.machine.context.current_state is PumpState.DISCONNECTED:
@@ -340,7 +423,9 @@ class PumpSession:
         )
         return None
 
-    def _on_data(self, frame: DartLineFrame) -> bytes | None:
+    def _on_data(
+        self, frame: DartLineFrame, *, capture_mono: float | None = None
+    ) -> bytes | None:
         if frame.crc_valid is False:
             self.state.stats.crc_error_count += 1
             self._record_persistent_fault("invalid_crc")
@@ -361,7 +446,7 @@ class PumpSession:
             and frame.sequence == self.state.last_accepted_rx_sequence
         ):
             self.state.stats.duplicate_count += 1
-            self._mark_valid_response(kind="DATA")
+            self._mark_valid_response(kind="DATA", capture_mono=capture_mono)
             self._set_communication(CommunicationHealth.HEALTHY)
             self._clear_transient_communication_error()
             ack = build_ack(self.wire_address, frame.sequence)
@@ -382,27 +467,39 @@ class PumpSession:
                 f"seq_mismatch expected={self.state.expected_rx_sequence} "
                 f"got={frame.sequence}"
             )
-            self._record_persistent_fault(detail)
+            if not self.soft_rx_sequence:
+                self._record_persistent_fault(detail)
+                self.events.publish(
+                    ControllerEvent(
+                        type=ControllerEventType.FRAME_REJECTED,
+                        address=self.address,
+                        timestamp=datetime.now(UTC),
+                        detail=detail,
+                    )
+                )
+                # Strict mode: do not apply; no ACK for unexpected seq from pump.
+                return None
+            # Soft mode: ACK CRC-valid DATA by frame seq and resync expected.
+            self.state.stats.seq_resync_count += 1
+            self.state.last_transient_error = detail
             self.events.publish(
                 ControllerEvent(
                     type=ControllerEventType.FRAME_REJECTED,
                     address=self.address,
                     timestamp=datetime.now(UTC),
-                    detail=detail,
+                    detail=f"seq_resync:{detail}",
                 )
             )
-            # Documented response: do not apply; no ACK for unexpected seq from pump.
-            return None
 
         self.state.stats.data_count += 1
         self.state.last_valid_frame = frame.raw_frame
-        self._mark_valid_response(kind="DATA")
+        self._mark_valid_response(kind="DATA", capture_mono=capture_mono)
         self._set_communication(CommunicationHealth.HEALTHY)
         self._clear_transient_communication_error()
         if self.machine.context.current_state is PumpState.DISCONNECTED:
             self._apply_sm(PumpEvent.COMMUNICATION_STARTED)
 
-        self._decode_and_apply(frame)
+        self._decode_and_apply(frame, capture_mono=capture_mono)
 
         self.state.last_accepted_rx_sequence = frame.sequence
         self.state.expected_rx_sequence = next_sequence(
@@ -429,13 +526,17 @@ class PumpSession:
         )
         return ack
 
-    def _decode_and_apply(self, frame: DartLineFrame) -> None:
+    def _decode_and_apply(
+        self, frame: DartLineFrame, *, capture_mono: float | None = None
+    ) -> None:
+        # Controller-owned poll/session RX is always pump→controller.
         bundle = decode_data_payload(
             frame.payload,
             pump_address=self.address,
             line_sequence=frame.sequence,
             source_frame_raw_hex=frame.raw_frame.hex(" "),
         )
+        obs_mono = capture_mono if capture_mono is not None else time.monotonic()
         for tx in bundle.transactions:
             decoded = tx.decoded_body or {}
             volume = decoded.get("volume") if isinstance(decoded, dict) else None
@@ -443,6 +544,9 @@ class PumpSession:
             price = decoded.get("price") if isinstance(decoded, dict) else None
             raw_volume = (
                 volume.get("raw_scaled") if isinstance(volume, dict) else None
+            )
+            raw_amount = (
+                amount.get("raw_scaled") if isinstance(amount, dict) else None
             )
             self.events.publish(
                 ControllerEvent(
@@ -460,11 +564,7 @@ class PumpSession:
                         "volume_decimals": (
                             volume.get("decimals") if isinstance(volume, dict) else None
                         ),
-                        "raw_amount": (
-                            amount.get("raw_scaled")
-                            if isinstance(amount, dict)
-                            else None
-                        ),
+                        "raw_amount": raw_amount,
                         "amount_decimals": (
                             amount.get("decimals") if isinstance(amount, dict) else None
                         ),
@@ -477,8 +577,17 @@ class PumpSession:
                     },
                 )
             )
+            if self.state.pending_exchange:
+                self.state.pending_command_events.append(tx.transaction_type.value)
             if isinstance(raw_volume, int):
                 self._note_dc2_volume(raw_volume, at=datetime.now(UTC))
+                self.state.filled_volume_raw = max(self.state.filled_volume_raw, raw_volume)
+            if isinstance(raw_amount, int):
+                self.state.filled_amount_raw = max(self.state.filled_amount_raw, raw_amount)
+            self.state.sale_evidence.note_dc2(
+                volume_raw=raw_volume if isinstance(raw_volume, int) else None,
+                amount_raw=raw_amount if isinstance(raw_amount, int) else None,
+            )
             ctx = self.machine.context
             mapped = map_wayne_observation(
                 tx,
@@ -489,10 +598,81 @@ class PumpSession:
                     bus_direction=MessageDirection.SLAVE_TO_MASTER,
                 ),
             )
+            self._update_observed_from_mapped(mapped, capture_mono=obs_mono)
             if self._needs_restart_reconcile:
                 self._reconcile_then_apply(mapped, raw_volume=raw_volume)
             else:
                 self._apply_mapped(mapped)
+
+    def _update_observed_from_mapped(
+        self, mapped: MappedWayneObservation, *, capture_mono: float
+    ) -> None:
+        if mapped.raw_wayne_status is not None:
+            try:
+                status = WaynePumpStatus(mapped.raw_wayne_status)
+                status_map = {
+                    WaynePumpStatus.PUMP_NOT_PROGRAMMED: ObservedStatus.NOT_PROGRAMMED,
+                    WaynePumpStatus.RESET: ObservedStatus.RESET,
+                    WaynePumpStatus.AUTHORIZED: ObservedStatus.AUTHORIZED,
+                    WaynePumpStatus.FILLING: ObservedStatus.FILLING,
+                    WaynePumpStatus.FILLING_COMPLETED: ObservedStatus.FILLING_COMPLETED,
+                    WaynePumpStatus.MAX_AMOUNT_VOLUME_REACHED: (
+                        ObservedStatus.MAX_AMOUNT_VOLUME_REACHED
+                    ),
+                    WaynePumpStatus.SWITCHED_OFF: ObservedStatus.SWITCHED_OFF,
+                    WaynePumpStatus.SUSPENDED: ObservedStatus.SUSPENDED,
+                }
+                observed = status_map.get(status)
+                if observed is not None:
+                    self.state.observed_status = observed
+                self.state.last_status_time = capture_mono
+                if status is WaynePumpStatus.FILLING:
+                    self.state.sale_evidence.note_filling()
+                    self.state.sale_lifecycle = SaleLifecycle.FILLING
+                elif status is WaynePumpStatus.AUTHORIZED:
+                    self.state.sale_evidence.note_authorized(
+                        application_confirmed=True
+                    )
+                    self.state.sale_lifecycle = SaleLifecycle.AUTHORIZED
+                elif status is WaynePumpStatus.FILLING_COMPLETED:
+                    self.state.sale_evidence.filling_completed_observed = True
+                elif status is WaynePumpStatus.RESET:
+                    if self.state.sale_lifecycle in {
+                        SaleLifecycle.ABORTED_NO_DELIVERY,
+                        SaleLifecycle.ABORTED,
+                        SaleLifecycle.FILLING_COMPLETED,
+                        SaleLifecycle.CLOSED,
+                    }:
+                        self.state.sale_lifecycle = SaleLifecycle.IDLE
+                        self.state.sale_evidence.reset_attempt()
+            except ValueError:
+                pass
+        if mapped.nozzle_out is not None:
+            new_pos = NozzlePosition.OUT if mapped.nozzle_out else NozzlePosition.IN
+            prev = self.state.nozzle_position
+            # Edge-only NOZIO events are handled by mapper; still update observed.
+            if prev is NozzlePosition.UNKNOWN:
+                self.state.nozzle_position = new_pos
+            elif prev is not new_pos:
+                self.state.nozzle_position = new_pos
+                if new_pos is NozzlePosition.OUT:
+                    self.state.sale_evidence.note_nozzle_out()
+                    self.state.sale_lifecycle = SaleLifecycle.NOZZLE_LIFTED
+                elif new_pos is NozzlePosition.IN:
+                    ev = self.state.sale_evidence
+                    if ev.lifecycle in {
+                        SaleLifecycle.NOZZLE_LIFTED,
+                        SaleLifecycle.AUTHORIZED,
+                    } and not ev.has_positive_delivery:
+                        self.state.sale_evidence.note_nozzle_in_zero_delivery()
+                        self.state.sale_lifecycle = SaleLifecycle.ABORTED_NO_DELIVERY
+            self.state.last_nozio_time = capture_mono
+            if mapped.logical_nozzle_raw is not None:
+                self.state.logical_nozzle = mapped.logical_nozzle_raw
+            elif mapped.selected_nozzle is not None:
+                self.state.logical_nozzle = mapped.selected_nozzle
+        self.state.sale_lifecycle = self.state.sale_evidence.lifecycle
+        self.evaluate_synchronized()
 
     def _note_dc2_volume(self, raw_volume: int, *, at: datetime) -> None:
         if self._last_dc2_volume != raw_volume:
@@ -592,6 +772,61 @@ class PumpSession:
             and mapped.completion_evidence_key in self._applied_completion_keys
         ):
             return
+        # Gate sale finalize: FILLING_COMPLETED without valid evidence → no sale.
+        if mapped.event is PumpEvent.FILLING_COMPLETED:
+            ctx0 = self.machine.context
+            # Sync evidence from live SM when poll path did not see every edge.
+            if ctx0.current_state in {
+                PumpState.FILLING,
+                PumpState.FILLING_COMPLETE,
+                PumpState.SUSPENDED,
+                PumpState.LIMIT_REACHED,
+            } or ctx0.previous_state is PumpState.FILLING:
+                self.state.sale_evidence.filling_observed = True
+            if isinstance(ctx0.dispensed_volume_raw, int) and ctx0.dispensed_volume_raw > 0:
+                self.state.sale_evidence.note_dc2(
+                    volume_raw=ctx0.dispensed_volume_raw,
+                    amount_raw=max(self.state.filled_amount_raw, 1),
+                )
+                self.state.filled_volume_raw = max(
+                    self.state.filled_volume_raw, ctx0.dispensed_volume_raw
+                )
+            may_sale, reason = self.state.sale_evidence.evaluate_filling_completed()
+            self.state.sale_lifecycle = self.state.sale_evidence.lifecycle
+            if not may_sale:
+                self._publish_state_changed(
+                    before=self.machine.context.current_state,
+                    after=self.machine.context.current_state,
+                    event_name="SALE_SUPPRESSED",
+                    context=self.machine.context.with_updates(
+                        warnings=(
+                            *self.machine.context.warnings,
+                            f"sale_suppressed:{reason}",
+                        )
+                    ),
+                    completion_evidence_key=None,
+                )
+                # Still allow SM to observe status, but strip completion key so
+                # persistence does not finalize a paid sale.
+                mapped = MappedWayneObservation(
+                    event=mapped.event,
+                    observation=mapped.observation,
+                    raw_wayne_status=mapped.raw_wayne_status,
+                    selected_nozzle=mapped.selected_nozzle,
+                    logical_nozzle_raw=mapped.logical_nozzle_raw,
+                    nozzle_out=mapped.nozzle_out,
+                    nozio_raw=mapped.nozio_raw,
+                    filling_price_raw=mapped.filling_price_raw,
+                    completion_evidence_key=None,
+                    awaiting_filling_complete=False,
+                    completion_inferred=mapped.completion_inferred,
+                    allow_implicit_authorize_to_filling=(
+                        mapped.allow_implicit_authorize_to_filling
+                    ),
+                    filling_inferred_from_dc2=mapped.filling_inferred_from_dc2,
+                    inferences=mapped.inferences,
+                    warnings=(*mapped.warnings, f"sale_suppressed:{reason}"),
+                )
         before_ctx = self.machine.context
         before = before_ctx.current_state
         was_awaiting = before_ctx.awaiting_filling_complete
@@ -612,6 +847,7 @@ class PumpSession:
         cleared_await = was_awaiting and not after_ctx.awaiting_filling_complete
         finalized = (
             mapped.event is PumpEvent.FILLING_COMPLETED
+            and mapped.completion_evidence_key is not None
             and result.accepted
             and (not result.noop or cleared_await or mapped.completion_inferred)
         )
@@ -679,6 +915,16 @@ class PumpSession:
                     "nozzle_out": context.nozzle_out,
                     "has_unresolved_transaction": context.has_unresolved_transaction,
                     "warnings": list(context.warnings[-8:]),
+                    "sale_lifecycle": self.state.sale_lifecycle.value,
+                    "may_publish_sale": (
+                        completion_evidence_key is not None
+                        and self.state.sale_evidence.lifecycle
+                        is SaleLifecycle.FILLING_COMPLETED
+                        and self.state.sale_evidence.has_positive_delivery
+                        and not self.state.sale_evidence.aborted
+                    ),
+                    "filled_volume_raw": self.state.filled_volume_raw,
+                    "filled_amount_raw": self.state.filled_amount_raw,
                 },
             )
         )

@@ -33,7 +33,7 @@ class SerialConfig:
     read_chunk_size: int = 256
     open_timeout_s: float = 2.0
     reconnect_delay_s: float = 1.0
-    read_timeout_s: float = 0.02
+    read_timeout_s: float = 0.01
     write_timeout_s: float = 2.0
     exclusive_open: bool = False
     flow_control: bool = False

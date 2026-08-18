@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from intelipump_fdc.protocol.cd101 import is_cd101_application_payload
 from intelipump_fdc.protocol.cd2_reset import is_cd2_reset_application_payload
+from intelipump_fdc.protocol.cd101 import is_cd101_application_payload
 from intelipump_fdc.protocol.dart.application.constants import PumpControlCommand
 from intelipump_fdc.protocol.dart.line.frame_builder import build_poll
 

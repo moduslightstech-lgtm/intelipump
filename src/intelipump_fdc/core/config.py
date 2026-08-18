@@ -36,7 +36,7 @@ class DartSettings(BaseModel):
     data_bits: int = 8
     parity: str = "ODD"
     stop_bits: int = 1
-    response_timeout_ms: int = Field(default=25, ge=1, le=1000)
+    response_timeout_ms: int = Field(default=120, ge=1, le=5000)
 
 
 class SafetySettings(BaseModel):
@@ -47,6 +47,11 @@ class SafetySettings(BaseModel):
     require_physical_control_enable: bool = True
     # Phase 8: LAB simulator command submission via API (virtual transport only).
     allow_lab_simulator_commands: bool = False
+    # Wayne poll-and-observe defaults (all auto actives OFF).
+    poll_and_observe: bool = True
+    automatic_startup_price_programming: bool = False
+    automatic_reset: bool = False
+    automatic_transaction_publishing: bool = False
 
 
 class DatabaseSettings(BaseModel):
