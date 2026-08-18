@@ -360,6 +360,42 @@ async def test_stale_ack_does_not_confirm_new_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_matching_ack_from_earlier_attempt_is_accepted() -> None:
+    ctrl, pump = create_memory_transport_pair()
+    await ctrl.open()
+    await pump.open()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,), response_timeout_ms=100),
+    )
+    loop = ControllerLoop(runtime)
+    loop._start_rx_task()
+    try:
+        session = loop.sessions[1]
+        floor = time.monotonic()
+        await pump.write(build_ack(0x50, 0))
+        await asyncio.sleep(0.02)
+        item = OutboundDataItem.create(
+            address=1,
+            application_payload=bytes((0x01, 0x01, 0x00)),
+            command_type=PumpCommand.READ_STATUS,
+            simulator_only=True,
+            idempotency=IdempotencyClass.IDEMPOTENT,
+            max_retries=0,
+        )
+        item = item.with_attempt(sequence=0, attempts=0)
+        result = await loop._send_outbound_once(
+            session, item, seq=0, ack_not_before=floor
+        )
+        assert result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED
+    finally:
+        await loop._stop_rx_task()
+        await ctrl.close()
+        await pump.close()
+
+
+@pytest.mark.asyncio
 async def test_retry_reuses_sequence_and_advances_after_ack() -> None:
     ctrl, pump = create_memory_transport_pair()
     await ctrl.open()

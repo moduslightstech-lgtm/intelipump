@@ -25,6 +25,7 @@ class ExchangeResult:
     sequence: int | None = None
     correlation_id: str | None = None
     command_tx_mono: float | None = None
+    write_start_mono: float | None = None
     link_ack_mono: float | None = None
     application_confirm_mono: float | None = None
     attempts: int = 0

@@ -458,11 +458,11 @@ class ControllerLoop:
         session = self.sessions[address]
         await self._maybe_send_outbound(session)
 
-        write_complete = await self._write_frame(
+        _write_start, _write_complete = await self._write_frame(
             session.build_poll(), address=address, note="POLL"
         )
         outcome = await self._read_poll_session(
-            session, not_before_mono=write_complete
+            session, not_before_mono=_write_start
         )
         if outcome == "timeout":
             await self._handle_timeout_with_retries(session)
@@ -638,11 +638,11 @@ class ControllerLoop:
         for _ in range(self.runtime.config.max_retries):
             if self._stop.is_set():
                 return
-            write_complete = await self._write_frame(
+            _write_start, _write_complete = await self._write_frame(
                 session.build_poll(), address=session.address, note="POLL_RETRY"
             )
             outcome = await self._read_poll_session(
-                session, not_before_mono=write_complete
+                session, not_before_mono=_write_start
             )
             if outcome != "timeout":
                 self.runtime.liveness.mark_successful_poll()
@@ -694,9 +694,14 @@ class ControllerLoop:
 
         seq = item.sequence if item.sequence is not None else session.state.tx_sequence
         attempts = item.attempts
+        exchange_start: float | None = None
         while True:
-            result = await self._send_outbound_once(session, item, seq=seq)
+            result = await self._send_outbound_once(
+                session, item, seq=seq, ack_not_before=exchange_start
+            )
             result.attempts = attempts + 1
+            if exchange_start is None:
+                exchange_start = result.write_start_mono
             if result.status in {
                 ExchangeResultStatus.LINK_ACKNOWLEDGED,
                 ExchangeResultStatus.APPLICATION_CONFIRMED,
@@ -709,7 +714,7 @@ class ControllerLoop:
                     confirmed = await self._confirm_application(
                         session,
                         expected=ObservedStatus(item.expect_status_after_tx),
-                        not_before_mono=result.command_tx_mono or time.monotonic(),
+                        not_before_mono=exchange_start or result.command_tx_mono or time.monotonic(),
                     )
                     if confirmed:
                         result.status = ExchangeResultStatus.APPLICATION_CONFIRMED
@@ -717,6 +722,7 @@ class ControllerLoop:
                 return result
 
             if result.status is ExchangeResultStatus.TIMED_OUT:
+                await self._drain_pending_data(session)
                 expected = item.expect_status_after_tx
                 if (
                     expected is not None
@@ -729,8 +735,8 @@ class ControllerLoop:
                 if attempts + 1 <= item.max_retries:
                     attempts += 1
                     session.state.stats.retry_count += 1
+                    await asyncio.sleep(0.08)
                     continue
-                # Give up: advance so the next command is not a duplicate TX#.
                 self._advance_tx_sequence(session, seq)
             return result
 
@@ -745,56 +751,36 @@ class ControllerLoop:
         item: OutboundDataItem,
         *,
         seq: int,
+        ack_not_before: float | None = None,
     ) -> ExchangeResult:
         wire = build_data_frame(session.wire_address, seq, item.application_payload)
-        write_complete = await self._write_frame(
+        write_start, write_complete = await self._write_frame(
             wire, address=session.address, note="DATA_OUT"
         )
         session.note_command_tx(tx_mono=write_complete)
         expected_ack = build_ack(session.wire_address, seq)
-        deadline = write_complete + (self.runtime.config.response_timeout_ms / 1000.0)
+        ack_floor = ack_not_before if ack_not_before is not None else write_start
+        timeout_ms = self.runtime.config.response_timeout_ms
+        if self._bus_delays_enabled():
+            timeout_ms = max(
+                timeout_ms, self.runtime.config.command_response_timeout_ms
+            )
+        deadline = write_complete + (timeout_ms / 1000.0)
         preserved = 0
 
-        while time.monotonic() < deadline and not self._stop.is_set():
-            remaining = deadline - time.monotonic()
-            stamped = await self.demux.get(
-                session.wire_address, timeout_s=min(0.01, max(0.0, remaining))
-            )
-            if stamped is None:
-                continue
+        async def _handle(stamped: TimestampedFrame) -> ExchangeResult | None:
+            nonlocal preserved
             frame = stamped.frame
-            stale_by_last_byte = stamped.last_byte_time < write_complete
-            if stale_by_last_byte:
-                self.demux.stale_frame_count += 1
-                session.state.stats.stale_frame_count += 1
-                if frame.control_type is ControlType.DATA:
-                    ack = session.handle_response_frame(
-                        frame, capture_mono=stamped.first_byte_time
-                    )
-                    preserved += 1
-                    if ack is not None:
-                        await self._write_frame(
-                            ack, address=session.address, note="ACK_STALE"
-                        )
-                    confirmed = self._command_status_met(
-                        session,
-                        item,
-                        command_tx_mono=write_complete,
-                        sequence=seq,
-                        preserved=preserved,
-                    )
-                    if confirmed is not None:
-                        return confirmed
-                continue
-
-            if (
+            matching_ack = (
                 frame.control_type is ControlType.ACK
                 and frame.sequence == seq
                 and (
                     stamped.raw == expected_ack
                     or frame.address == session.wire_address
                 )
-            ):
+            )
+            if matching_ack and stamped.last_byte_time >= ack_floor:
+                print(f"RX ACK addr={session.address} seq={seq}")
                 session.note_link_ack(ack_mono=stamped.first_byte_time)
                 return ExchangeResult(
                     status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
@@ -802,9 +788,35 @@ class ControllerLoop:
                     sequence=seq,
                     correlation_id=item.correlation_id,
                     command_tx_mono=write_complete,
+                    write_start_mono=write_start,
                     link_ack_mono=stamped.first_byte_time,
                     preserved_event_count=preserved,
                 )
+            if matching_ack:
+                return None
+
+            stale_by_last_byte = stamped.last_byte_time < write_complete
+            if stale_by_last_byte:
+                self.demux.stale_frame_count += 1
+                session.state.stats.stale_frame_count += 1
+                if frame.control_type is ControlType.DATA:
+                    ack = session.handle_response_frame(
+                        frame, capture_mono=stamped.last_byte_time
+                    )
+                    preserved += 1
+                    if ack is not None:
+                        await self._write_frame(
+                            ack, address=session.address, note="ACK_STALE"
+                        )
+                    return self._command_status_met(
+                        session,
+                        item,
+                        command_tx_mono=write_complete,
+                        write_start_mono=write_start,
+                        sequence=seq,
+                        preserved=preserved,
+                    )
+                return None
 
             if frame.control_type is ControlType.NAK and frame.sequence == seq:
                 session.state.stats.nak_count += 1
@@ -815,39 +827,59 @@ class ControllerLoop:
                     sequence=seq,
                     correlation_id=item.correlation_id,
                     command_tx_mono=write_complete,
+                    write_start_mono=write_start,
                     detail="nak",
                     preserved_event_count=preserved,
                 )
 
-            # Do not silently discard non-ACK: process/ACK valid DATA, keep waiting.
             if frame.control_type is ControlType.DATA:
                 ack = session.handle_response_frame(
-                    frame, capture_mono=stamped.first_byte_time
+                    frame, capture_mono=stamped.last_byte_time
                 )
                 preserved += 1
                 if ack is not None:
                     await self._write_frame(ack, address=session.address, note="ACK")
-                confirmed = self._command_status_met(
+                return self._command_status_met(
                     session,
                     item,
                     command_tx_mono=write_complete,
+                    write_start_mono=write_start,
                     sequence=seq,
                     preserved=preserved,
                 )
-                if confirmed is not None:
-                    return confirmed
-                continue
 
             if frame.control_type is ControlType.EOT:
                 session.handle_response_frame(
-                    frame, capture_mono=stamped.first_byte_time
+                    frame, capture_mono=stamped.last_byte_time
                 )
-                continue
+            return None
 
+        while time.monotonic() < deadline and not self._stop.is_set():
+            remaining = deadline - time.monotonic()
+            stamped = await self.demux.get(
+                session.wire_address, timeout_s=min(0.02, max(0.0, remaining))
+            )
+            if stamped is None:
+                continue
+            handled = await _handle(stamped)
+            if handled is not None:
+                return handled
+
+        grace_end = time.monotonic() + 0.08
+        while time.monotonic() < grace_end and not self._stop.is_set():
+            stamped = await self.demux.get(session.wire_address, timeout_s=0.02)
+            if stamped is None:
+                continue
+            handled = await _handle(stamped)
+            if handled is not None:
+                return handled
+
+        await self._drain_pending_data(session)
         late = self._command_status_met(
             session,
             item,
             command_tx_mono=write_complete,
+            write_start_mono=write_start,
             sequence=seq,
             preserved=preserved,
         )
@@ -862,6 +894,7 @@ class ControllerLoop:
             sequence=seq,
             correlation_id=item.correlation_id,
             command_tx_mono=write_complete,
+            write_start_mono=write_start,
             detail="ack_timeout",
             preserved_event_count=preserved,
         )
@@ -872,6 +905,7 @@ class ControllerLoop:
         item: OutboundDataItem,
         *,
         command_tx_mono: float | None = None,
+        write_start_mono: float | None = None,
         sequence: int | None = None,
         preserved: int = 0,
     ) -> ExchangeResult | None:
@@ -887,6 +921,7 @@ class ControllerLoop:
             sequence=sequence,
             correlation_id=item.correlation_id,
             command_tx_mono=command_tx_mono,
+            write_start_mono=write_start_mono,
             application_confirm_mono=session.state.last_status_time,
             preserved_event_count=preserved,
             detail="status_in_command_window",
@@ -904,11 +939,15 @@ class ControllerLoop:
         for _ in range(max_polls):
             if session.status_observed_after(expected, not_before_mono=not_before_mono):
                 return True
-            write_complete = await self._write_frame(
+            if session.state.observed_status is expected:
+                return True
+            _write_start, _write_complete = await self._write_frame(
                 session.build_poll(), address=session.address, note="POLL_CONFIRM"
             )
-            await self._read_poll_session(session, not_before_mono=write_complete)
+            await self._read_poll_session(session, not_before_mono=_write_start)
             if session.status_observed_after(expected, not_before_mono=not_before_mono):
+                return True
+            if session.state.observed_status is expected:
                 return True
         return False
 
@@ -1080,6 +1119,8 @@ class ControllerLoop:
     async def _owned_lab_authorize(self, session: PumpSession) -> None:
         addr = session.address
         await self._drain_pending_data(session)
+        if self._bus_delays_enabled():
+            await asyncio.sleep(0.08)
         if session.state.observed_status is not ObservedStatus.RESET:
             reset = await self._run_owned_command(
                 session,
@@ -1138,6 +1179,7 @@ class ControllerLoop:
             simulator_only=False,
             idempotency=idempotency,
             ttl_ms=30_000,
+            max_retries=1,
             expect_status_after_tx=(
                 expect_status.value if expect_status is not None else None
             ),
@@ -1171,8 +1213,8 @@ class ControllerLoop:
             )
         return result
 
-    async def _write_frame(self, data: bytes, *, address: int, note: str) -> float:
-        """Write frame; return write-complete monotonic timestamp."""
+    async def _write_frame(self, data: bytes, *, address: int, note: str) -> tuple[float, float]:
+        """Write frame; return (write_start, write_complete) monotonic timestamps."""
         if self._bus_delays_enabled():
             if note == "ACK":
                 delay_ms = self.runtime.config.ack_delay_ms
@@ -1204,7 +1246,7 @@ class ControllerLoop:
                 f"TX timing [{note}] addr={address} "
                 f"start={write_start_s:.6f} complete={write_complete_s:.6f}"
             )
-        return write_complete_s
+        return write_start_s, write_complete_s
 
     def _refresh_totals(self) -> None:
         self.totals = ControllerTotals(

@@ -37,5 +37,7 @@ class PollSchedulerConfig:
     # Application confirmation poll budget after link ACK (gated commands).
     application_confirm_timeout_ms: int = 600
     application_confirm_max_polls: int = 8
+    # DATA command ACK wait; longer than poll so hang-up/lift RESET is not missed.
+    command_response_timeout_ms: int = 500
     # Soft RX sequence: ACK CRC-valid DATA by frame seq and resync (default ON).
     soft_rx_sequence: bool = True
