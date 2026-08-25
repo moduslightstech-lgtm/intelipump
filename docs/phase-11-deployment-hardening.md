@@ -49,15 +49,24 @@ Conservative settings: `Type=notify`, `WatchdogSec=30s`, `Restart=on-failure`,
 
 ## Pi deployment (reviewable)
 
+Owned-lab one-shot installer (after clone):
+
+```bash
+cd ~/intelipump/intelipump-fdc
+./scripts/install_owned_lab_pi.sh --confirm-owned-lab-install --start
+# optional: --port /dev/ttyUSB0 --price 1175 --addresses 1,2
+journalctl -u intelipump -n 100 --no-pager
+```
+
+Manual equivalent:
+
 ```bash
 # From the deployed tree (adjust paths as needed):
 sudo install -d -o intelipump -g intelipump -m 0750 /var/lib/intelipump
 sudo install -d -o root -g root -m 0755 /etc/intelipump
-sudo cp -n deploy/systemd/intelipump.env.example /etc/intelipump/intelipump.env
 sudo cp deploy/systemd/intelipump.service /etc/systemd/system/intelipump.service
 sudo cp -n deploy/systemd/intelipump.env.example /etc/intelipump/intelipump.env
 # Owned lab: ExecStart in the unit uses BENCH_CONTROL + confirm flags.
-# LISTEN_ONLY default for other installs is no longer in this unit.
 sudo systemctl daemon-reload
 sudo systemctl enable intelipump.service
 sudo systemctl start intelipump.service
