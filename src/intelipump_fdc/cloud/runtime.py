@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from intelipump_fdc.cloud.command_intake import CloudCommandIntake
 from intelipump_fdc.cloud.delivery import DeliveryMapper
+from intelipump_fdc.cloud.fill_stream import LiveFillStream
 from intelipump_fdc.cloud.fill_throttle import FillPublishBook, FillThrottleConfig
 from intelipump_fdc.cloud.heartbeat import HeartbeatService
 from intelipump_fdc.cloud.messages import build_envelope
@@ -41,6 +42,7 @@ class CloudRuntime:
     fill_book: FillPublishBook
     sync_worker: SyncWorker | None = None
     heartbeat: HeartbeatService | None = None
+    fill_stream: LiveFillStream | None = None
     command_intake: CloudCommandIntake | None = None
     started: bool = False
     online_published: bool = False
@@ -178,6 +180,17 @@ class CloudRuntime:
             interval_seconds=self.settings.mqtt.heartbeat_interval_seconds,
             payload_provider=self.payload_provider,
         )
+        self.fill_stream = LiveFillStream(
+            session_factory=self.session_factory,
+            mqtt=self.mqtt,
+            topics=self.topics,
+            fill_book=self.fill_book,
+            device_id=device_id,
+            station_id=station_id,
+            environment=environment,
+            simulated=simulated,
+            poll_interval_seconds=self.settings.mqtt.sync_poll_interval_seconds,
+        )
         if self.settings.mqtt.command_subscription_enabled:
             self.command_intake = CloudCommandIntake(
                 session_factory=self.session_factory,
@@ -200,6 +213,8 @@ class CloudRuntime:
             # Still start workers; they wait for connectivity.
         self.sync_worker.start()
         self.heartbeat.start()
+        if self.fill_stream is not None:
+            self.fill_stream.start()
         if self.command_intake is not None and self.mqtt.is_connected:
             await self.command_intake.start()
         if self.mqtt.is_connected:
@@ -216,6 +231,8 @@ class CloudRuntime:
             return
         if self.heartbeat is not None:
             await self.heartbeat.stop()
+        if self.fill_stream is not None:
+            await self.fill_stream.stop()
         if self.sync_worker is not None:
             await self.sync_worker.stop()
         if self.command_intake is not None:

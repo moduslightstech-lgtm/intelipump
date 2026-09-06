@@ -9,9 +9,10 @@ from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.topics import TopicBuilder
 from intelipump_fdc.persistence.dto import SyncQueueRecord
 
-# Phase 9 cloud contract: only completed sales go on the transactions topic.
-# Heartbeat / LWT are published by CloudRuntime, not the queue.
-PUBLISHABLE_QUEUE_EVENTS = frozenset({"TRANSACTION_COMPLETED"})
+# Completed sales are durable. In-progress fills are also published so the
+# dashboard can stream volume/amount during a dispense (sidecar also polls
+# ACTIVE rows if the controller has not queued FILLING_UPDATED yet).
+PUBLISHABLE_QUEUE_EVENTS = frozenset({"TRANSACTION_COMPLETED", "FILLING_UPDATED"})
 
 
 class DeliveryMapper:
@@ -67,7 +68,7 @@ class DeliveryMapper:
         return topic, envelope, qos_for_event(event_type)
 
     def _topic_for(self, event_type: str, *, pump_id: str | None) -> str:
-        if event_type.startswith("TRANSACTION"):
+        if event_type.startswith("TRANSACTION") or event_type == "FILLING_UPDATED":
             return self._topics.transactions(self._station_id)
         if event_type.startswith("ALARM"):
             return self._topics.alarms(self._station_id)

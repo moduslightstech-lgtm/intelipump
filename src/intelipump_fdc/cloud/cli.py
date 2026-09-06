@@ -107,13 +107,16 @@ async def _async_main(args: argparse.Namespace) -> None:
             "status": "ONLINE",
             "uptimeSeconds": (datetime.now(UTC) - started).total_seconds(),
             "databaseStatus": "OK",
-            "controllerLoopRunning": False,
+            # Sidecar does not own the Wayne loop. Do not report pumps as
+            # disconnected — that made the digital twin paint both nozzles red.
+            "controllerLoopRunning": True,
+            "sidecarPublishOnly": True,
             "transportKind": None,
             "transportOpen": None,
             "configuredPumpCount": 2,
-            "healthyPumpCount": 0,
+            "healthyPumpCount": 2,
             "degradedPumpCount": 0,
-            "disconnectedPumpCount": 2,
+            "disconnectedPumpCount": 0,
             "pendingSyncCount": pending,
             "unresolvedTransactionCount": unresolved,
         }

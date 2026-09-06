@@ -115,8 +115,8 @@ def test_cloud_sync_cli_defaults_are_publish_only() -> None:
     assert args.station_id == "InteliPump-US-Lab"
 
 
-def test_queue_publish_filter_is_completed_sales_only() -> None:
-    assert PUBLISHABLE_QUEUE_EVENTS == {"TRANSACTION_COMPLETED"}
+def test_queue_publish_filter_includes_live_fills() -> None:
+    assert PUBLISHABLE_QUEUE_EVENTS == {"TRANSACTION_COMPLETED", "FILLING_UPDATED"}
 
 
 def test_raw_scaled_values_remain_integers() -> None:
@@ -243,10 +243,10 @@ def test_backoff_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_worker_drains_ignored_queue_events_without_publish(
+async def test_sync_worker_publishes_filling_updates(
     db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
 ) -> None:
-    mqtt = FakeMqttClient(host="skip-fill")
+    mqtt = FakeMqttClient(host="live-fill")
     await mqtt.connect()
     mapper = DeliveryMapper(
         topics=topics,
@@ -272,7 +272,11 @@ async def test_sync_worker_drains_ignored_queue_events_without_publish(
         )
     before = len(mqtt.published)
     await worker._cycle()
-    assert len(mqtt.published) == before
+    assert len(mqtt.published) == before + 1
+    msg = mqtt.published[-1]
+    body = json.loads(msg.payload)
+    assert msg.topic.endswith("/transactions")
+    assert body["eventType"] == "FILLING_UPDATED"
     async with unit_of_work(db_factory) as uow:
         assert await uow.sync_queue.pending_count() == 0
         assert await uow.sync_queue.delivered_count() == 1
