@@ -1,0 +1,51 @@
+# Publish-only sidecar. Does not talk to the pump or authorize.
+# intelipump.service stays MQTT-off and is the only RS-485 master.
+#
+# Install:
+#   ./scripts/install_cloud_sync_pi.sh --confirm-cloud-sync-install
+# Then set MQTT user/password in /etc/intelipump/intelipump-cloud-sync.env
+
+[Unit]
+Description=InteliPump cloud sync (Phase 9 MQTT publish)
+Documentation=file:///home/intelipump/intelipump/intelipump-fdc/docs/cloud/message-schemas.md
+After=network-online.target intelipump.service
+Wants=network-online.target
+# Do not Require=intelipump.service — drain the queue even if the controller is restarting.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=intelipump
+Group=intelipump
+
+WorkingDirectory=/home/intelipump/intelipump/intelipump-fdc
+EnvironmentFile=-/etc/intelipump/intelipump.env
+EnvironmentFile=-/etc/intelipump/intelipump-cloud-sync.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/intelipump/.local/bin:/usr/bin:/bin
+Environment=INTELIPUMP_ENVIRONMENT=LAB
+Environment=INTELIPUMP_MQTT__ENABLED=true
+Environment=INTELIPUMP_MQTT__COMMAND_SUBSCRIPTION_ENABLED=false
+Environment=INTELIPUMP_SAFETY__REMOTE_AUTHORIZATION_ENABLED=false
+Environment=INTELIPUMP_API__SIMULATED=false
+
+ExecStart=/home/intelipump/intelipump/intelipump-fdc/.venv/bin/intelipump-cloud-sync \
+  --database-url sqlite+aiosqlite:////var/lib/intelipump/intelipump.db \
+  --device-id InteliPump-Lab-pi-001 \
+  --station-id InteliPump-US-Lab
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=intelipump-cloud-sync
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

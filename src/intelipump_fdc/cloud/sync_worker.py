@@ -77,6 +77,10 @@ class SyncWorker:
             batch = await uow.sync_queue.claim_batch(limit=self.batch_size)
 
         for record in batch:
+            if not self.mapper.should_publish(record):
+                async with unit_of_work(self.session_factory) as uow:
+                    await uow.sync_queue.mark_delivered(record.id)
+                continue
             try:
                 topic, envelope, qos = self.mapper.map_record(record)
                 payload = json.dumps(envelope.to_dict(), separators=(",", ":")).encode()

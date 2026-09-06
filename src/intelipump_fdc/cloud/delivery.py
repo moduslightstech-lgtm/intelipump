@@ -9,6 +9,10 @@ from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.topics import TopicBuilder
 from intelipump_fdc.persistence.dto import SyncQueueRecord
 
+# Phase 9 cloud contract: only completed sales go on the transactions topic.
+# Heartbeat / LWT are published by CloudRuntime, not the queue.
+PUBLISHABLE_QUEUE_EVENTS = frozenset({"TRANSACTION_COMPLETED"})
+
 
 class DeliveryMapper:
     def __init__(
@@ -31,9 +35,14 @@ class DeliveryMapper:
         self._seq += 1
         return self._seq
 
+    def should_publish(self, record: SyncQueueRecord) -> bool:
+        return record.event_type in PUBLISHABLE_QUEUE_EVENTS
+
     def map_record(
         self, record: SyncQueueRecord
     ) -> tuple[str, CloudMessageEnvelope, int]:
+        if not self.should_publish(record):
+            raise ValueError(f"queue event is not publishable: {record.event_type}")
         payload = dict(record.payload)
         event_type = record.event_type
         pump_id = _as_str(payload.get("pump_id") or payload.get("logical_pump_id"))

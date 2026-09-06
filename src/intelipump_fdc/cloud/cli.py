@@ -23,29 +23,43 @@ from intelipump_fdc.persistence.unit_of_work import unit_of_work
 from intelipump_fdc.services.recovery_service import RecoveryService
 
 
-def run(argv: list[str] | None = None) -> None:
-    settings = get_settings()
+def build_parser(settings: object | None = None) -> argparse.ArgumentParser:
+    cfg = settings or get_settings()
     parser = argparse.ArgumentParser(
         prog="intelipump-cloud-sync",
         description=(
-            "LAB MQTT cloud sync: heartbeats, durable sync_queue delivery, "
-            "optional command intake (no production execution)."
+            "LAB MQTT cloud sync: heartbeats, durable sync_queue delivery. "
+            "Command intake stays off unless --commands-enabled."
         ),
     )
-    parser.add_argument("--mqtt-host", default=settings.mqtt.host)
-    parser.add_argument("--mqtt-port", type=int, default=settings.mqtt.port)
-    parser.add_argument("--device-id", default=settings.controller.device_id)
-    parser.add_argument("--station-id", default=settings.controller.station_id)
-    parser.add_argument("--database-url", default=settings.database.url)
-    parser.add_argument("--duration", type=float, default=60.0)
+    parser.add_argument("--mqtt-host", default=cfg.mqtt.host)
+    parser.add_argument("--mqtt-port", type=int, default=cfg.mqtt.port)
+    parser.add_argument("--device-id", default=cfg.controller.device_id)
+    parser.add_argument("--station-id", default=cfg.controller.station_id)
+    parser.add_argument("--database-url", default=cfg.database.url)
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Seconds to run. Omit (or 0) to run until SIGTERM — used by systemd.",
+    )
     parser.add_argument("--log-messages", action="store_true")
-    parser.add_argument("--commands-enabled", action="store_true")
+    parser.add_argument(
+        "--commands-enabled",
+        action="store_true",
+        help="LAB only. Do not enable on the owned-lab Pi sidecar.",
+    )
     parser.add_argument("--tls", action="store_true")
     parser.add_argument(
         "--fake-mqtt",
         action="store_true",
         help="Use in-process fake MQTT (tests / offline demo)",
     )
+    return parser
+
+
+def run(argv: list[str] | None = None) -> None:
+    parser = build_parser()
     args = parser.parse_args(argv)
     asyncio.run(_async_main(args))
 
@@ -58,7 +72,9 @@ async def _async_main(args: argparse.Namespace) -> None:
     settings.mqtt.host = args.mqtt_host
     settings.mqtt.port = args.mqtt_port
     settings.mqtt.tls_enabled = bool(args.tls)
+    # Publish-only sidecar. Command subscription stays off unless explicitly requested.
     settings.mqtt.command_subscription_enabled = bool(args.commands_enabled)
+    settings.safety.remote_authorization_enabled = False
     settings.controller.device_id = args.device_id
     settings.controller.station_id = args.station_id
     settings.database.url = args.database_url
@@ -128,7 +144,10 @@ async def _async_main(args: argparse.Namespace) -> None:
         print(json.dumps({"fake_mqtt": True, "host": args.mqtt_host}))
 
     try:
-        await asyncio.wait_for(stop.wait(), timeout=args.duration)
+        if args.duration is None or args.duration <= 0:
+            await stop.wait()
+        else:
+            await asyncio.wait_for(stop.wait(), timeout=args.duration)
     except TimeoutError:
         pass
     finally:

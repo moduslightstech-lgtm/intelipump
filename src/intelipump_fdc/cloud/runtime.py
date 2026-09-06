@@ -127,16 +127,26 @@ class CloudRuntime:
         environment = self.topics.environment
         simulated = self.settings.api.simulated
 
-        offline = {
+        offline_payload = {
             "deviceId": device_id,
             "stationId": station_id,
             "status": "OFFLINE",
             "environment": environment,
             "simulated": simulated,
         }
+        offline = build_envelope(
+            event_type="DEVICE_OFFLINE",
+            environment=environment,
+            device_id=device_id,
+            station_id=station_id,
+            sequence=0,
+            simulated=simulated,
+            deduplication_key=f"status:{device_id}:offline",
+            payload=offline_payload,
+        )
         self.mqtt.set_will(
             self.topics.device_status(device_id),
-            json.dumps(offline, separators=(",", ":")),
+            json.dumps(offline.to_dict(), separators=(",", ":")),
             qos=1,
             retain=True,
         )

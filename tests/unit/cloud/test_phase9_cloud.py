@@ -10,8 +10,9 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from intelipump_fdc.cloud.backoff import compute_backoff_seconds
+from intelipump_fdc.cloud.cli import build_parser
 from intelipump_fdc.cloud.command_intake import CloudCommandIntake
-from intelipump_fdc.cloud.delivery import DeliveryMapper
+from intelipump_fdc.cloud.delivery import DeliveryMapper, PUBLISHABLE_QUEUE_EVENTS
 from intelipump_fdc.cloud.fill_throttle import (
     FillPublishBook,
     FillThrottleConfig,
@@ -104,6 +105,18 @@ def test_message_envelope_serialization() -> None:
     assert data["publishedAt"]
     assert data["payload"]["raw_volume"] == 1000
     assert isinstance(data["payload"]["raw_volume"], int)
+
+
+def test_cloud_sync_cli_defaults_are_publish_only() -> None:
+    args = build_parser().parse_args([])
+    assert args.duration is None
+    assert args.commands_enabled is False
+    assert args.device_id == "InteliPump-Lab-pi-001"
+    assert args.station_id == "InteliPump-US-Lab"
+
+
+def test_queue_publish_filter_is_completed_sales_only() -> None:
+    assert PUBLISHABLE_QUEUE_EVENTS == {"TRANSACTION_COMPLETED"}
 
 
 def test_raw_scaled_values_remain_integers() -> None:
@@ -227,6 +240,42 @@ def test_backoff_bounded() -> None:
     d5 = compute_backoff_seconds(5, base=1.0, maximum=8.0, jitter=0)
     assert d1 == 1.0
     assert d5 == 8.0
+
+
+@pytest.mark.asyncio
+async def test_sync_worker_drains_ignored_queue_events_without_publish(
+    db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
+) -> None:
+    mqtt = FakeMqttClient(host="skip-fill")
+    await mqtt.connect()
+    mapper = DeliveryMapper(
+        topics=topics,
+        device_id="InteliPump-Lab-pi-001",
+        station_id="InteliPump-US-Lab",
+        environment="LAB",
+        simulated=False,
+    )
+    worker = SyncWorker(
+        session_factory=db_factory,
+        mqtt=mqtt,
+        mapper=mapper,
+        batch_size=5,
+        poll_interval_seconds=0.05,
+    )
+    async with unit_of_work(db_factory) as uow:
+        await uow.sync_queue.enqueue(
+            entity_type="transaction",
+            entity_id="tx-fill",
+            event_type="FILLING_UPDATED",
+            payload={"raw_volume": 10, "raw_amount": 20, "pump_id": "pump-1"},
+            deduplication_key="fill:tx-fill",
+        )
+    before = len(mqtt.published)
+    await worker._cycle()
+    assert len(mqtt.published) == before
+    async with unit_of_work(db_factory) as uow:
+        assert await uow.sync_queue.pending_count() == 0
+        assert await uow.sync_queue.delivered_count() == 1
 
 
 @pytest.mark.asyncio
@@ -588,7 +637,15 @@ async def test_cloud_runtime_lifecycle_and_no_secrets(
     )
     await cloud.start()
     assert cloud.online_published
+    assert cloud.command_intake is None
     assert cloud.heartbeat is not None
+    assert mqtt._will is not None
+    assert mqtt._will.topic.endswith("/status")
+    assert mqtt._will.retain is True
+    will = json.loads(mqtt._will.payload)
+    assert will["eventType"] == "DEVICE_OFFLINE"
+    assert will["schemaVersion"] == "1.0"
+    assert will["payload"]["status"] == "OFFLINE"
     await cloud.heartbeat.publish_once()
     health = cloud.health_dict()
     blob = json.dumps(health)
