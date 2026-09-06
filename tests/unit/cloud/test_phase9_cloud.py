@@ -225,6 +225,19 @@ def test_fill_throttling_time_volume_amount_final() -> None:
         state=state,
         config=cfg,
     )
+    settled = FillThrottleState(
+        last_published_at=now,
+        last_raw_volume=200,
+        last_raw_amount=200,
+        published_first=True,
+    )
+    assert not should_publish_fill(
+        now=now + timedelta(seconds=30),
+        raw_volume=200,
+        raw_amount=200,
+        state=settled,
+        config=cfg,
+    )
     assert should_publish_fill(
         now=now,
         raw_volume=1,

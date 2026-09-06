@@ -35,6 +35,15 @@ def should_publish_fill(
         return True
     if not state.published_first:
         return True
+    # Hang-up holds the same totals on the pump. Do not keep republishing
+    # that snapshot or the dashboard stays stuck on DISPENSING.
+    if (
+        state.last_raw_volume is not None
+        and state.last_raw_amount is not None
+        and raw_volume == state.last_raw_volume
+        and raw_amount == state.last_raw_amount
+    ):
+        return False
     vol_ok = (
         state.last_raw_volume is not None
         and abs(raw_volume - state.last_raw_volume) >= config.min_volume_delta
