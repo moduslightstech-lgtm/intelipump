@@ -16,7 +16,10 @@ from intelipump_fdc.cloud.mqtt.base import MqttClient
 from intelipump_fdc.cloud.mqtt.errors import MqttError, MqttNotConnectedError
 from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.topics import TopicBuilder
+from intelipump_fdc.persistence.dto import TransactionRecord
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
+from intelipump_fdc.services.transaction_models import CompleteTransactionRequest
+from intelipump_fdc.services.transaction_service import TransactionService
 
 logger = structlog.get_logger(__name__)
 
@@ -34,9 +37,12 @@ class LiveFillStream:
     environment: str
     simulated: bool
     poll_interval_seconds: float = 1.0
+    settle_seconds: float = 4.0
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
     _seq: int = 0
+    _unchanged_since: dict[str, tuple[int, int, datetime]] = field(default_factory=dict)
+    _finalized: set[str] = field(default_factory=set)
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -64,7 +70,8 @@ class LiveFillStream:
             except TimeoutError:
                 continue
 
-    async def publish_active_fills(self) -> int:
+    async def publish_active_fills(self, *, now: datetime | None = None) -> int:
+        now = now or datetime.now(UTC)
         published = 0
         async with unit_of_work(self.session_factory) as uow:
             active = await uow.transactions.list_unresolved(station_id=self.station_id)
@@ -75,16 +82,33 @@ class LiveFillStream:
                 if pump is not None:
                     logical[pump_id] = pump.logical_pump_id
 
+        live_ids = {tx.transaction_uuid for tx in active}
+        self._unchanged_since = {
+            key: value for key, value in self._unchanged_since.items() if key in live_ids
+        }
+        self._finalized &= live_ids
+
         for tx in active:
             raw_volume = int(tx.raw_volume or 0)
             raw_amount = int(tx.raw_amount or 0)
             if raw_volume <= 0 and raw_amount <= 0:
                 continue
+            prev = self._unchanged_since.get(tx.transaction_uuid)
+            if prev and prev[0] == raw_volume and prev[1] == raw_amount:
+                if (
+                    tx.transaction_uuid not in self._finalized
+                    and (now - prev[2]).total_seconds() >= self.settle_seconds
+                ):
+                    if await self._finalize_settled(tx, raw_volume, raw_amount):
+                        published += 1
+                continue
+            self._unchanged_since[tx.transaction_uuid] = (raw_volume, raw_amount, now)
             if not self.fill_book.decide(
                 tx.transaction_uuid,
                 raw_volume=raw_volume,
                 raw_amount=raw_amount,
                 is_final=False,
+                now=now,
             ):
                 continue
             pump_id = logical.get(tx.pump_id)
@@ -117,7 +141,7 @@ class LiveFillStream:
                 },
                 pump_id=pump_id,
                 transaction_id=tx.transaction_uuid,
-                occurred_at=datetime.now(UTC).isoformat(),
+                occurred_at=now.isoformat(),
             )
             try:
                 await self.mqtt.publish(
@@ -131,3 +155,46 @@ class LiveFillStream:
                 logger.warning("live_fill_publish_failed", error=str(exc))
                 return published
         return published
+
+    async def _finalize_settled(
+        self, tx: TransactionRecord, raw_volume: int, raw_amount: int
+    ) -> bool:
+        """Hang-up holds DISPLAY; controller may leave the SQLite row ACTIVE.
+
+        Complete it here so TRANSACTION_COMPLETED is queued without touching
+        the Wayne loop.
+        """
+        try:
+            async with unit_of_work(self.session_factory) as uow:
+                _row, newly = await TransactionService(uow).complete(
+                    CompleteTransactionRequest(
+                        transaction_uuid=tx.transaction_uuid,
+                        source_completion_key=f"sidecar-settle:{tx.transaction_uuid}",
+                        raw_volume=raw_volume,
+                        raw_amount=raw_amount,
+                        completion_inferred=True,
+                        completion_warnings=("sidecar_settle_after_hangup",),
+                    )
+                )
+        except Exception as exc:
+            logger.warning(
+                "live_fill_finalize_failed",
+                transaction_uuid=tx.transaction_uuid,
+                error=str(exc),
+            )
+            return False
+        self._finalized.add(tx.transaction_uuid)
+        self.fill_book.decide(
+            tx.transaction_uuid,
+            raw_volume=raw_volume,
+            raw_amount=raw_amount,
+            is_final=True,
+        )
+        if newly:
+            logger.info(
+                "live_fill_settled_completed",
+                transaction_uuid=tx.transaction_uuid,
+                raw_volume=raw_volume,
+                raw_amount=raw_amount,
+            )
+        return newly

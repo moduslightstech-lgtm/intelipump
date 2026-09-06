@@ -13,6 +13,7 @@ from intelipump_fdc.cloud.backoff import compute_backoff_seconds
 from intelipump_fdc.cloud.cli import build_parser
 from intelipump_fdc.cloud.command_intake import CloudCommandIntake
 from intelipump_fdc.cloud.delivery import DeliveryMapper, PUBLISHABLE_QUEUE_EVENTS
+from intelipump_fdc.cloud.fill_stream import LiveFillStream
 from intelipump_fdc.cloud.fill_throttle import (
     FillPublishBook,
     FillThrottleConfig,
@@ -41,6 +42,7 @@ from intelipump_fdc.persistence.unit_of_work import unit_of_work
 from intelipump_fdc.services.transaction_models import (
     BeginTransactionRequest,
     CompleteTransactionRequest,
+    FillingUpdateRequest,
 )
 from intelipump_fdc.services.transaction_service import TransactionService
 
@@ -246,6 +248,69 @@ def test_fill_throttling_time_volume_amount_final() -> None:
         config=cfg,
         is_final=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_live_fill_stream_completes_settled_hangup(
+    db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
+) -> None:
+    mqtt = FakeMqttClient(host="settle-fill")
+    await mqtt.connect()
+    started = datetime.now(UTC)
+    async with unit_of_work(db_factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id="InteliPump-US-Lab",
+            logical_pump_id="pump-2",
+            dart_address=2,
+        )
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="InteliPump-US-Lab",
+                pump_db_id=pump.id,
+                transaction_uuid="tx-700",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=3,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await svc.update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-700",
+                raw_volume=595,
+                raw_amount=70000,
+                event_key="fill:tx-700:595:70000",
+            )
+        )
+
+    stream = LiveFillStream(
+        session_factory=db_factory,
+        mqtt=mqtt,
+        topics=topics,
+        fill_book=FillPublishBook(),
+        device_id="InteliPump-Lab-pi-001",
+        station_id="InteliPump-US-Lab",
+        environment="LAB",
+        simulated=False,
+        settle_seconds=4.0,
+    )
+    await stream.publish_active_fills(now=started)
+    assert any(
+        json.loads(m.payload).get("eventType") == "FILLING_UPDATED" for m in mqtt.published
+    )
+    async with unit_of_work(db_factory) as uow:
+        open_rows = await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab")
+        assert len(open_rows) == 1
+
+    await stream.publish_active_fills(now=started + timedelta(seconds=5))
+    async with unit_of_work(db_factory) as uow:
+        assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
+        pending = await uow.sync_queue.pending_count()
+    assert pending >= 1
 
 
 def test_backoff_bounded() -> None:
