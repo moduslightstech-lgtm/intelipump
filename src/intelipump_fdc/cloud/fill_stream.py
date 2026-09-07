@@ -65,6 +65,8 @@ class LiveFillStream:
     simulated: bool
     poll_interval_seconds: float = 1.0
     settle_seconds: float = 4.0
+    # Hang-up often leaves Wayne snapshot as FILLING. Still complete if ticks stop.
+    force_settle_seconds: float = 8.0
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
     _seq: int = 0
@@ -105,12 +107,24 @@ class LiveFillStream:
             pump_ids = {tx.pump_id for tx in active}
             logical: dict[str, str] = {}
             filling_now: dict[str, bool] = {}
+            skip_fill_pub: set[str] = set()
             for pump_id in pump_ids:
                 pump = await uow.pumps.get_by_id(pump_id)
                 if pump is not None:
                     logical[pump_id] = pump.logical_pump_id
                 snap = await uow.states.latest(pump_id)
                 filling_now[pump_id] = _pump_is_actively_filling(snap, now)
+            for tx in active:
+                twin = await uow.transactions.find_recent_completed_same_totals(
+                    station_id=tx.station_id,
+                    pump_id=tx.pump_id,
+                    raw_volume=int(tx.raw_volume or 0),
+                    raw_amount=int(tx.raw_amount or 0),
+                    exclude_uuid=tx.transaction_uuid,
+                    within_seconds=20.0,
+                )
+                if twin is not None:
+                    skip_fill_pub.add(tx.transaction_uuid)
 
         live_ids = {tx.transaction_uuid for tx in active}
         self._unchanged_since = {
@@ -125,15 +139,18 @@ class LiveFillStream:
                 continue
             prev = self._unchanged_since.get(tx.transaction_uuid)
             if prev and prev[0] == raw_volume and prev[1] == raw_amount:
-                if (
-                    tx.transaction_uuid not in self._finalized
-                    and not filling_now.get(tx.pump_id, False)
-                    and (now - prev[2]).total_seconds() >= self.settle_seconds
-                ):
+                unchanged = (now - prev[2]).total_seconds()
+                filling = filling_now.get(tx.pump_id, False)
+                ready = unchanged >= self.settle_seconds and (
+                    not filling or unchanged >= self.force_settle_seconds
+                )
+                if tx.transaction_uuid not in self._finalized and ready:
                     if await self._finalize_settled(tx, raw_volume, raw_amount):
                         published += 1
                 continue
             self._unchanged_since[tx.transaction_uuid] = (raw_volume, raw_amount, now)
+            if tx.transaction_uuid in skip_fill_pub:
+                continue
             if not self.fill_book.decide(
                 tx.transaction_uuid,
                 raw_volume=raw_volume,
@@ -206,16 +223,8 @@ class LiveFillStream:
         Complete it here so TRANSACTION_COMPLETED is queued without touching
         the Wayne loop.
         """
-        published = False
         try:
             async with unit_of_work(self.session_factory) as uow:
-                already = await uow.transactions.find_recent_completed_same_totals(
-                    station_id=tx.station_id,
-                    pump_id=tx.pump_id,
-                    raw_volume=raw_volume,
-                    raw_amount=raw_amount,
-                    exclude_uuid=tx.transaction_uuid,
-                )
                 _row, newly = await TransactionService(uow).complete(
                     CompleteTransactionRequest(
                         transaction_uuid=tx.transaction_uuid,
@@ -224,16 +233,8 @@ class LiveFillStream:
                         raw_amount=raw_amount,
                         completion_inferred=True,
                         completion_warnings=("sidecar_settle_after_hangup",),
-                        publish_completion=already is None,
                     )
                 )
-                published = bool(newly and already is None)
-                if newly and already is not None:
-                    logger.info(
-                        "live_fill_settle_suppressed_duplicate",
-                        transaction_uuid=tx.transaction_uuid,
-                        kept_uuid=already.transaction_uuid,
-                    )
         except Exception as exc:
             logger.warning(
                 "live_fill_finalize_failed",
@@ -248,11 +249,11 @@ class LiveFillStream:
             raw_amount=raw_amount,
             is_final=True,
         )
-        if published:
+        if newly:
             logger.info(
                 "live_fill_settled_completed",
                 transaction_uuid=tx.transaction_uuid,
                 raw_volume=raw_volume,
                 raw_amount=raw_amount,
             )
-        return published
+        return newly
