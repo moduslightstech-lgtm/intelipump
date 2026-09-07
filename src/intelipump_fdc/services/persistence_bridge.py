@@ -73,6 +73,103 @@ class PersistenceBridge:
     def detach(self) -> None:
         self._events.remove_subscriber(self.on_event)
 
+    async def _open_uuid(self, uow: Any, uuid: str | None) -> str | None:
+        if not uuid:
+            return None
+        row = await uow.transactions.get_by_uuid(uuid)
+        if row is not None and row.status in _OPEN_TX_STATUSES:
+            return uuid
+        return None
+
+    async def _begin_sale(
+        self,
+        uow: Any,
+        *,
+        pump_db: str,
+        tx_uuid: str,
+        nozzle_id: int | None,
+        raw_price: int | None = None,
+        price_decimals: int | None = None,
+        volume_decimals: int | None = None,
+        amount_decimals: int | None = None,
+    ) -> None:
+        await TransactionService(uow, fill_book=self._fill_book).begin(
+            BeginTransactionRequest(
+                station_id=self._station_id,
+                pump_db_id=pump_db,
+                transaction_uuid=tx_uuid,
+                nozzle_id=nozzle_id,
+                raw_price=raw_price,
+                price_decimals=price_decimals,
+                volume_decimals=volume_decimals,
+                amount_decimals=amount_decimals,
+                simulated=self._simulated,
+                environment=self._environment,
+            )
+        )
+
+    async def _ensure_open_sale(
+        self,
+        uow: Any,
+        *,
+        address: int,
+        pump_db: str,
+        candidate: str | None,
+        nozzle_id: int | None,
+        raw_price: int | None = None,
+        price_decimals: int | None = None,
+        volume_decimals: int | None = None,
+        amount_decimals: int | None = None,
+        reason: str,
+    ) -> str:
+        """Return an ACTIVE sale UUID. Never write ticks onto a COMPLETED row.
+
+        After hang-up the Wayne state machine keeps the old UUID. Reusing that
+        row swallows the next fill (₦750 on the wire, nothing in SQLite).
+        """
+        mapped = await self._open_uuid(uow, self._tx_by_address.get(address))
+        if mapped:
+            self._tx_by_address[address] = mapped
+            return mapped
+        if candidate:
+            row = await uow.transactions.get_by_uuid(candidate)
+            if row is None:
+                await self._begin_sale(
+                    uow,
+                    pump_db=pump_db,
+                    tx_uuid=candidate,
+                    nozzle_id=nozzle_id,
+                    raw_price=raw_price,
+                    price_decimals=price_decimals,
+                    volume_decimals=volume_decimals,
+                    amount_decimals=amount_decimals,
+                )
+                self._tx_by_address[address] = candidate
+                return candidate
+            if row.status in _OPEN_TX_STATUSES:
+                self._tx_by_address[address] = candidate
+                return candidate
+            logger.info(
+                "new_fill_after_completed_sale",
+                previous_uuid=candidate,
+                previous_status=row.status,
+                address=address,
+                reason=reason,
+            )
+        tx_uuid = str(uuid4())
+        await self._begin_sale(
+            uow,
+            pump_db=pump_db,
+            tx_uuid=tx_uuid,
+            nozzle_id=nozzle_id,
+            raw_price=raw_price,
+            price_decimals=price_decimals,
+            volume_decimals=volume_decimals,
+            amount_decimals=amount_decimals,
+        )
+        self._tx_by_address[address] = tx_uuid
+        return tx_uuid
+
     def on_event(self, event: ControllerEvent) -> None:
         self._publish_live(event)
         if event.type is ControllerEventType.STATE_CHANGED:
@@ -257,9 +354,6 @@ class PersistenceBridge:
         state_version = int(detail_payload.get("state_version") or 0)
         active_tx = detail_payload.get("active_transaction_id")
         active_tx_s = str(active_tx) if active_tx else None
-        if active_tx_s:
-            # Keep in-memory mapping across restart/reconcile without new begin.
-            self._tx_by_address[address] = active_tx_s
         completion_key = detail_payload.get("completion_evidence_key")
         completion_key_s = str(completion_key) if completion_key else None
 
@@ -289,53 +383,26 @@ class PersistenceBridge:
             )
 
             if new_state is PumpState.FILLING and prev_state is not PumpState.FILLING:
-                tx_uuid = active_tx_s or self._tx_by_address.get(address)
-                existing = (
-                    await uow.transactions.get_by_uuid(tx_uuid) if tx_uuid else None
+                nozzle = detail_payload.get("selected_nozzle")
+                nozzle_id = nozzle if isinstance(nozzle, int) else None
+                previous = self._tx_by_address.get(address)
+                tx_uuid = await self._ensure_open_sale(
+                    uow,
+                    address=address,
+                    pump_db=pump_db,
+                    candidate=active_tx_s,
+                    nozzle_id=nozzle_id,
+                    reason="filling_started",
                 )
-                # After hang-up the state machine often keeps the old UUID.
-                # Reusing a COMPLETED row + never-decrease max() swallows the
-                # next sale (₦700 never appears; dashboard stays on ₦8000).
-                if existing is not None and existing.status not in _OPEN_TX_STATUSES:
-                    logger.info(
-                        "new_fill_after_completed_sale",
-                        previous_uuid=tx_uuid,
-                        previous_status=existing.status,
-                        address=address,
+                if self._live is not None and tx_uuid != previous:
+                    self._live.publish_typed(
+                        LiveEventType.TRANSACTION_CREATED,
+                        station_id=self._station_id,
+                        environment=self._environment,
+                        simulated=self._simulated,
+                        pump_id=logical,
+                        transaction_id=tx_uuid,
                     )
-                    tx_uuid = str(uuid4())
-                    existing = None
-                elif not tx_uuid:
-                    tx_uuid = str(uuid4())
-                self._tx_by_address[address] = tx_uuid
-                # Restore mapping for restart without creating a duplicate when
-                # the active transaction id was already persisted.
-                if existing is None:
-                    nozzle = detail_payload.get("selected_nozzle")
-                    nozzle_id = nozzle if isinstance(nozzle, int) else None
-                    await TransactionService(uow, fill_book=self._fill_book).begin(
-                        BeginTransactionRequest(
-                            station_id=self._station_id,
-                            pump_db_id=pump_db,
-                            transaction_uuid=tx_uuid,
-                            nozzle_id=nozzle_id,
-                            raw_price=None,
-                            price_decimals=None,
-                            volume_decimals=None,
-                            amount_decimals=None,
-                            simulated=self._simulated,
-                            environment=self._environment,
-                        )
-                    )
-                    if self._live is not None:
-                        self._live.publish_typed(
-                            LiveEventType.TRANSACTION_CREATED,
-                            station_id=self._station_id,
-                            environment=self._environment,
-                            simulated=self._simulated,
-                            pump_id=logical,
-                            transaction_id=tx_uuid,
-                        )
 
             event_name = str(detail_payload.get("event") or "")
             awaiting = bool(detail_payload.get("awaiting_filling_complete"))
@@ -393,7 +460,6 @@ class PersistenceBridge:
                 return
 
             if new_state in {PumpState.FILLING_COMPLETE, PumpState.LIMIT_REACHED}:
-                complete_uuid = active_tx_s or self._tx_by_address.get(address)
                 may_publish = detail_payload.get("may_publish_sale")
                 filled_vol = detail_payload.get("filled_volume_raw")
                 filled_amt = detail_payload.get("filled_amount_raw")
@@ -435,7 +501,16 @@ class PersistenceBridge:
                         },
                     )
                     return
-                if complete_uuid and not awaiting:
+                if not awaiting and (vol_raw > 0 or amt_raw > 0):
+                    nozzle = detail_payload.get("selected_nozzle")
+                    complete_uuid = await self._ensure_open_sale(
+                        uow,
+                        address=address,
+                        pump_db=pump_db,
+                        candidate=active_tx_s,
+                        nozzle_id=nozzle if isinstance(nozzle, int) else None,
+                        reason="sale_complete",
+                    )
                     key = (
                         completion_key_s
                         or f"complete:{complete_uuid}:{new_state.value}"
@@ -498,8 +573,8 @@ class PersistenceBridge:
             return
         if not payload.get("is_dc2"):
             return
-        tx_uuid = self._tx_by_address.get(address)
-        if not tx_uuid:
+        pump_db = self._pump_id_by_address.get(address)
+        if not pump_db:
             return
         detail_payload = payload.get("payload") or {}
         if not isinstance(detail_payload, dict):
@@ -508,11 +583,34 @@ class PersistenceBridge:
         raw_amount = detail_payload.get("raw_amount")
         if not isinstance(raw_volume, int) or not isinstance(raw_amount, int):
             return
-        # Stable event key from scaled values — duplicate DATA with same
-        # totals is ignored; progressive fills still update.
-        event_key = f"fill:{tx_uuid}:{raw_volume}:{raw_amount}"
+        nozzle = detail_payload.get("selected_nozzle")
         async with unit_of_work(self._factory) as uow:
-            await TransactionService(uow, fill_book=self._fill_book).update_filling(
+            tx_uuid = await self._ensure_open_sale(
+                uow,
+                address=address,
+                pump_db=pump_db,
+                candidate=self._tx_by_address.get(address),
+                nozzle_id=nozzle if isinstance(nozzle, int) else None,
+                raw_price=detail_payload.get("raw_price")
+                if isinstance(detail_payload.get("raw_price"), int)
+                else None,
+                price_decimals=detail_payload.get("price_decimals")
+                if isinstance(detail_payload.get("price_decimals"), int)
+                else None,
+                volume_decimals=detail_payload.get("volume_decimals")
+                if isinstance(detail_payload.get("volume_decimals"), int)
+                else None,
+                amount_decimals=detail_payload.get("amount_decimals")
+                if isinstance(detail_payload.get("amount_decimals"), int)
+                else None,
+                reason="dc2_tick",
+            )
+            # Stable event key from scaled values — duplicate DATA with same
+            # totals is ignored; progressive fills still update.
+            event_key = f"fill:{tx_uuid}:{raw_volume}:{raw_amount}"
+            updated = await TransactionService(
+                uow, fill_book=self._fill_book
+            ).update_filling(
                 FillingUpdateRequest(
                     transaction_uuid=tx_uuid,
                     raw_volume=raw_volume,
@@ -524,6 +622,8 @@ class PersistenceBridge:
                     source_frame_ref=detail_payload.get("source_frame_ref"),
                 )
             )
+            if updated is None:
+                return
             if self._live is not None:
                 self._live.publish_typed(
                     LiveEventType.FILLING_UPDATED,
