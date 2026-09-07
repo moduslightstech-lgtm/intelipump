@@ -81,59 +81,6 @@ class PersistenceBridge:
             return uuid
         return None
 
-    async def _fueled_open_uuid(self, uow: Any, pump_db: str) -> str | None:
-        """ACTIVE row on this pump that already has DC2 totals (not a 0/0 zombie)."""
-        rows = await uow.transactions.list_unresolved(station_id=self._station_id)
-        fueled = [
-            tx
-            for tx in rows
-            if tx.pump_id == pump_db
-            and (int(tx.raw_amount or 0) > 0 or int(tx.raw_volume or 0) > 0)
-        ]
-        if not fueled:
-            return None
-        fueled.sort(
-            key=lambda tx: tx.updated_at or tx.started_at or tx.created_at,
-            reverse=True,
-        )
-        return fueled[0].transaction_uuid
-
-    async def _open_uuid_for_hangup(
-        self,
-        uow: Any,
-        *,
-        address: int,
-        pump_db: str,
-        vol_raw: int,
-        amt_raw: int,
-    ) -> str | None:
-        """Complete the live fill only. Never mint a second sale on holster."""
-        fueled = await self._fueled_open_uuid(uow, pump_db)
-        if fueled:
-            self._tx_by_address[address] = fueled
-            return fueled
-        mapped = await self._open_uuid(uow, self._tx_by_address.get(address))
-        if mapped:
-            self._tx_by_address[address] = mapped
-            return mapped
-        already = await uow.transactions.find_recent_completed_same_totals(
-            station_id=self._station_id,
-            pump_id=pump_db,
-            raw_volume=vol_raw,
-            raw_amount=amt_raw,
-        )
-        if already is not None:
-            logger.info(
-                "hangup_already_completed",
-                address=address,
-                transaction_uuid=already.transaction_uuid,
-                raw_volume=vol_raw,
-                raw_amount=amt_raw,
-            )
-            self._tx_by_address[address] = already.transaction_uuid
-            return None
-        return None
-
     async def _begin_sale(
         self,
         uow: Any,
@@ -154,8 +101,8 @@ class PersistenceBridge:
                 nozzle_id=nozzle_id,
                 raw_price=raw_price,
                 price_decimals=price_decimals,
-                volume_decimals=volume_decimals if volume_decimals is not None else 2,
-                amount_decimals=amount_decimals if amount_decimals is not None else 2,
+                volume_decimals=volume_decimals,
+                amount_decimals=amount_decimals,
                 simulated=self._simulated,
                 environment=self._environment,
             )
@@ -181,23 +128,6 @@ class PersistenceBridge:
         row swallows the next fill (₦750 on the wire, nothing in SQLite).
         """
         mapped = await self._open_uuid(uow, self._tx_by_address.get(address))
-        mapped_row = (
-            await uow.transactions.get_by_uuid(mapped) if mapped else None
-        )
-        mapped_has_fuel = bool(
-            mapped_row
-            and (
-                int(mapped_row.raw_amount or 0) > 0
-                or int(mapped_row.raw_volume or 0) > 0
-            )
-        )
-        if mapped and mapped_has_fuel:
-            self._tx_by_address[address] = mapped
-            return mapped
-        fueled = await self._fueled_open_uuid(uow, pump_db)
-        if fueled:
-            self._tx_by_address[address] = fueled
-            return fueled
         if mapped:
             self._tx_by_address[address] = mapped
             return mapped
@@ -572,23 +502,15 @@ class PersistenceBridge:
                     )
                     return
                 if not awaiting and (vol_raw > 0 or amt_raw > 0):
-                    complete_uuid = await self._open_uuid_for_hangup(
+                    nozzle = detail_payload.get("selected_nozzle")
+                    complete_uuid = await self._ensure_open_sale(
                         uow,
                         address=address,
                         pump_db=pump_db,
-                        vol_raw=vol_raw,
-                        amt_raw=amt_raw,
+                        candidate=active_tx_s,
+                        nozzle_id=nozzle if isinstance(nozzle, int) else None,
+                        reason="sale_complete",
                     )
-                    if complete_uuid is None:
-                        logger.info(
-                            "hangup_skipped_no_open_sale",
-                            address=address,
-                            pump_id=pump_db,
-                            filled_volume_raw=vol_raw,
-                            filled_amount_raw=amt_raw,
-                            candidate=active_tx_s,
-                        )
-                        return
                     key = (
                         completion_key_s
                         or f"complete:{complete_uuid}:{new_state.value}"
