@@ -16,12 +16,32 @@ from intelipump_fdc.cloud.mqtt.base import MqttClient
 from intelipump_fdc.cloud.mqtt.errors import MqttError, MqttNotConnectedError
 from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.topics import TopicBuilder
-from intelipump_fdc.persistence.dto import TransactionRecord
+from intelipump_fdc.persistence.dto import StateSnapshotRecord, TransactionRecord
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 from intelipump_fdc.services.transaction_models import CompleteTransactionRequest
 from intelipump_fdc.services.transaction_service import TransactionService
 
 logger = structlog.get_logger(__name__)
+
+# Do not auto-complete while the controller is still reporting a live fill.
+# Stale FILLING (hang-up left the row ACTIVE) is handled by observed_at age.
+_LIVE_FILL_STATES = frozenset({"FILLING", "AUTHORIZED", "NOZZLE_UP", "SUSPENDED"})
+_LIVE_STATE_MAX_AGE_SECONDS = 12.0
+
+
+def _pump_is_actively_filling(
+    snap: StateSnapshotRecord | None, now: datetime
+) -> bool:
+    if snap is None:
+        return False
+    if (snap.normalized_state or "").upper() not in _LIVE_FILL_STATES:
+        return False
+    observed = snap.observed_at or snap.persisted_at
+    if observed is None:
+        return True
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=UTC)
+    return (now - observed).total_seconds() < _LIVE_STATE_MAX_AGE_SECONDS
 
 
 @dataclass
@@ -77,10 +97,13 @@ class LiveFillStream:
             active = await uow.transactions.list_unresolved(station_id=self.station_id)
             pump_ids = {tx.pump_id for tx in active}
             logical: dict[str, str] = {}
+            filling_now: dict[str, bool] = {}
             for pump_id in pump_ids:
                 pump = await uow.pumps.get_by_id(pump_id)
                 if pump is not None:
                     logical[pump_id] = pump.logical_pump_id
+                snap = await uow.states.latest(pump_id)
+                filling_now[pump_id] = _pump_is_actively_filling(snap, now)
 
         live_ids = {tx.transaction_uuid for tx in active}
         self._unchanged_since = {
@@ -97,6 +120,7 @@ class LiveFillStream:
             if prev and prev[0] == raw_volume and prev[1] == raw_amount:
                 if (
                     tx.transaction_uuid not in self._finalized
+                    and not filling_now.get(tx.pump_id, False)
                     and (now - prev[2]).total_seconds() >= self.settle_seconds
                 ):
                     if await self._finalize_settled(tx, raw_volume, raw_amount):
@@ -151,6 +175,13 @@ class LiveFillStream:
                     retain=False,
                 )
                 published += 1
+                logger.info(
+                    "live_fill_published",
+                    transaction_uuid=tx.transaction_uuid,
+                    pump_id=pump_id,
+                    raw_volume=raw_volume,
+                    raw_amount=raw_amount,
+                )
             except (MqttNotConnectedError, MqttError) as exc:
                 logger.warning("live_fill_publish_failed", error=str(exc))
                 return published

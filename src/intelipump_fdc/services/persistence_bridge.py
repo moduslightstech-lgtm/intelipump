@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from intelipump_fdc.cloud.fill_throttle import FillPublishBook
@@ -29,6 +30,10 @@ from intelipump_fdc.services.transaction_models import (
 )
 from intelipump_fdc.services.transaction_service import TransactionService
 from intelipump_fdc.state_machine.models import PumpContext
+
+logger = structlog.get_logger(__name__)
+
+_OPEN_TX_STATUSES = frozenset({"ACTIVE", "SUSPENDED", "OPEN"})
 
 
 class PersistenceBridge:
@@ -284,11 +289,27 @@ class PersistenceBridge:
             )
 
             if new_state is PumpState.FILLING and prev_state is not PumpState.FILLING:
-                tx_uuid = active_tx_s or self._tx_by_address.get(address) or str(uuid4())
+                tx_uuid = active_tx_s or self._tx_by_address.get(address)
+                existing = (
+                    await uow.transactions.get_by_uuid(tx_uuid) if tx_uuid else None
+                )
+                # After hang-up the state machine often keeps the old UUID.
+                # Reusing a COMPLETED row + never-decrease max() swallows the
+                # next sale (₦700 never appears; dashboard stays on ₦8000).
+                if existing is not None and existing.status not in _OPEN_TX_STATUSES:
+                    logger.info(
+                        "new_fill_after_completed_sale",
+                        previous_uuid=tx_uuid,
+                        previous_status=existing.status,
+                        address=address,
+                    )
+                    tx_uuid = str(uuid4())
+                    existing = None
+                elif not tx_uuid:
+                    tx_uuid = str(uuid4())
                 self._tx_by_address[address] = tx_uuid
                 # Restore mapping for restart without creating a duplicate when
                 # the active transaction id was already persisted.
-                existing = await uow.transactions.get_by_uuid(tx_uuid)
                 if existing is None:
                     nozzle = detail_payload.get("selected_nozzle")
                     nozzle_id = nozzle if isinstance(nozzle, int) else None

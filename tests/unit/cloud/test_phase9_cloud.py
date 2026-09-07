@@ -38,13 +38,16 @@ from intelipump_fdc.persistence.database import (
     dispose_engine,
 )
 from intelipump_fdc.persistence.migrations import init_schema
+from intelipump_fdc.domain.pump_state import PumpState
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
+from intelipump_fdc.services.pump_state_service import PumpStateService
 from intelipump_fdc.services.transaction_models import (
     BeginTransactionRequest,
     CompleteTransactionRequest,
     FillingUpdateRequest,
 )
 from intelipump_fdc.services.transaction_service import TransactionService
+from intelipump_fdc.state_machine.models import PumpContext
 
 
 @pytest.fixture
@@ -311,6 +314,75 @@ async def test_live_fill_stream_completes_settled_hangup(
         assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
         pending = await uow.sync_queue.pending_count()
     assert pending >= 1
+
+
+@pytest.mark.asyncio
+async def test_live_fill_stream_does_not_settle_during_live_fill(
+    db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
+) -> None:
+    mqtt = FakeMqttClient(host="live-pause")
+    await mqtt.connect()
+    started = datetime.now(UTC)
+    async with unit_of_work(db_factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id="InteliPump-US-Lab",
+            logical_pump_id="pump-2",
+            dart_address=2,
+        )
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="InteliPump-US-Lab",
+                pump_db_id=pump.id,
+                transaction_uuid="tx-live-pause",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=3,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await svc.update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-live-pause",
+                raw_volume=200,
+                raw_amount=23500,
+                event_key="fill:tx-live-pause:200:23500",
+            )
+        )
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump.id,
+            context=PumpContext(
+                pump_id="pump-2",
+                dart_address=2,
+                current_state=PumpState.FILLING,
+                previous_state=PumpState.AUTHORIZED,
+                active_transaction_id="tx-live-pause",
+                communication_healthy=True,
+                state_version=3,
+            ),
+            observed_at=started,
+        )
+
+    stream = LiveFillStream(
+        session_factory=db_factory,
+        mqtt=mqtt,
+        topics=topics,
+        fill_book=FillPublishBook(),
+        device_id="InteliPump-Lab-pi-001",
+        station_id="InteliPump-US-Lab",
+        environment="LAB",
+        simulated=False,
+        settle_seconds=4.0,
+    )
+    await stream.publish_active_fills(now=started)
+    await stream.publish_active_fills(now=started + timedelta(seconds=5))
+    async with unit_of_work(db_factory) as uow:
+        open_rows = await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab")
+        assert len(open_rows) == 1
+        assert open_rows[0].transaction_uuid == "tx-live-pause"
 
 
 def test_backoff_bounded() -> None:

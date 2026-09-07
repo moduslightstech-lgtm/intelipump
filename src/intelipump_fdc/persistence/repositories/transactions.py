@@ -138,7 +138,9 @@ class TransactionRepository:
         row = result.scalar_one_or_none()
         if row is None:
             return None
-        # Never decrease.
+        if row.status in {"COMPLETED", "COMPLETE", "VOID", "CANCELLED"}:
+            return None
+        # Never decrease while the sale is still open.
         row.raw_volume = max(row.raw_volume, raw_volume)
         row.raw_amount = max(row.raw_amount, raw_amount)
         if raw_price is not None:

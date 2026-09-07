@@ -188,3 +188,46 @@ async def test_raw_scaled_values_preserved(engine_factory: tuple) -> None:
         assert tx.raw_price == 12345
         assert tx.raw_volume == 67890
         assert tx.price_decimals is None
+
+
+@pytest.mark.asyncio
+async def test_update_filling_does_not_mutate_completed(engine_factory: tuple) -> None:
+    _engine, factory = engine_factory
+    pump_id = await _pump(factory)
+    async with unit_of_work(factory) as uow:
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id=STATION,
+                pump_db_id=pump_id,
+                transaction_uuid="tx-done",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=3,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await svc.complete(
+            CompleteTransactionRequest(
+                transaction_uuid="tx-done",
+                source_completion_key="done:tx-done",
+                raw_volume=680,
+                raw_amount=800000,
+            )
+        )
+        again = await svc.update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-done",
+                raw_volume=595,
+                raw_amount=70000,
+                event_key="fill:tx-done:595:70000",
+            )
+        )
+        assert again is None
+        frozen = await uow.transactions.get_by_uuid("tx-done")
+        assert frozen is not None
+        assert frozen.status == "COMPLETED"
+        assert frozen.raw_amount == 800000
