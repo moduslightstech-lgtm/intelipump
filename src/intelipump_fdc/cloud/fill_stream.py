@@ -121,7 +121,7 @@ class LiveFillStream:
                     raw_volume=int(tx.raw_volume or 0),
                     raw_amount=int(tx.raw_amount or 0),
                     exclude_uuid=tx.transaction_uuid,
-                    within_seconds=20.0,
+                    within_seconds=120.0,
                 )
                 if twin is not None:
                     skip_fill_pub.add(tx.transaction_uuid)
@@ -223,8 +223,17 @@ class LiveFillStream:
         Complete it here so TRANSACTION_COMPLETED is queued without touching
         the Wayne loop.
         """
+        published = False
         try:
             async with unit_of_work(self.session_factory) as uow:
+                already = await uow.transactions.find_recent_completed_same_totals(
+                    station_id=tx.station_id,
+                    pump_id=tx.pump_id,
+                    raw_volume=raw_volume,
+                    raw_amount=raw_amount,
+                    exclude_uuid=tx.transaction_uuid,
+                    within_seconds=120.0,
+                )
                 _row, newly = await TransactionService(uow).complete(
                     CompleteTransactionRequest(
                         transaction_uuid=tx.transaction_uuid,
@@ -233,8 +242,16 @@ class LiveFillStream:
                         raw_amount=raw_amount,
                         completion_inferred=True,
                         completion_warnings=("sidecar_settle_after_hangup",),
+                        publish_completion=already is None,
                     )
                 )
+                published = bool(newly and already is None)
+                if newly and already is not None:
+                    logger.info(
+                        "live_fill_settle_suppressed_duplicate",
+                        transaction_uuid=tx.transaction_uuid,
+                        kept_uuid=already.transaction_uuid,
+                    )
         except Exception as exc:
             logger.warning(
                 "live_fill_finalize_failed",
@@ -249,11 +266,11 @@ class LiveFillStream:
             raw_amount=raw_amount,
             is_final=True,
         )
-        if newly:
+        if published:
             logger.info(
                 "live_fill_settled_completed",
                 transaction_uuid=tx.transaction_uuid,
                 raw_volume=raw_volume,
                 raw_amount=raw_amount,
             )
-        return newly
+        return published

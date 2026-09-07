@@ -395,8 +395,8 @@ async def test_live_fill_stream_does_not_publish_duplicate_after_hangup(
         assert leftover is not None
         assert leftover.status == "COMPLETED"
         pending = await uow.sync_queue.pending_count()
-    # Live-fill UUID must still publish COMPLETED so the dashboard leaves DISPENSING.
-    assert pending > before
+    # Hang-up already posted these totals — do not queue a second COMPLETED.
+    assert pending == before
 
 
 @pytest.mark.asyncio

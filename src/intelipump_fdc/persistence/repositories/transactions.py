@@ -130,7 +130,7 @@ class TransactionRepository:
         raw_volume: int,
         raw_amount: int,
         exclude_uuid: str | None = None,
-        within_seconds: float = 30.0,
+        within_seconds: float = 120.0,
     ) -> TransactionRecord | None:
         """Hang-up / sidecar settle: same pump face totals already posted."""
         cutoff = datetime.now(UTC) - timedelta(seconds=within_seconds)
