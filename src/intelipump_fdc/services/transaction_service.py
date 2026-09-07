@@ -96,9 +96,13 @@ class TransactionService:
                     "station_id": tx.station_id,
                     "pump_id": pump.logical_pump_id if pump else tx.pump_id,
                     "raw_volume": req.raw_volume,
-                    "volume_decimals": tx.volume_decimals,
+                    "volume_decimals": tx.volume_decimals
+                    if tx.volume_decimals is not None
+                    else 2,
                     "raw_amount": req.raw_amount,
-                    "amount_decimals": tx.amount_decimals,
+                    "amount_decimals": tx.amount_decimals
+                    if tx.amount_decimals is not None
+                    else 2,
                     "environment": tx.environment,
                     "simulated": tx.simulated,
                 },
@@ -141,35 +145,40 @@ class TransactionService:
                     raw_amount=tx.raw_amount,
                     is_final=True,
                 )
-            await self._uow.sync_queue.enqueue_checked(
-                entity_type="transaction",
-                entity_id=tx.transaction_uuid,
-                event_type="TRANSACTION_COMPLETED",
-                payload={
-                    "transaction_uuid": tx.transaction_uuid,
-                    "station_id": tx.station_id,
-                    "pump_id": pump.logical_pump_id if pump else tx.pump_id,
-                    "pump_db_id": tx.pump_id,
-                    "nozzle_id": tx.nozzle_id,
-                    "product": None,
-                    "raw_unit_price": tx.raw_price,
-                    "price_decimals": tx.price_decimals,
-                    "raw_volume": tx.raw_volume,
-                    "volume_decimals": tx.volume_decimals,
-                    "raw_amount": tx.raw_amount,
-                    "amount_decimals": tx.amount_decimals,
-                    "started_at": (
-                        tx.started_at.isoformat() if tx.started_at else None
-                    ),
-                    "completed_at": (
-                        tx.completed_at.isoformat() if tx.completed_at else None
-                    ),
-                    "final_status": tx.status,
-                    "source_completion_key": req.source_completion_key,
-                    "completion_inferred": req.completion_inferred,
-                    "environment": tx.environment,
-                    "simulated": tx.simulated,
-                },
-                deduplication_key=f"tx-completed:{req.source_completion_key}",
-            )
+            if req.publish_completion:
+                await self._uow.sync_queue.enqueue_checked(
+                    entity_type="transaction",
+                    entity_id=tx.transaction_uuid,
+                    event_type="TRANSACTION_COMPLETED",
+                    payload={
+                        "transaction_uuid": tx.transaction_uuid,
+                        "station_id": tx.station_id,
+                        "pump_id": pump.logical_pump_id if pump else tx.pump_id,
+                        "pump_db_id": tx.pump_id,
+                        "nozzle_id": tx.nozzle_id,
+                        "product": None,
+                        "raw_unit_price": tx.raw_price,
+                        "price_decimals": tx.price_decimals,
+                        "raw_volume": tx.raw_volume,
+                        "volume_decimals": tx.volume_decimals
+                        if tx.volume_decimals is not None
+                        else 2,
+                        "raw_amount": tx.raw_amount,
+                        "amount_decimals": tx.amount_decimals
+                        if tx.amount_decimals is not None
+                        else 2,
+                        "started_at": (
+                            tx.started_at.isoformat() if tx.started_at else None
+                        ),
+                        "completed_at": (
+                            tx.completed_at.isoformat() if tx.completed_at else None
+                        ),
+                        "final_status": tx.status,
+                        "source_completion_key": req.source_completion_key,
+                        "completion_inferred": req.completion_inferred,
+                        "environment": tx.environment,
+                        "simulated": tx.simulated,
+                    },
+                    deduplication_key=f"tx-completed:{req.source_completion_key}",
+                )
         return tx, newly

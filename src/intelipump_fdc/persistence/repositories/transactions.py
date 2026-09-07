@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -121,6 +121,37 @@ class TransactionRepository:
             )
         )
         return tuple(_tx(r) for r in result.scalars().all())
+
+    async def find_recent_completed_same_totals(
+        self,
+        *,
+        station_id: str,
+        pump_id: str,
+        raw_volume: int,
+        raw_amount: int,
+        exclude_uuid: str | None = None,
+        within_seconds: float = 30.0,
+    ) -> TransactionRecord | None:
+        """Hang-up / sidecar settle: same pump face totals already posted."""
+        cutoff = datetime.now(UTC) - timedelta(seconds=within_seconds)
+        filters = [
+            TransactionRow.station_id == station_id,
+            TransactionRow.pump_id == pump_id,
+            TransactionRow.status.in_(("COMPLETED", "COMPLETE")),
+            TransactionRow.raw_volume == raw_volume,
+            TransactionRow.raw_amount == raw_amount,
+            TransactionRow.completed_at >= cutoff,
+        ]
+        if exclude_uuid:
+            filters.append(TransactionRow.transaction_uuid != exclude_uuid)
+        result = await self._session.execute(
+            select(TransactionRow)
+            .where(*filters)
+            .order_by(TransactionRow.completed_at.desc())
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        return _tx(row) if row else None
 
     async def update_filling(
         self,

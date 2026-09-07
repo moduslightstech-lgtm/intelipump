@@ -41,3 +41,4 @@ class CompleteTransactionRequest:
     completed_at: datetime | None = None
     completion_inferred: bool = False
     completion_warnings: tuple[str, ...] = ()
+    publish_completion: bool = True

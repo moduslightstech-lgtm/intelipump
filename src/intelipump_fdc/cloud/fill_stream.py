@@ -27,6 +27,13 @@ logger = structlog.get_logger(__name__)
 # Stale FILLING (hang-up left the row ACTIVE) is handled by observed_at age.
 _LIVE_FILL_STATES = frozenset({"FILLING", "AUTHORIZED", "NOZZLE_UP", "SUSPENDED"})
 _LIVE_STATE_MAX_AGE_SECONDS = 12.0
+# Pump face: 170 raw → 1.70 L (2 dp). Null decimals used to become 0.17 L on the cloud.
+_LAB_VOLUME_DECIMALS = 2
+_LAB_AMOUNT_DECIMALS = 2
+
+
+def _wire_decimals(value: int | None, default: int) -> int:
+    return default if value is None else value
 
 
 def _pump_is_actively_filling(
@@ -155,9 +162,13 @@ class LiveFillStream:
                     "raw_unit_price": tx.raw_price,
                     "price_decimals": tx.price_decimals,
                     "raw_volume": raw_volume,
-                    "volume_decimals": tx.volume_decimals,
+                    "volume_decimals": _wire_decimals(
+                        tx.volume_decimals, _LAB_VOLUME_DECIMALS
+                    ),
                     "raw_amount": raw_amount,
-                    "amount_decimals": tx.amount_decimals,
+                    "amount_decimals": _wire_decimals(
+                        tx.amount_decimals, _LAB_AMOUNT_DECIMALS
+                    ),
                     "started_at": tx.started_at.isoformat() if tx.started_at else None,
                     "final_status": "DISPENSING",
                     "environment": tx.environment,
@@ -195,8 +206,16 @@ class LiveFillStream:
         Complete it here so TRANSACTION_COMPLETED is queued without touching
         the Wayne loop.
         """
+        published = False
         try:
             async with unit_of_work(self.session_factory) as uow:
+                already = await uow.transactions.find_recent_completed_same_totals(
+                    station_id=tx.station_id,
+                    pump_id=tx.pump_id,
+                    raw_volume=raw_volume,
+                    raw_amount=raw_amount,
+                    exclude_uuid=tx.transaction_uuid,
+                )
                 _row, newly = await TransactionService(uow).complete(
                     CompleteTransactionRequest(
                         transaction_uuid=tx.transaction_uuid,
@@ -205,8 +224,16 @@ class LiveFillStream:
                         raw_amount=raw_amount,
                         completion_inferred=True,
                         completion_warnings=("sidecar_settle_after_hangup",),
+                        publish_completion=already is None,
                     )
                 )
+                published = bool(newly and already is None)
+                if newly and already is not None:
+                    logger.info(
+                        "live_fill_settle_suppressed_duplicate",
+                        transaction_uuid=tx.transaction_uuid,
+                        kept_uuid=already.transaction_uuid,
+                    )
         except Exception as exc:
             logger.warning(
                 "live_fill_finalize_failed",
@@ -221,11 +248,11 @@ class LiveFillStream:
             raw_amount=raw_amount,
             is_final=True,
         )
-        if newly:
+        if published:
             logger.info(
                 "live_fill_settled_completed",
                 transaction_uuid=tx.transaction_uuid,
                 raw_volume=raw_volume,
                 raw_amount=raw_amount,
             )
-        return newly
+        return published

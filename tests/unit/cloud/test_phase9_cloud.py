@@ -317,6 +317,88 @@ async def test_live_fill_stream_completes_settled_hangup(
 
 
 @pytest.mark.asyncio
+async def test_live_fill_stream_does_not_publish_duplicate_after_hangup(
+    db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
+) -> None:
+    mqtt = FakeMqttClient(host="settle-dup")
+    await mqtt.connect()
+    started = datetime.now(UTC)
+    async with unit_of_work(db_factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id="InteliPump-US-Lab",
+            logical_pump_id="pump-2",
+            dart_address=2,
+        )
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="InteliPump-US-Lab",
+                pump_db_id=pump.id,
+                transaction_uuid="tx-live-dup",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await svc.update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-live-dup",
+                raw_volume=170,
+                raw_amount=200000,
+                event_key="fill:tx-live-dup:170:200000",
+            )
+        )
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="InteliPump-US-Lab",
+                pump_db_id=pump.id,
+                transaction_uuid="tx-hangup-dup",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await svc.complete(
+            CompleteTransactionRequest(
+                transaction_uuid="tx-hangup-dup",
+                source_completion_key="complete:tx-hangup-dup",
+                raw_volume=170,
+                raw_amount=200000,
+            )
+        )
+        before = await uow.sync_queue.pending_count()
+
+    stream = LiveFillStream(
+        session_factory=db_factory,
+        mqtt=mqtt,
+        topics=topics,
+        fill_book=FillPublishBook(),
+        device_id="InteliPump-Lab-pi-001",
+        station_id="InteliPump-US-Lab",
+        environment="LAB",
+        simulated=False,
+        settle_seconds=4.0,
+    )
+    await stream.publish_active_fills(now=started)
+    await stream.publish_active_fills(now=started + timedelta(seconds=5))
+    async with unit_of_work(db_factory) as uow:
+        assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
+        leftover = await uow.transactions.get_by_uuid("tx-live-dup")
+        assert leftover is not None
+        assert leftover.status == "COMPLETED"
+        pending = await uow.sync_queue.pending_count()
+    assert pending == before
+
+
+@pytest.mark.asyncio
 async def test_live_fill_stream_does_not_settle_during_live_fill(
     db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
 ) -> None:

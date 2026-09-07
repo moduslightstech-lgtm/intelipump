@@ -256,6 +256,8 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
     open_uuid = bridge._tx_by_address[2]
     assert open_uuid != "tx-600"
 
+    bridge._tx_by_address[2] = "tx-600"
+
     await bridge._handle_state_changed(
         {
             "address": 2,
@@ -286,3 +288,69 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
         assert sold.status == "COMPLETED"
         assert sold.raw_amount == 75000
         assert sold.raw_volume == 63
+
+
+@pytest.mark.asyncio
+async def test_hangup_does_not_mint_after_sale_already_completed(
+    engine_factory: tuple,
+) -> None:
+    """Sidecar settle then holster must not post a second SQLite sale."""
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id=STATION, logical_pump_id="pump-2", dart_address=2
+        )
+        pump_id = pump.id
+        await TransactionService(uow).begin(
+            BeginTransactionRequest(
+                station_id=STATION,
+                pump_db_id=pump_id,
+                transaction_uuid="tx-live",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await TransactionService(uow).complete(
+            CompleteTransactionRequest(
+                transaction_uuid="tx-live",
+                source_completion_key="sidecar-settle:tx-live",
+                raw_volume=170,
+                raw_amount=200000,
+            )
+        )
+
+    bridge = _bridge(factory, pump_id)
+    bridge._tx_by_address[2] = "tx-live"
+
+    await bridge._handle_state_changed(
+        {
+            "address": 2,
+            "detail": "FILLING->FILLING_COMPLETE",
+            "payload": {
+                "normalized_state": PumpState.FILLING_COMPLETE.value,
+                "previous_state": PumpState.FILLING.value,
+                "active_transaction_id": "tx-live",
+                "selected_nozzle": 1,
+                "communication_healthy": True,
+                "state_version": 12,
+                "event": "FILLING_COMPLETED",
+                "awaiting_filling_complete": False,
+                "filled_volume_raw": 170,
+                "filled_amount_raw": 200000,
+                "sale_lifecycle": "FILLING_COMPLETED",
+            },
+        }
+    )
+
+    async with unit_of_work(factory) as uow:
+        assert await uow.transactions.count_completed(station_id=STATION) == 1
+        assert await uow.transactions.list_unresolved(station_id=STATION) == ()
+        sold = await uow.transactions.get_by_uuid("tx-live")
+        assert sold is not None
+        assert sold.status == "COMPLETED"
+        assert sold.raw_amount == 200000
