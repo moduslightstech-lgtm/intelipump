@@ -543,6 +543,153 @@ async def test_live_fill_stream_force_settles_stale_filling_snapshot(
         assert sold.status == "COMPLETED"
 
 
+@pytest.mark.asyncio
+async def test_live_fill_stream_does_not_settle_during_long_live_pause(
+    db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
+) -> None:
+    mqtt = FakeMqttClient(host="long-pause")
+    await mqtt.connect()
+    started = datetime.now(UTC)
+    async with unit_of_work(db_factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id="InteliPump-US-Lab",
+            logical_pump_id="pump-1",
+            dart_address=1,
+        )
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="InteliPump-US-Lab",
+                pump_db_id=pump.id,
+                transaction_uuid="tx-long-pause",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await svc.update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-long-pause",
+                raw_volume=42,
+                raw_amount=50000,
+                event_key="fill:tx-long-pause:42:50000",
+            )
+        )
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump.id,
+            context=PumpContext(
+                pump_id="pump-1",
+                dart_address=1,
+                current_state=PumpState.FILLING,
+                previous_state=PumpState.AUTHORIZED,
+                active_transaction_id="tx-long-pause",
+                communication_healthy=True,
+                state_version=3,
+            ),
+            observed_at=started,
+        )
+
+    stream = LiveFillStream(
+        session_factory=db_factory,
+        mqtt=mqtt,
+        topics=topics,
+        fill_book=FillPublishBook(),
+        device_id="InteliPump-Lab-pi-001",
+        station_id="InteliPump-US-Lab",
+        environment="LAB",
+        simulated=False,
+        settle_seconds=4.0,
+    )
+    await stream.publish_active_fills(now=started)
+    await stream.publish_active_fills(now=started + timedelta(seconds=20))
+    async with unit_of_work(db_factory) as uow:
+        open_rows = await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab")
+        assert len(open_rows) == 1
+        assert open_rows[0].transaction_uuid == "tx-long-pause"
+    bodies = [json.loads(m.payload) for m in mqtt.published]
+    fills = [b for b in bodies if b.get("eventType") == "FILLING_UPDATED"]
+    assert len(fills) >= 2
+    assert {b.get("transactionId") for b in fills} == {"tx-long-pause"}
+
+
+@pytest.mark.asyncio
+async def test_live_fill_stream_keepalive_reuses_transaction_id(
+    db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
+) -> None:
+    mqtt = FakeMqttClient(host="keepalive")
+    await mqtt.connect()
+    started = datetime.now(UTC)
+    async with unit_of_work(db_factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id="InteliPump-US-Lab",
+            logical_pump_id="pump-1",
+            dart_address=1,
+        )
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="InteliPump-US-Lab",
+                pump_db_id=pump.id,
+                transaction_uuid="tx-keep",
+                nozzle_id=2,
+                raw_price=119048,
+                price_decimals=2,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await svc.update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-keep",
+                raw_volume=42,
+                raw_amount=50000,
+                event_key="fill:tx-keep:42:50000",
+            )
+        )
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump.id,
+            context=PumpContext(
+                pump_id="pump-1",
+                dart_address=1,
+                current_state=PumpState.FILLING,
+                previous_state=PumpState.AUTHORIZED,
+                active_transaction_id="tx-keep",
+                communication_healthy=True,
+                state_version=3,
+            ),
+            observed_at=started,
+        )
+
+    stream = LiveFillStream(
+        session_factory=db_factory,
+        mqtt=mqtt,
+        topics=topics,
+        fill_book=FillPublishBook(),
+        device_id="InteliPump-Lab-pi-001",
+        station_id="InteliPump-US-Lab",
+        environment="LAB",
+        simulated=False,
+        settle_seconds=4.0,
+        keepalive_seconds=10.0,
+    )
+    await stream.publish_active_fills(now=started)
+    await stream.publish_active_fills(now=started + timedelta(seconds=11))
+    fills = [
+        json.loads(m.payload)
+        for m in mqtt.published
+        if json.loads(m.payload).get("eventType") == "FILLING_UPDATED"
+    ]
+    assert len(fills) == 2
+    assert fills[0]["transactionId"] == fills[1]["transactionId"] == "tx-keep"
+    assert fills[1]["sequence"] > fills[0]["sequence"]
+
+
 def test_backoff_bounded() -> None:
     d1 = compute_backoff_seconds(1, base=1.0, maximum=8.0, jitter=0)
     d5 = compute_backoff_seconds(5, base=1.0, maximum=8.0, jitter=0)

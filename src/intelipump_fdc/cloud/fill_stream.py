@@ -25,9 +25,9 @@ from intelipump_fdc.services.transaction_service import TransactionService
 logger = structlog.get_logger(__name__)
 
 # Do not auto-complete while the controller is still reporting a live fill.
-# Stale FILLING (hang-up left the row ACTIVE) is handled by observed_at age.
+# A paused meter tick is not completion. Only age-out a truly stale FILLING snapshot.
 _LIVE_FILL_STATES = frozenset({"FILLING", "AUTHORIZED", "NOZZLE_UP", "SUSPENDED"})
-_LIVE_STATE_MAX_AGE_SECONDS = 12.0
+_LIVE_STATE_MAX_AGE_SECONDS = 90.0
 # Pump face: 170 raw → 1.70 L (2 dp). Null decimals used to become 0.17 L on the cloud.
 _LAB_VOLUME_DECIMALS = 2
 _LAB_AMOUNT_DECIMALS = 2
@@ -66,13 +66,16 @@ class LiveFillStream:
     simulated: bool
     poll_interval_seconds: float = 1.0
     settle_seconds: float = 4.0
-    # Hang-up often leaves Wayne snapshot as FILLING. Still complete if ticks stop.
-    force_settle_seconds: float = 8.0
+    # Hang-up often leaves Wayne snapshot as FILLING. Complete only after a long pause.
+    force_settle_seconds: float = 90.0
+    keepalive_seconds: float = 10.0
     channel_mappings: dict | None = None
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
     _seq: int = 0
+    _tx_seq: dict[str, int] = field(default_factory=dict)
     _unchanged_since: dict[str, tuple[int, int, datetime]] = field(default_factory=dict)
+    _last_fill_publish: dict[str, datetime] = field(default_factory=dict)
     _finalized: set[str] = field(default_factory=set)
 
     def start(self) -> None:
@@ -108,14 +111,19 @@ class LiveFillStream:
             active = await uow.transactions.list_unresolved(station_id=self.station_id)
             pump_ids = {tx.pump_id for tx in active}
             logical: dict[str, str] = {}
+            dart_by_pump: dict[str, int] = {}
             filling_now: dict[str, bool] = {}
+            prev_state: dict[str, str] = {}
             skip_fill_pub: set[str] = set()
             for pump_id in pump_ids:
                 pump = await uow.pumps.get_by_id(pump_id)
                 if pump is not None:
                     logical[pump_id] = pump.logical_pump_id
+                    dart_by_pump[pump_id] = pump.dart_address
                 snap = await uow.states.latest(pump_id)
                 filling_now[pump_id] = _pump_is_actively_filling(snap, now)
+                if snap is not None:
+                    prev_state[pump_id] = (snap.normalized_state or "").upper()
             for tx in active:
                 twin = await uow.transactions.find_recent_completed_same_totals(
                     station_id=tx.station_id,
@@ -132,6 +140,10 @@ class LiveFillStream:
         self._unchanged_since = {
             key: value for key, value in self._unchanged_since.items() if key in live_ids
         }
+        self._last_fill_publish = {
+            key: value for key, value in self._last_fill_publish.items() if key in live_ids
+        }
+        self._tx_seq = {key: value for key, value in self._tx_seq.items() if key in live_ids}
         self._finalized &= live_ids
 
         for tx in active:
@@ -140,15 +152,38 @@ class LiveFillStream:
             if raw_volume <= 0 and raw_amount <= 0:
                 continue
             prev = self._unchanged_since.get(tx.transaction_uuid)
+            filling = filling_now.get(tx.pump_id, False)
             if prev and prev[0] == raw_volume and prev[1] == raw_amount:
                 unchanged = (now - prev[2]).total_seconds()
-                filling = filling_now.get(tx.pump_id, False)
                 ready = unchanged >= self.settle_seconds and (
                     not filling or unchanged >= self.force_settle_seconds
                 )
                 if tx.transaction_uuid not in self._finalized and ready:
-                    if await self._finalize_settled(tx, raw_volume, raw_amount):
+                    if await self._finalize_settled(
+                        tx,
+                        raw_volume,
+                        raw_amount,
+                        dart=dart_by_pump.get(tx.pump_id),
+                        controller_state=prev_state.get(tx.pump_id),
+                    ):
                         published += 1
+                    continue
+                if (
+                    filling
+                    and tx.transaction_uuid not in skip_fill_pub
+                    and self._keepalive_due(tx.transaction_uuid, now)
+                    and await self._publish_fill_update(
+                        tx,
+                        raw_volume=raw_volume,
+                        raw_amount=raw_amount,
+                        now=now,
+                        logical=logical,
+                        dart=dart_by_pump.get(tx.pump_id),
+                        controller_state=prev_state.get(tx.pump_id),
+                        reason="keepalive_unchanged_meter",
+                    )
+                ):
+                    published += 1
                 continue
             self._unchanged_since[tx.transaction_uuid] = (raw_volume, raw_amount, now)
             if tx.transaction_uuid in skip_fill_pub:
@@ -161,70 +196,118 @@ class LiveFillStream:
                 now=now,
             ):
                 continue
-            pump_id = logical.get(tx.pump_id)
-            if not pump_id:
-                continue
-            payload = {
-                "transaction_uuid": tx.transaction_uuid,
-                "station_id": tx.station_id,
-                "pump_id": tx.canonical_pump_id or pump_id,
-                "nozzle_id": tx.canonical_nozzle_id if tx.canonical_nozzle_id is not None else tx.nozzle_id,
-                "nozzleId": tx.canonical_nozzle_id,
-                "sourceIdentifier": tx.source_identifier or pump_id,
-                "raw_unit_price": tx.raw_price,
-                "price_decimals": tx.price_decimals,
-                "raw_volume": raw_volume,
-                "volume_decimals": _wire_decimals(
-                    tx.volume_decimals, _LAB_VOLUME_DECIMALS
-                ),
-                "raw_amount": raw_amount,
-                "amount_decimals": _wire_decimals(
-                    tx.amount_decimals, _LAB_AMOUNT_DECIMALS
-                ),
-                "started_at": tx.started_at.isoformat() if tx.started_at else None,
-                "final_status": "DISPENSING",
-                "environment": tx.environment,
-                "simulated": tx.simulated,
-            }
-            if self.channel_mappings:
-                payload = enrich_transaction_payload(payload, self.channel_mappings)
-            mqtt_pump = str(payload.get("pumpId") or payload.get("pump_id") or pump_id)
-            self._seq += 1
-            envelope = build_envelope(
-                event_type="FILLING_UPDATED",
-                environment=self.environment,
-                device_id=self.device_id,
-                station_id=self.station_id,
-                sequence=self._seq,
-                simulated=bool(tx.simulated if tx.simulated is not None else self.simulated),
-                deduplication_key=f"fill:{tx.transaction_uuid}:{raw_volume}:{raw_amount}",
-                payload=payload,
-                pump_id=mqtt_pump,
-                transaction_id=tx.transaction_uuid,
-                occurred_at=now.isoformat(),
-            )
-            try:
-                await self.mqtt.publish(
-                    self.topics.transactions(self.station_id),
-                    json.dumps(envelope.to_dict(), separators=(",", ":")).encode(),
-                    qos=qos_for_event("FILLING_UPDATED"),
-                    retain=False,
-                )
+            if await self._publish_fill_update(
+                tx,
+                raw_volume=raw_volume,
+                raw_amount=raw_amount,
+                now=now,
+                logical=logical,
+                dart=dart_by_pump.get(tx.pump_id),
+                controller_state=prev_state.get(tx.pump_id),
+                reason="meter_progress",
+            ):
                 published += 1
-                logger.info(
-                    "live_fill_published",
-                    transaction_uuid=tx.transaction_uuid,
-                    pump_id=pump_id,
-                    raw_volume=raw_volume,
-                    raw_amount=raw_amount,
-                )
-            except (MqttNotConnectedError, MqttError) as exc:
-                logger.warning("live_fill_publish_failed", error=str(exc))
-                return published
         return published
 
+    def _keepalive_due(self, transaction_uuid: str, now: datetime) -> bool:
+        last = self._last_fill_publish.get(transaction_uuid)
+        if last is None:
+            return True
+        return (now - last).total_seconds() >= self.keepalive_seconds
+
+    async def _publish_fill_update(
+        self,
+        tx: TransactionRecord,
+        *,
+        raw_volume: int,
+        raw_amount: int,
+        now: datetime,
+        logical: dict[str, str],
+        dart: int | None,
+        controller_state: str | None,
+        reason: str,
+    ) -> bool:
+        pump_id = logical.get(tx.pump_id)
+        if not pump_id:
+            return False
+        session_seq = self._tx_seq.get(tx.transaction_uuid, 0) + 1
+        self._tx_seq[tx.transaction_uuid] = session_seq
+        payload = {
+            "transaction_uuid": tx.transaction_uuid,
+            "station_id": tx.station_id,
+            "pump_id": tx.canonical_pump_id or pump_id,
+            "nozzle_id": (
+                tx.canonical_nozzle_id if tx.canonical_nozzle_id is not None else tx.nozzle_id
+            ),
+            "nozzleId": tx.canonical_nozzle_id,
+            "sourceIdentifier": tx.source_identifier or pump_id,
+            "raw_unit_price": tx.raw_price,
+            "price_decimals": tx.price_decimals,
+            "raw_volume": raw_volume,
+            "volume_decimals": _wire_decimals(tx.volume_decimals, _LAB_VOLUME_DECIMALS),
+            "raw_amount": raw_amount,
+            "amount_decimals": _wire_decimals(tx.amount_decimals, _LAB_AMOUNT_DECIMALS),
+            "started_at": tx.started_at.isoformat() if tx.started_at else None,
+            "final_status": "DISPENSING",
+            "status": "DISPENSING",
+            "environment": tx.environment,
+            "simulated": tx.simulated,
+            "sessionSequence": session_seq,
+        }
+        if self.channel_mappings:
+            payload = enrich_transaction_payload(payload, self.channel_mappings)
+        mqtt_pump = str(payload.get("pumpId") or payload.get("pump_id") or pump_id)
+        mqtt_nozzle = str(payload.get("nozzleId") or payload.get("nozzle_id") or "")
+        self._seq += 1
+        envelope = build_envelope(
+            event_type="FILLING_UPDATED",
+            environment=self.environment,
+            device_id=self.device_id,
+            station_id=self.station_id,
+            sequence=self._seq,
+            simulated=bool(tx.simulated if tx.simulated is not None else self.simulated),
+            deduplication_key=f"fill:{tx.transaction_uuid}:{session_seq}:{raw_volume}:{raw_amount}",
+            payload=payload,
+            pump_id=mqtt_pump,
+            transaction_id=tx.transaction_uuid,
+            occurred_at=now.isoformat(),
+        )
+        try:
+            await self.mqtt.publish(
+                self.topics.transactions(self.station_id),
+                json.dumps(envelope.to_dict(), separators=(",", ":")).encode(),
+                qos=qos_for_event("FILLING_UPDATED"),
+                retain=False,
+            )
+        except (MqttNotConnectedError, MqttError) as exc:
+            logger.warning("live_fill_publish_failed", error=str(exc))
+            self._tx_seq[tx.transaction_uuid] = max(session_seq - 1, 0)
+            return False
+        self._last_fill_publish[tx.transaction_uuid] = now
+        logger.info(
+            "live_fill_state_transition",
+            source_address=dart,
+            pump_id=mqtt_pump,
+            nozzle_id=mqtt_nozzle,
+            transaction_id=tx.transaction_uuid,
+            previous_state=controller_state or "FILLING",
+            new_state="DISPENSING",
+            sequence=self._seq,
+            session_sequence=session_seq,
+            volume=raw_volume,
+            amount=raw_amount,
+            reason=reason,
+        )
+        return True
+
     async def _finalize_settled(
-        self, tx: TransactionRecord, raw_volume: int, raw_amount: int
+        self,
+        tx: TransactionRecord,
+        raw_volume: int,
+        raw_amount: int,
+        *,
+        dart: int | None = None,
+        controller_state: str | None = None,
     ) -> bool:
         """Hang-up holds DISPLAY; controller may leave the SQLite row ACTIVE.
 
@@ -276,9 +359,19 @@ class LiveFillStream:
         )
         if published:
             logger.info(
-                "live_fill_settled_completed",
-                transaction_uuid=tx.transaction_uuid,
-                raw_volume=raw_volume,
-                raw_amount=raw_amount,
+                "live_fill_state_transition",
+                source_address=dart,
+                pump_id=tx.canonical_pump_id or tx.pump_id,
+                nozzle_id=(
+                    tx.canonical_nozzle_id if tx.canonical_nozzle_id is not None else tx.nozzle_id
+                ),
+                transaction_id=tx.transaction_uuid,
+                previous_state=controller_state or "DISPENSING",
+                new_state="COMPLETED",
+                sequence=self._seq,
+                session_sequence=self._tx_seq.get(tx.transaction_uuid),
+                volume=raw_volume,
+                amount=raw_amount,
+                reason="sidecar_settle_after_hangup",
             )
         return published
