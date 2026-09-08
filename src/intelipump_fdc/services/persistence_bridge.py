@@ -53,6 +53,8 @@ class PersistenceBridge:
         live_broker: EventBroker | None = None,
         fill_book: FillPublishBook | None = None,
         automatic_transaction_publishing: bool = False,
+        mqtt_pump_by_address: dict[int, str] | None = None,
+        mqtt_nozzle_by_address: dict[int, str] | None = None,
     ) -> None:
         self._factory = session_factory
         self._station_id = station_id
@@ -61,6 +63,8 @@ class PersistenceBridge:
         self._worker = worker
         self._pump_id_by_address = pump_id_by_address
         self._logical_by_address = logical_by_address
+        self._mqtt_pump_by_address = mqtt_pump_by_address or dict(logical_by_address)
+        self._mqtt_nozzle_by_address = mqtt_nozzle_by_address or {}
         self._events = events
         self._live = live_broker
         self._fill_book = fill_book
@@ -72,6 +76,18 @@ class PersistenceBridge:
 
     def detach(self) -> None:
         self._events.remove_subscriber(self.on_event)
+
+    def _address_for_pump_db(self, pump_db: str) -> int | None:
+        for addr, pid in self._pump_id_by_address.items():
+            if pid == pump_db:
+                return addr
+        return None
+
+    def _source_for_pump_db(self, pump_db: str) -> str | None:
+        addr = self._address_for_pump_db(pump_db)
+        if addr is None:
+            return None
+        return self._logical_by_address.get(addr, f"pump-{addr}")
 
     async def _open_uuid(self, uow: Any, uuid: str | None) -> str | None:
         if not uuid:
@@ -99,6 +115,9 @@ class PersistenceBridge:
                 pump_db_id=pump_db,
                 transaction_uuid=tx_uuid,
                 nozzle_id=nozzle_id,
+                canonical_pump_id=self._mqtt_pump_by_address.get(self._address_for_pump_db(pump_db)),
+                canonical_nozzle_id=self._mqtt_nozzle_by_address.get(self._address_for_pump_db(pump_db)),
+                source_identifier=self._source_for_pump_db(pump_db),
                 raw_price=raw_price,
                 price_decimals=price_decimals,
                 volume_decimals=volume_decimals,
@@ -228,8 +247,12 @@ class PersistenceBridge:
         if self._live is None:
             return
         logical = None
+        nozzle_id = None
         if isinstance(event.address, int):
-            logical = self._logical_by_address.get(event.address, f"pump-{event.address}")
+            logical = self._mqtt_pump_by_address.get(
+                event.address, self._logical_by_address.get(event.address, f"pump-{event.address}")
+            )
+            nozzle_id = self._mqtt_nozzle_by_address.get(event.address)
         mapping: dict[ControllerEventType, LiveEventType] = {
             ControllerEventType.PUMP_CONNECTED: LiveEventType.PUMP_CONNECTED,
             ControllerEventType.PUMP_DISCONNECTED: LiveEventType.PUMP_DISCONNECTED,
@@ -260,7 +283,16 @@ class PersistenceBridge:
             if isinstance(event.address, int)
             else None,
             severity="WARNING" if live_type is LiveEventType.PROTOCOL_ERROR else None,
-            payload={"detail": event.detail, **dict(detail_payload)},
+            payload={
+                "detail": event.detail,
+                **dict(detail_payload),
+                "nozzleId": nozzle_id,
+                "sourceIdentifier": (
+                    self._logical_by_address.get(event.address)
+                    if isinstance(event.address, int)
+                    else None
+                ),
+            },
             state_version=detail_payload.get("state_version")
             if isinstance(detail_payload.get("state_version"), int)
             else None,
@@ -501,7 +533,7 @@ class PersistenceBridge:
                         },
                     )
                     return
-                if not awaiting and (vol_raw > 0 or amt_raw > 0):
+                if not awaiting:
                     nozzle = detail_payload.get("selected_nozzle")
                     complete_uuid = await self._ensure_open_sale(
                         uow,

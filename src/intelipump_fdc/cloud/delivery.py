@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from intelipump_fdc.cloud.channel_map import enrich_transaction_payload
 from intelipump_fdc.cloud.messages import CloudMessageEnvelope, build_envelope
 from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.topics import TopicBuilder
@@ -24,12 +25,14 @@ class DeliveryMapper:
         station_id: str,
         environment: str,
         simulated: bool,
+        channel_mappings: dict | None = None,
     ) -> None:
         self._topics = topics
         self._device_id = device_id
         self._station_id = station_id
         self._environment = environment
         self._simulated = simulated
+        self._channel_mappings = channel_mappings or {}
         self._seq = 0
 
     def next_sequence(self) -> int:
@@ -45,8 +48,12 @@ class DeliveryMapper:
         if not self.should_publish(record):
             raise ValueError(f"queue event is not publishable: {record.event_type}")
         payload = dict(record.payload)
+        if self._channel_mappings:
+            payload = enrich_transaction_payload(payload, self._channel_mappings)
         event_type = record.event_type
-        pump_id = _as_str(payload.get("pump_id") or payload.get("logical_pump_id"))
+        pump_id = _as_str(
+            payload.get("pumpId") or payload.get("pump_id") or payload.get("logical_pump_id")
+        )
         transaction_id = _as_str(
             payload.get("transaction_uuid") or payload.get("transaction_id")
         )

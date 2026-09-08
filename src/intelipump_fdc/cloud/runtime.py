@@ -25,6 +25,7 @@ from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.sync_worker import SyncWorker, SyncWorkerStats
 from intelipump_fdc.cloud.topics import TopicBuilder
 from intelipump_fdc.controller.controller_loop import ControllerLoop
+from intelipump_fdc.cloud.channel_map import mappings_from_settings
 from intelipump_fdc.core.config import Settings
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 
@@ -128,6 +129,15 @@ class CloudRuntime:
         station_id = self.settings.controller.station_id
         environment = self.topics.environment
         simulated = self.settings.api.simulated
+        addresses = tuple(
+            int(x.strip())
+            for x in self.settings.api.controller_addresses.split(",")
+            if x.strip()
+        ) or (1, 2)
+        try:
+            channel_mappings = mappings_from_settings(self.settings, addresses)
+        except Exception:
+            channel_mappings = {}
 
         offline_payload = {
             "deviceId": device_id,
@@ -160,6 +170,7 @@ class CloudRuntime:
             station_id=station_id,
             environment=environment,
             simulated=simulated,
+            channel_mappings=channel_mappings,
         )
         self.sync_worker = SyncWorker(
             session_factory=self.session_factory,
@@ -190,6 +201,7 @@ class CloudRuntime:
             environment=environment,
             simulated=simulated,
             poll_interval_seconds=self.settings.mqtt.sync_poll_interval_seconds,
+            channel_mappings=channel_mappings,
         )
         if self.settings.mqtt.command_subscription_enabled:
             self.command_intake = CloudCommandIntake(

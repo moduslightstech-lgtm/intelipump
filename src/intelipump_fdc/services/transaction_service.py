@@ -28,6 +28,9 @@ class TransactionService:
             station_id=req.station_id,
             pump_id=req.pump_db_id,
             nozzle_id=req.nozzle_id,
+            canonical_pump_id=req.canonical_pump_id,
+            canonical_nozzle_id=req.canonical_nozzle_id,
+            source_identifier=req.source_identifier,
             status="ACTIVE",
             raw_price=req.raw_price,
             price_decimals=req.price_decimals,
@@ -87,6 +90,9 @@ class TransactionService:
             is_final=False,
         ):
             pump = await self._uow.pumps.get_by_id(tx.pump_id)
+            source = tx.source_identifier or (pump.logical_pump_id if pump else tx.pump_id)
+            mqtt_pump = tx.canonical_pump_id or source
+            mqtt_nozzle = tx.canonical_nozzle_id
             await self._uow.sync_queue.enqueue_checked(
                 entity_type="transaction",
                 entity_id=tx.transaction_uuid,
@@ -94,7 +100,11 @@ class TransactionService:
                 payload={
                     "transaction_uuid": tx.transaction_uuid,
                     "station_id": tx.station_id,
-                    "pump_id": pump.logical_pump_id if pump else tx.pump_id,
+                    "pump_id": mqtt_pump,
+                    "pumpId": mqtt_pump,
+                    "nozzle_id": mqtt_nozzle if mqtt_nozzle is not None else tx.nozzle_id,
+                    "nozzleId": mqtt_nozzle,
+                    "sourceIdentifier": source,
                     "raw_volume": req.raw_volume,
                     "volume_decimals": tx.volume_decimals
                     if tx.volume_decimals is not None
@@ -138,6 +148,9 @@ class TransactionService:
                 observed_at=req.completed_at,
             )
             pump = await self._uow.pumps.get_by_id(tx.pump_id)
+            source = tx.source_identifier or (pump.logical_pump_id if pump else tx.pump_id)
+            mqtt_pump = tx.canonical_pump_id or source
+            mqtt_nozzle = tx.canonical_nozzle_id
             if self._fill_book is not None:
                 self._fill_book.decide(
                     tx.transaction_uuid,
@@ -152,10 +165,15 @@ class TransactionService:
                     event_type="TRANSACTION_COMPLETED",
                     payload={
                         "transaction_uuid": tx.transaction_uuid,
+                        "transactionId": tx.transaction_uuid,
                         "station_id": tx.station_id,
-                        "pump_id": pump.logical_pump_id if pump else tx.pump_id,
+                        "stationId": tx.station_id,
+                        "pump_id": mqtt_pump,
+                        "pumpId": mqtt_pump,
                         "pump_db_id": tx.pump_id,
-                        "nozzle_id": tx.nozzle_id,
+                        "nozzle_id": mqtt_nozzle if mqtt_nozzle is not None else tx.nozzle_id,
+                        "nozzleId": mqtt_nozzle,
+                        "sourceIdentifier": source,
                         "product": None,
                         "raw_unit_price": tx.raw_price,
                         "price_decimals": tx.price_decimals,

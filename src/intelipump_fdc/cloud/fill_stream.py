@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from intelipump_fdc.cloud.channel_map import enrich_transaction_payload
 from intelipump_fdc.cloud.fill_throttle import FillPublishBook
 from intelipump_fdc.cloud.messages import build_envelope
 from intelipump_fdc.cloud.mqtt.base import MqttClient
@@ -67,6 +68,7 @@ class LiveFillStream:
     settle_seconds: float = 4.0
     # Hang-up often leaves Wayne snapshot as FILLING. Still complete if ticks stop.
     force_settle_seconds: float = 8.0
+    channel_mappings: dict | None = None
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
     _seq: int = 0
@@ -162,6 +164,31 @@ class LiveFillStream:
             pump_id = logical.get(tx.pump_id)
             if not pump_id:
                 continue
+            payload = {
+                "transaction_uuid": tx.transaction_uuid,
+                "station_id": tx.station_id,
+                "pump_id": tx.canonical_pump_id or pump_id,
+                "nozzle_id": tx.canonical_nozzle_id if tx.canonical_nozzle_id is not None else tx.nozzle_id,
+                "nozzleId": tx.canonical_nozzle_id,
+                "sourceIdentifier": tx.source_identifier or pump_id,
+                "raw_unit_price": tx.raw_price,
+                "price_decimals": tx.price_decimals,
+                "raw_volume": raw_volume,
+                "volume_decimals": _wire_decimals(
+                    tx.volume_decimals, _LAB_VOLUME_DECIMALS
+                ),
+                "raw_amount": raw_amount,
+                "amount_decimals": _wire_decimals(
+                    tx.amount_decimals, _LAB_AMOUNT_DECIMALS
+                ),
+                "started_at": tx.started_at.isoformat() if tx.started_at else None,
+                "final_status": "DISPENSING",
+                "environment": tx.environment,
+                "simulated": tx.simulated,
+            }
+            if self.channel_mappings:
+                payload = enrich_transaction_payload(payload, self.channel_mappings)
+            mqtt_pump = str(payload.get("pumpId") or payload.get("pump_id") or pump_id)
             self._seq += 1
             envelope = build_envelope(
                 event_type="FILLING_UPDATED",
@@ -171,27 +198,8 @@ class LiveFillStream:
                 sequence=self._seq,
                 simulated=bool(tx.simulated if tx.simulated is not None else self.simulated),
                 deduplication_key=f"fill:{tx.transaction_uuid}:{raw_volume}:{raw_amount}",
-                payload={
-                    "transaction_uuid": tx.transaction_uuid,
-                    "station_id": tx.station_id,
-                    "pump_id": pump_id,
-                    "nozzle_id": tx.nozzle_id,
-                    "raw_unit_price": tx.raw_price,
-                    "price_decimals": tx.price_decimals,
-                    "raw_volume": raw_volume,
-                    "volume_decimals": _wire_decimals(
-                        tx.volume_decimals, _LAB_VOLUME_DECIMALS
-                    ),
-                    "raw_amount": raw_amount,
-                    "amount_decimals": _wire_decimals(
-                        tx.amount_decimals, _LAB_AMOUNT_DECIMALS
-                    ),
-                    "started_at": tx.started_at.isoformat() if tx.started_at else None,
-                    "final_status": "DISPENSING",
-                    "environment": tx.environment,
-                    "simulated": tx.simulated,
-                },
-                pump_id=pump_id,
+                payload=payload,
+                pump_id=mqtt_pump,
                 transaction_id=tx.transaction_uuid,
                 occurred_at=now.isoformat(),
             )

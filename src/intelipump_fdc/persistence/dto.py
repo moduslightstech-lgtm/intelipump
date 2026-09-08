@@ -56,6 +56,9 @@ class TransactionRecord:
     environment: str
     created_at: datetime
     updated_at: datetime
+    canonical_pump_id: str | None = None
+    canonical_nozzle_id: str | None = None
+    source_identifier: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -166,6 +166,11 @@ class Settings(BaseSettings):
     api: ApiSettings = ApiSettings()
     bench: BenchSettings = BenchSettings()
     watchdog: WatchdogSettings = WatchdogSettings()
+    # JSON object mapping DART address → {pump_id, nozzle_id, source_identifier}.
+    # Default (unset) keeps logical pump-{address} for stations that have not
+    # migrated. US Lab loads config/channel_map.us-lab.json via CHANNEL_MAP_PATH.
+    channel_map: str | None = None
+    channel_map_path: str | None = None
 
 
 @lru_cache

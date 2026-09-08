@@ -17,10 +17,31 @@ from intelipump_fdc.persistence.models import (
 SCHEMA_VERSION_KEY = "schema_version"
 
 
+_TX_HIERARCHY_COLUMNS = (
+    ("canonical_pump_id", "VARCHAR(64)"),
+    ("canonical_nozzle_id", "VARCHAR(64)"),
+    ("source_identifier", "VARCHAR(64)"),
+)
+
+
+async def _ensure_transaction_hierarchy_columns(conn) -> None:
+    """Additive SQLite columns for canonical pump/nozzle ids (idempotent)."""
+    if conn.dialect.name != "sqlite":
+        return
+    result = await conn.execute(text("PRAGMA table_info(transactions)"))
+    existing = {row[1] for row in result.fetchall()}
+    if not existing:
+        return
+    for name, ddl in _TX_HIERARCHY_COLUMNS:
+        if name not in existing:
+            await conn.execute(text(f"ALTER TABLE transactions ADD COLUMN {name} {ddl}"))
+
+
 async def init_schema(engine: AsyncEngine) -> int:
     """Create tables if needed and record schema version. Returns version."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_transaction_hierarchy_columns(conn)
 
     async with AsyncSession(engine, expire_on_commit=False) as session, session.begin():
         result = await session.execute(

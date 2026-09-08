@@ -104,6 +104,9 @@ class TransactionRow(Base):
         String(36), ForeignKey("pumps.id"), nullable=False, index=True
     )
     nozzle_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    canonical_pump_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    canonical_nozzle_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_identifier: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     raw_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
     price_decimals: Mapped[int | None] = mapped_column(Integer, nullable=True)

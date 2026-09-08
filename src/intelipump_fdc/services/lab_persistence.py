@@ -17,6 +17,8 @@ from intelipump_fdc.persistence.database import (
 )
 from intelipump_fdc.persistence.migrations import init_schema
 from intelipump_fdc.services.persistence_bridge import PersistenceBridge
+from intelipump_fdc.cloud.channel_map import ChannelMapping, mappings_from_settings, parse_channel_map
+from intelipump_fdc.core.config import get_settings
 from intelipump_fdc.services.persistence_worker import PersistenceWorker
 from intelipump_fdc.services.recovery_service import RecoveryReport, RecoveryService
 from intelipump_fdc.state_machine.models import PumpContext
@@ -47,6 +49,7 @@ async def start_persistence(
     simulated: bool = True,
     worker_maxsize: int = 256,
     live_broker: EventBroker | None = None,
+    channel_map: dict[int, ChannelMapping] | None = None,
 ) -> PersistenceRuntime:
     engine = create_engine(database_url)
     await configure_sqlite_pragmas(engine)
@@ -59,6 +62,14 @@ async def start_persistence(
     report = await recovery_svc.recover()
     worker = PersistenceWorker(maxsize=worker_maxsize)
     worker.start()
+    mapping = channel_map
+    if mapping is None:
+        try:
+            mapping = mappings_from_settings(get_settings(), addresses)
+        except Exception:
+            mapping = parse_channel_map(None, addresses)
+    mqtt_pump = {a: mapping[a].pump_id for a in addresses if a in mapping}
+    mqtt_nozzle = {a: mapping[a].nozzle_id for a in addresses if a in mapping}
     bridge = PersistenceBridge(
         session_factory=factory,
         station_id=station_id,
@@ -69,6 +80,8 @@ async def start_persistence(
         logical_by_address={a: f"pump-{a}" for a in addresses},
         events=events,
         live_broker=live_broker,
+        mqtt_pump_by_address=mqtt_pump or None,
+        mqtt_nozzle_by_address=mqtt_nozzle or None,
     )
     bridge.attach()
     return PersistenceRuntime(

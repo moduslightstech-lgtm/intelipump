@@ -37,6 +37,9 @@ def _tx(row: TransactionRow) -> TransactionRecord:
         environment=row.environment,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        canonical_pump_id=getattr(row, "canonical_pump_id", None),
+        canonical_nozzle_id=getattr(row, "canonical_nozzle_id", None),
+        source_identifier=getattr(row, "source_identifier", None),
     )
 
 
@@ -72,6 +75,9 @@ class TransactionRepository:
         simulated: bool,
         environment: str,
         started_at: datetime | None = None,
+        canonical_pump_id: str | None = None,
+        canonical_nozzle_id: str | None = None,
+        source_identifier: str | None = None,
     ) -> TransactionRecord:
         now = datetime.now(UTC)
         row = TransactionRow(
@@ -80,6 +86,9 @@ class TransactionRepository:
             station_id=station_id,
             pump_id=pump_id,
             nozzle_id=nozzle_id,
+            canonical_pump_id=canonical_pump_id,
+            canonical_nozzle_id=canonical_nozzle_id,
+            source_identifier=source_identifier,
             status=status,
             raw_price=raw_price,
             price_decimals=price_decimals,

@@ -1,0 +1,14 @@
+{
+  "1": {
+    "pump_id": "pump-1",
+    "nozzle_id": "nozzle-1",
+    "source_identifier": "pump-1",
+    "product": "PMS"
+  },
+  "2": {
+    "pump_id": "pump-1",
+    "nozzle_id": "nozzle-2",
+    "source_identifier": "pump-2",
+    "product": "PMS"
+  }
+}

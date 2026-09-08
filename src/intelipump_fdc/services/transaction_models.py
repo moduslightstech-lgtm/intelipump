@@ -19,6 +19,9 @@ class BeginTransactionRequest:
     simulated: bool
     environment: str
     started_at: datetime | None = None
+    canonical_pump_id: str | None = None
+    canonical_nozzle_id: str | None = None
+    source_identifier: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
