@@ -90,3 +90,17 @@ def test_duplicate_nozzle_mapping_rejected():
             },
             (1, 2),
         )
+
+def test_missing_channel_map_path_uses_us_lab_embedded():
+    from types import SimpleNamespace
+
+    from intelipump_fdc.cloud.channel_map import mappings_from_settings
+
+    settings = SimpleNamespace(
+        channel_map_path="/no/such/channel_map.us-lab.json",
+        channel_map=None,
+        controller=SimpleNamespace(station_id="InteliPump-US-Lab"),
+    )
+    mapping = mappings_from_settings(settings, (1, 2))
+    assert mapping[2].pump_id == "pump-1"
+    assert mapping[2].nozzle_id == "nozzle-2"

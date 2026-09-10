@@ -129,11 +129,20 @@ def mappings_from_settings(settings: Any, addresses: tuple[int, ...]) -> dict[in
     """Load INTELIPUMP_CHANNEL_MAP / CHANNEL_MAP_PATH. Default stays pump-{addr}."""
     path = getattr(settings, "channel_map_path", None)
     raw = getattr(settings, "channel_map", None)
+    station = str(getattr(getattr(settings, "controller", None), "station_id", "") or "").strip()
     if path:
-        return load_channel_map_file(path, addresses)
+        path_obj = Path(str(path))
+        if path_obj.is_file():
+            return load_channel_map_file(path_obj, addresses)
+        logger.warning(
+            "channel_map_path_missing",
+            path=str(path_obj),
+            station_id=station,
+            reason="file_not_found_continue",
+        )
+        # Fall through: US Lab keeps embedded map; others use default.
     if raw:
         return parse_channel_map(raw, addresses)
-    station = str(getattr(getattr(settings, "controller", None), "station_id", "") or "").strip()
     if station in US_LAB_STATION_IDS:
         bundled = _bundled_us_lab_map_path()
         if bundled is not None:
