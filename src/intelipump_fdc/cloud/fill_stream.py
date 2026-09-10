@@ -81,6 +81,14 @@ class LiveFillStream:
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop.clear()
+            logger.info(
+                "live_source_started",
+                source_type="sqlite_poll_transactions",
+                database="shared_controller_sqlite",
+                station_id=self.station_id,
+                poll_interval_seconds=self.poll_interval_seconds,
+                starting_cursor="list_unresolved",
+            )
             self._task = asyncio.create_task(self._run(), name="mqtt-live-fill")
 
     async def stop(self, *, timeout_s: float = 5.0) -> None:
@@ -185,8 +193,35 @@ class LiveFillStream:
                 ):
                     published += 1
                 continue
-            self._unchanged_since[tx.transaction_uuid] = (raw_volume, raw_amount, now)
+            # First sight of this ACTIVE row: seed meter baseline. Do not publish
+            # DISPENSING unless the controller reports a live fill — retained
+            # FILLING_COMPLETE / orphan ACTIVE rows must not animate the twin.
+            if prev is None:
+                self._unchanged_since[tx.transaction_uuid] = (
+                    raw_volume,
+                    raw_amount,
+                    now,
+                )
+                if not filling:
+                    logger.info(
+                        "live_fill_startup_baseline_seeded",
+                        transaction_id=tx.transaction_uuid,
+                        pump_id=logical.get(tx.pump_id),
+                        controller_state=prev_state.get(tx.pump_id),
+                        amount=raw_amount,
+                        volume=raw_volume,
+                        reason="retained_or_idle_active_row",
+                    )
+                    continue
+            else:
+                self._unchanged_since[tx.transaction_uuid] = (
+                    raw_volume,
+                    raw_amount,
+                    now,
+                )
             if tx.transaction_uuid in skip_fill_pub:
+                continue
+            if not filling:
                 continue
             if not self.fill_book.decide(
                 tx.transaction_uuid,

@@ -415,27 +415,36 @@ class PersistenceBridge:
                 observed_at=datetime.now(UTC),
             )
 
-            if new_state is PumpState.FILLING and prev_state is not PumpState.FILLING:
+            # Entering FILLING always opens a sale. Remaining in FILLING without an
+            # ACTIVE row (orphaned after sidecar settle / missed STATE_CHANGED) heals.
+            if new_state is PumpState.FILLING:
                 nozzle = detail_payload.get("selected_nozzle")
                 nozzle_id = nozzle if isinstance(nozzle, int) else None
                 previous = self._tx_by_address.get(address)
-                tx_uuid = await self._ensure_open_sale(
-                    uow,
-                    address=address,
-                    pump_db=pump_db,
-                    candidate=active_tx_s,
-                    nozzle_id=nozzle_id,
-                    reason="filling_started",
+                open_before = await self._open_uuid(uow, previous or active_tx_s)
+                reason = (
+                    "filling_started"
+                    if prev_state is not PumpState.FILLING
+                    else "heal_orphaned_filling"
                 )
-                if self._live is not None and tx_uuid != previous:
-                    self._live.publish_typed(
-                        LiveEventType.TRANSACTION_CREATED,
-                        station_id=self._station_id,
-                        environment=self._environment,
-                        simulated=self._simulated,
-                        pump_id=logical,
-                        transaction_id=tx_uuid,
+                if open_before is None or prev_state is not PumpState.FILLING:
+                    tx_uuid = await self._ensure_open_sale(
+                        uow,
+                        address=address,
+                        pump_db=pump_db,
+                        candidate=active_tx_s,
+                        nozzle_id=nozzle_id,
+                        reason=reason,
                     )
+                    if self._live is not None and tx_uuid != previous:
+                        self._live.publish_typed(
+                            LiveEventType.TRANSACTION_CREATED,
+                            station_id=self._station_id,
+                            environment=self._environment,
+                            simulated=self._simulated,
+                            pump_id=logical,
+                            transaction_id=tx_uuid,
+                        )
 
             event_name = str(detail_payload.get("event") or "")
             awaiting = bool(detail_payload.get("awaiting_filling_complete"))
@@ -800,17 +809,70 @@ class PersistenceBridge:
                 )
                 return
             if open_mapped is None:
-                # Never mint a new sale UUID from retained DC2 face alone.
-                # New sales begin on FILLING_STARTED (IDLE→DISPENSING lifecycle).
+                # Retained COMPLETED face must not mint a sale. A live fill after
+                # AUTHORIZE often emits DC2 before DC1 FILLING / STATE_CHANGED —
+                # open from controller snapshot when the lifecycle is in progress.
+                snap = await uow.states.latest(pump_db)
+                state_s = (snap.normalized_state or "").upper() if snap else ""
+                lifecycle_open = state_s in {
+                    PumpState.FILLING.value,
+                    PumpState.AUTHORIZED.value,
+                    PumpState.NOZZLE_UP.value,
+                    PumpState.SUSPENDED.value,
+                }
+                if state_s == PumpState.AUTHORIZED.value and raw_volume <= 0:
+                    lifecycle_open = False
+                if not lifecycle_open:
+                    logger.info(
+                        "dc2_tick_ignored_no_open_sale",
+                        stationId=self._station_id,
+                        pumpId=self._logical_by_address.get(address),
+                        nozzleId=nozzle_id,
+                        fingerprint=fp,
+                        source="awaiting_filling_lifecycle",
+                        controllerState=state_s or None,
+                        amount=raw_amount,
+                        volume=raw_volume,
+                    )
+                    return
+                open_mapped = await self._ensure_open_sale(
+                    uow,
+                    address=address,
+                    pump_db=pump_db,
+                    candidate=None,
+                    nozzle_id=nozzle_id,
+                    raw_price=price_raw,
+                    price_decimals=(
+                        detail_payload.get("price_decimals")
+                        if isinstance(detail_payload.get("price_decimals"), int)
+                        else None
+                    ),
+                    volume_decimals=(
+                        detail_payload.get("volume_decimals")
+                        if isinstance(detail_payload.get("volume_decimals"), int)
+                        else None
+                    ),
+                    amount_decimals=(
+                        detail_payload.get("amount_decimals")
+                        if isinstance(detail_payload.get("amount_decimals"), int)
+                        else None
+                    ),
+                    reason="dc2_progress_while_filling",
+                )
                 logger.info(
-                    "dc2_tick_ignored_no_open_sale",
+                    "live_source_event_received",
+                    kind="dc2_open_sale",
                     stationId=self._station_id,
                     pumpId=self._logical_by_address.get(address),
                     nozzleId=nozzle_id,
-                    fingerprint=fp,
-                    source="awaiting_filling_lifecycle",
+                    sourceAddress=address,
+                    controllerState=state_s,
+                    transactionId=open_mapped,
+                    amount=raw_amount,
+                    volume=raw_volume,
+                    amountScaled=round(raw_amount / 100.0, 2),
+                    volumeLitres=round(raw_volume / 100.0, 2),
                 )
-                return
             tx_uuid = open_mapped
             # Stable event key from scaled values — duplicate DATA with same
             # totals is ignored; progressive fills still update.
@@ -831,6 +893,20 @@ class PersistenceBridge:
             )
             if updated is None:
                 return
+            logger.info(
+                "live_source_event_received",
+                kind="dc2_progress",
+                stationId=self._station_id,
+                pumpId=self._logical_by_address.get(address),
+                nozzleId=nozzle_id,
+                sourceAddress=address,
+                transactionId=tx_uuid,
+                state="DISPENSING",
+                amount=raw_amount,
+                volume=raw_volume,
+                amountScaled=round(raw_amount / 100.0, 2),
+                volumeLitres=round(raw_volume / 100.0, 2),
+            )
             if self._live is not None:
                 self._live.publish_typed(
                     LiveEventType.FILLING_UPDATED,

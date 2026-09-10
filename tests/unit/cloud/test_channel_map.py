@@ -61,6 +61,7 @@ def test_safe_mappings_keeps_us_lab_on_load_failure(monkeypatch, tmp_path):
     settings = SimpleNamespace(
         channel_map_path=str(bad),
         channel_map=None,
+        channel_map_allow_missing=True,
         controller=SimpleNamespace(station_id="InteliPump-US-Lab"),
     )
     mapping = safe_mappings_from_settings(settings, (1, 2))
@@ -91,7 +92,27 @@ def test_duplicate_nozzle_mapping_rejected():
             (1, 2),
         )
 
-def test_missing_channel_map_path_uses_us_lab_embedded():
+def test_missing_channel_map_path_fails_without_allow_missing():
+    from types import SimpleNamespace
+
+    import pytest
+
+    from intelipump_fdc.cloud.channel_map import (
+        ChannelMapMissingError,
+        mappings_from_settings,
+    )
+
+    settings = SimpleNamespace(
+        channel_map_path="/no/such/channel_map.us-lab.json",
+        channel_map=None,
+        channel_map_allow_missing=False,
+        controller=SimpleNamespace(station_id="InteliPump-US-Lab"),
+    )
+    with pytest.raises(ChannelMapMissingError):
+        mappings_from_settings(settings, (1, 2))
+
+
+def test_missing_channel_map_path_uses_us_lab_embedded_when_allowed():
     from types import SimpleNamespace
 
     from intelipump_fdc.cloud.channel_map import mappings_from_settings
@@ -99,8 +120,16 @@ def test_missing_channel_map_path_uses_us_lab_embedded():
     settings = SimpleNamespace(
         channel_map_path="/no/such/channel_map.us-lab.json",
         channel_map=None,
+        channel_map_allow_missing=True,
         controller=SimpleNamespace(station_id="InteliPump-US-Lab"),
     )
     mapping = mappings_from_settings(settings, (1, 2))
     assert mapping[2].pump_id == "pump-1"
     assert mapping[2].nozzle_id == "nozzle-2"
+
+
+def test_source_address_1_and_2_map_to_distinct_nozzles():
+    mapping = parse_channel_map(US_LAB_CHANNEL_MAP, (1, 2))
+    assert mapping[1].nozzle_id == "nozzle-1"
+    assert mapping[2].nozzle_id == "nozzle-2"
+    assert mapping[1].pump_id == mapping[2].pump_id == "pump-1"

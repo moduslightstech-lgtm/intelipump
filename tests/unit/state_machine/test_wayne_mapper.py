@@ -154,6 +154,39 @@ def test_outstanding_request_resolves_dc1() -> None:
     assert mapped.event is PumpEvent.RESET_OBSERVED
 
 
+def test_dc2_after_authorize_infers_filling_started() -> None:
+    """Post-authorize DC2 with volume must open FILLING (not only FILLING_UPDATED)."""
+    tx = decode_data_payload(
+        bytes.fromhex("02 08 00 00 00 25 00 03 00 00")
+    ).transactions[0]
+    mapped = map_wayne_observation(
+        tx,
+        context=MapperContext(
+            current_state=PumpState.AUTHORIZED,
+            previous_wayne_status=int(WaynePumpStatus.AUTHORIZED),
+            resolve_as_dc1=True,
+        ),
+    )
+    assert mapped.event is PumpEvent.FILLING_STARTED
+    assert mapped.filling_inferred_from_dc2 is True
+
+
+def test_dc2_does_not_infer_filling_from_completed_face() -> None:
+    tx = decode_data_payload(
+        bytes.fromhex("02 08 00 00 00 25 00 03 00 00")
+    ).transactions[0]
+    mapped = map_wayne_observation(
+        tx,
+        context=MapperContext(
+            current_state=PumpState.AUTHORIZED,
+            previous_wayne_status=int(WaynePumpStatus.FILLING_COMPLETED),
+            resolve_as_dc1=True,
+        ),
+    )
+    assert mapped.event is PumpEvent.FILLING_UPDATED
+    assert mapped.filling_inferred_from_dc2 is False
+
+
 def test_transaction_id_collision_not_used_as_direction_proof() -> None:
     tx = ApplicationTransaction(
         transaction_id=0x01,

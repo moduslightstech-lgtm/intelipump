@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from intelipump_fdc.controller.session_events import EventBus
@@ -165,6 +167,67 @@ async def test_dc2_ticks_do_not_mint_sale_without_filling_lifecycle(
         open_rows = await uow.transactions.list_unresolved(station_id=STATION)
         assert len(open_rows) == 0
         assert bridge._tx_by_address[2] == "tx-600"
+
+
+@pytest.mark.asyncio
+async def test_dc2_opens_sale_when_controller_already_filling(
+    engine_factory: tuple,
+) -> None:
+    """DC2 before/without STATE_CHANGED still opens an ACTIVE sale while FILLING."""
+    from intelipump_fdc.services.pump_state_service import PumpStateService
+    from intelipump_fdc.state_machine.models import PumpContext
+
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id=STATION, logical_pump_id="pump-1", dart_address=1
+        )
+        pump_id = pump.id
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump_id,
+            context=PumpContext(
+                pump_id="pump-1",
+                dart_address=1,
+                current_state=PumpState.FILLING,
+                previous_state=PumpState.AUTHORIZED,
+                communication_healthy=True,
+                state_version=1,
+            ),
+            observed_at=datetime.now(UTC),
+        )
+    bridge = PersistenceBridge(
+        session_factory=factory,
+        station_id=STATION,
+        environment="LAB",
+        simulated=False,
+        worker=PersistenceWorker(),
+        pump_id_by_address={1: pump_id},
+        logical_by_address={1: "pump-1"},
+        events=EventBus(),
+    )
+
+    await bridge._handle_app_decoded(
+        {
+            "address": 1,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 25,
+                "raw_amount": 30000,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+                "selected_nozzle": 1,
+            },
+        }
+    )
+
+    async with unit_of_work(factory) as uow:
+        open_rows = await uow.transactions.list_unresolved(station_id=STATION)
+        assert len(open_rows) == 1
+        assert open_rows[0].raw_amount == 30000
+        assert open_rows[0].raw_volume == 25
+        assert bridge._tx_by_address[1] == open_rows[0].transaction_uuid
 
 
 @pytest.mark.asyncio

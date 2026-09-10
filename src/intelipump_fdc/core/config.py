@@ -171,6 +171,8 @@ class Settings(BaseSettings):
     # migrated. US Lab loads config/channel_map.us-lab.json via CHANNEL_MAP_PATH.
     channel_map: str | None = None
     channel_map_path: str | None = None
+    # When CHANNEL_MAP_PATH is set but missing, fail startup unless this is true.
+    channel_map_allow_missing: bool = False
 
 
 @lru_cache

@@ -80,11 +80,27 @@ echo "==> Controller unit is not modified."
 
 sudo install -d -o root -g root -m 0755 "$ETC_DIR"
 
+MAP_SRC="${REPO_ROOT}/config/channel_map.us-lab.json"
+MAP_DST="${REPO_ROOT}/config/channel_map.us-lab.json"
+if [[ -f "$MAP_SRC" ]]; then
+  echo "==> Channel map present: ${MAP_SRC}"
+else
+  echo "ERROR: missing ${MAP_SRC}" >&2
+  exit 1
+fi
+
 if [[ ! -f "$ENV_DST" ]]; then
   echo "==> Writing ${ENV_DST} from example"
-  sudo install -o root -g root -m 0640 "$ENV_SRC" "$ENV_DST"
+  TMP_ENV="$(mktemp)"
+  sed -e "s|/home/intelipump/intelipump/intelipump-fdc|${REPO_ROOT}|g" "$ENV_SRC" >"$TMP_ENV"
+  sudo install -o root -g root -m 0640 "$TMP_ENV" "$ENV_DST"
+  rm -f "$TMP_ENV"
 else
   echo "==> Keeping existing ${ENV_DST}"
+  if ! sudo grep -q '^INTELIPUMP_CHANNEL_MAP_PATH=' "$ENV_DST" 2>/dev/null; then
+    echo "==> Adding INTELIPUMP_CHANNEL_MAP_PATH=${MAP_DST}"
+    echo "INTELIPUMP_CHANNEL_MAP_PATH=${MAP_DST}" | sudo tee -a "$ENV_DST" >/dev/null
+  fi
 fi
 
 TMP_UNIT="$(mktemp)"

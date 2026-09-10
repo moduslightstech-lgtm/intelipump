@@ -10,12 +10,16 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
+
 from intelipump_fdc.cloud.messages import build_envelope
 from intelipump_fdc.cloud.mqtt.base import MqttClient
 from intelipump_fdc.cloud.mqtt.errors import MqttError
 from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.schemas import HeartbeatPayload
 from intelipump_fdc.cloud.topics import TopicBuilder
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -118,6 +122,13 @@ class HeartbeatService:
                 retain=False,
             )
             self.last_published_at = datetime.now(UTC)
+            logger.info(
+                "heartbeat_published",
+                topic=topic,
+                device_id=self.device_id,
+                station_id=self.station_id,
+                published_at=self.last_published_at.isoformat(),
+            )
             return True
         except MqttError:
             self._pending_latest = envelope.to_dict()

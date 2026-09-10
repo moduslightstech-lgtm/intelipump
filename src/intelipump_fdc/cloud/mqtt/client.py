@@ -7,6 +7,8 @@ import ssl
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
+
 from intelipump_fdc.cloud.mqtt.base import ConnectionHandler, MessageHandler, MqttClient
 from intelipump_fdc.cloud.mqtt.config import MqttClientConfig
 from intelipump_fdc.cloud.mqtt.errors import MqttError, MqttNotConnectedError, MqttPublishError
@@ -16,6 +18,8 @@ from intelipump_fdc.cloud.mqtt.models import (
     MqttMessage,
     MqttPublishResult,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 class PahoMqttClient(MqttClient):
@@ -63,6 +67,14 @@ class PahoMqttClient(MqttClient):
 
         self._loop = asyncio.get_running_loop()
         self._meta.state = MqttConnectionState.CONNECTING
+        logger.info(
+            "mqtt_connecting",
+            host=self._config.host,
+            port=self._config.port,
+            tls=self._config.tls_enabled,
+            client_id=self._config.client_id,
+            keepalive=self._config.keepalive_seconds,
+        )
         client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[attr-defined]
             client_id=self._config.client_id,
@@ -105,8 +117,18 @@ class PahoMqttClient(MqttClient):
                 self._connected.wait(), timeout=self._config.connect_timeout_seconds
             )
         except TimeoutError as exc:
+            # Leave loop_start running — paho will keep reconnecting. Do not
+            # imply cloud_runtime_started means MQTT is up.
             self._meta.last_error = "connect_timeout"
             self._meta.state = MqttConnectionState.DISCONNECTED
+            logger.warning(
+                "mqtt_reconnect_scheduled",
+                host=self._config.host,
+                port=self._config.port,
+                reason="connect_timeout",
+                min_delay=self._config.reconnect_min_delay_seconds,
+                max_delay=self._config.reconnect_max_delay_seconds,
+            )
             raise MqttError("MQTT connect timeout") from exc
 
     async def disconnect(self) -> None:
@@ -164,9 +186,20 @@ class PahoMqttClient(MqttClient):
     ) -> None:
         rc = int(getattr(reason_code, "value", reason_code))
         if rc == 0:
+            was_reconnect = self._meta.reconnect_count > 0 or (
+                self._meta.last_disconnected_at is not None
+            )
             self._meta.state = MqttConnectionState.CONNECTED
             self._meta.last_connected_at = datetime.now(UTC)
             self._meta.last_error = None
+            logger.info(
+                "mqtt_reconnected" if was_reconnect else "mqtt_connected",
+                host=self._config.host,
+                port=self._config.port,
+                tls=self._config.tls_enabled,
+                client_id=self._config.client_id,
+                reconnect_count=self._meta.reconnect_count,
+            )
             if self._loop:
                 self._loop.call_soon_threadsafe(self._connected.set)
                 for topic, qos in list(self._subscriptions.items()):
@@ -178,6 +211,14 @@ class PahoMqttClient(MqttClient):
         else:
             self._meta.last_error = f"connect_rc={rc}"
             self._meta.state = MqttConnectionState.DISCONNECTED
+            logger.warning(
+                "mqtt_reconnect_scheduled",
+                host=self._config.host,
+                port=self._config.port,
+                reason=f"connect_rc={rc}",
+                min_delay=self._config.reconnect_min_delay_seconds,
+                max_delay=self._config.reconnect_max_delay_seconds,
+            )
 
     def _on_disconnect(
         self,
@@ -187,11 +228,26 @@ class PahoMqttClient(MqttClient):
         reason_code: Any,
         _props: Any = None,
     ) -> None:
+        reason = f"disconnect_rc={getattr(reason_code, 'value', reason_code)}"
         self._meta.state = MqttConnectionState.DISCONNECTED
         self._meta.last_disconnected_at = datetime.now(UTC)
         self._meta.reconnect_count += 1
-        self._meta.last_error = (
-            f"disconnect_rc={getattr(reason_code, 'value', reason_code)}"
+        self._meta.last_error = reason
+        logger.warning(
+            "mqtt_disconnected",
+            host=self._config.host,
+            port=self._config.port,
+            client_id=self._config.client_id,
+            reason=reason,
+            reconnect_count=self._meta.reconnect_count,
+        )
+        logger.info(
+            "mqtt_reconnect_scheduled",
+            host=self._config.host,
+            port=self._config.port,
+            reason=reason,
+            min_delay=self._config.reconnect_min_delay_seconds,
+            max_delay=self._config.reconnect_max_delay_seconds,
         )
         if self._loop:
             self._loop.call_soon_threadsafe(self._connected.clear)

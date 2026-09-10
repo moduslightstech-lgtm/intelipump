@@ -125,15 +125,41 @@ def _bundled_us_lab_map_path() -> Path | None:
     return None
 
 
+class ChannelMapMissingError(FileNotFoundError):
+    """Configured channel map path is required but missing."""
+
+
 def mappings_from_settings(settings: Any, addresses: tuple[int, ...]) -> dict[int, ChannelMapping]:
     """Load INTELIPUMP_CHANNEL_MAP / CHANNEL_MAP_PATH. Default stays pump-{addr}."""
     path = getattr(settings, "channel_map_path", None)
     raw = getattr(settings, "channel_map", None)
     station = str(getattr(getattr(settings, "controller", None), "station_id", "") or "").strip()
+    allow_missing = bool(getattr(settings, "channel_map_allow_missing", False))
     if path:
         path_obj = Path(str(path))
         if path_obj.is_file():
-            return load_channel_map_file(path_obj, addresses)
+            mappings = load_channel_map_file(path_obj, addresses)
+            logger.info(
+                "channel_map_loaded",
+                path=str(path_obj),
+                station_id=station,
+                source="file",
+                addresses=sorted(mappings.keys()),
+            )
+            return mappings
+        logger.error(
+            "channel_map_path_missing",
+            path=str(path_obj),
+            station_id=station,
+            reason="file_not_found",
+            allow_missing=allow_missing,
+        )
+        if not allow_missing:
+            raise ChannelMapMissingError(
+                f"Required channel map missing: {path_obj}. "
+                "Deploy config/channel_map.us-lab.json or set "
+                "INTELIPUMP_CHANNEL_MAP_ALLOW_MISSING=true for lab fallback."
+            )
         logger.warning(
             "channel_map_path_missing",
             path=str(path_obj),
@@ -142,12 +168,34 @@ def mappings_from_settings(settings: Any, addresses: tuple[int, ...]) -> dict[in
         )
         # Fall through: US Lab keeps embedded map; others use default.
     if raw:
-        return parse_channel_map(raw, addresses)
+        mappings = parse_channel_map(raw, addresses)
+        logger.info(
+            "channel_map_loaded",
+            station_id=station,
+            source="inline_json",
+            addresses=sorted(mappings.keys()),
+        )
+        return mappings
     if station in US_LAB_STATION_IDS:
         bundled = _bundled_us_lab_map_path()
         if bundled is not None:
-            return load_channel_map_file(bundled, addresses)
-        return parse_channel_map(US_LAB_CHANNEL_MAP, addresses)
+            mappings = load_channel_map_file(bundled, addresses)
+            logger.info(
+                "channel_map_loaded",
+                path=str(bundled),
+                station_id=station,
+                source="bundled",
+                addresses=sorted(mappings.keys()),
+            )
+            return mappings
+        mappings = parse_channel_map(US_LAB_CHANNEL_MAP, addresses)
+        logger.info(
+            "channel_map_loaded",
+            station_id=station,
+            source="embedded_us_lab",
+            addresses=sorted(mappings.keys()),
+        )
+        return mappings
     return parse_channel_map(None, addresses)
 
 
@@ -159,15 +207,20 @@ def us_lab_channel_mappings(addresses: tuple[int, ...]) -> dict[int, ChannelMapp
 def safe_mappings_from_settings(settings: Any, addresses: tuple[int, ...]) -> dict[int, ChannelMapping]:
     """Load channel map; never fall back to default pump-2 for US Lab stations.
 
-    The default map treats DART address 2 as a second physical pump (`pump-2` /
-    `nozzle-1`). That breaks live Nozzle 2. US Lab must keep
-    `pump-1` / `nozzle-2` / source `pump-2` even when the config file fails.
+    Missing required path raises ChannelMapMissingError unless
+    INTELIPUMP_CHANNEL_MAP_ALLOW_MISSING is enabled. US Lab keeps
+    `pump-1` / `nozzle-2` / source `pump-2` when allow-missing fallbacks run.
     """
     station = str(getattr(getattr(settings, "controller", None), "station_id", "") or "").strip()
     try:
         return mappings_from_settings(settings, addresses)
+    except ChannelMapMissingError:
+        raise
     except Exception:
         logger.exception("channel_map_load_failed", station_id=station)
+        allow_missing = bool(getattr(settings, "channel_map_allow_missing", False))
+        if not allow_missing and station not in US_LAB_STATION_IDS:
+            raise
         if station in US_LAB_STATION_IDS:
             logger.warning(
                 "channel_map_us_lab_fallback",

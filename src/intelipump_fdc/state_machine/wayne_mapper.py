@@ -311,24 +311,26 @@ def _map_dc2(
         "FILLING entry remains DC1-driven.",
     )
     warnings: tuple[str, ...] = ()
-    # Only when DC1 is unavailable may DC2 *infer* filling (explicitly marked).
+    # After AUTHORIZE the pump often emits DC2 before the next DC1 FILLING.
+    # Infer FILLING_STARTED so the SM opens a sale and live ticks are not dropped.
+    # Do not infer from a retained COMPLETED face (status 5) or while already FILLING.
     if (
         ctx.current_state in {PumpState.AUTHORIZED, PumpState.NOZZLE_UP}
-        and ctx.previous_wayne_status not in {
-            int(WaynePumpStatus.FILLING),
-            int(WaynePumpStatus.AUTHORIZED),
-        }
         and isinstance(vol_raw, int)
         and vol_raw > 0
-        and ctx.previous_wayne_status is None
+        and ctx.previous_wayne_status
+        not in {
+            int(WaynePumpStatus.FILLING),
+            int(WaynePumpStatus.FILLING_COMPLETED),
+        }
     ):
         return MappedWayneObservation(
             event=PumpEvent.FILLING_STARTED,
             observation=obs,
             filling_inferred_from_dc2=True,
             warnings=(
-                "DC1 FILLING unavailable; inferring FILLING_STARTED from DC2 "
-                "volume increase (marked inferred).",
+                "DC1 FILLING not yet observed; inferring FILLING_STARTED from DC2 "
+                "volume while AUTHORIZED/NOZZLE_UP (marked inferred).",
             ),
             inferences=inferences,
         )

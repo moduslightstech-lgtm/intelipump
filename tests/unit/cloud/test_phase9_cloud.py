@@ -289,6 +289,20 @@ async def test_live_fill_stream_completes_settled_hangup(
                 event_key="fill:tx-700:595:70000",
             )
         )
+        # FILLING_COMPLETE snapshot: orphan ACTIVE must settle without DISPENSING.
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump.id,
+            context=PumpContext(
+                pump_id="pump-2",
+                dart_address=2,
+                current_state=PumpState.FILLING_COMPLETE,
+                previous_state=PumpState.FILLING,
+                active_transaction_id="tx-700",
+                communication_healthy=True,
+                state_version=1,
+            ),
+            observed_at=started,
+        )
 
     stream = LiveFillStream(
         session_factory=db_factory,
@@ -302,7 +316,7 @@ async def test_live_fill_stream_completes_settled_hangup(
         settle_seconds=4.0,
     )
     await stream.publish_active_fills(now=started)
-    assert any(
+    assert not any(
         json.loads(m.payload).get("eventType") == "FILLING_UPDATED" for m in mqtt.published
     )
     async with unit_of_work(db_factory) as uow:
@@ -315,6 +329,78 @@ async def test_live_fill_stream_completes_settled_hangup(
         pending = await uow.sync_queue.pending_count()
     assert pending >= 1
 
+
+@pytest.mark.asyncio
+async def test_live_fill_stream_publishes_only_while_controller_filling(
+    db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
+) -> None:
+    mqtt = FakeMqttClient(host="live-while-filling")
+    await mqtt.connect()
+    started = datetime.now(UTC)
+    async with unit_of_work(db_factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id="InteliPump-US-Lab",
+            logical_pump_id="pump-1",
+            dart_address=1,
+        )
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="InteliPump-US-Lab",
+                pump_db_id=pump.id,
+                transaction_uuid="tx-live-1",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await svc.update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-live-1",
+                raw_volume=25,
+                raw_amount=30000,
+                event_key="fill:tx-live-1:25:30000",
+            )
+        )
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump.id,
+            context=PumpContext(
+                pump_id="pump-1",
+                dart_address=1,
+                current_state=PumpState.FILLING,
+                previous_state=PumpState.AUTHORIZED,
+                active_transaction_id="tx-live-1",
+                communication_healthy=True,
+                state_version=1,
+            ),
+            observed_at=started,
+        )
+
+    stream = LiveFillStream(
+        session_factory=db_factory,
+        mqtt=mqtt,
+        topics=topics,
+        fill_book=FillPublishBook(),
+        device_id="InteliPump-Lab-pi-001",
+        station_id="InteliPump-US-Lab",
+        environment="LAB",
+        simulated=False,
+    )
+    await stream.publish_active_fills(now=started)
+    fills = [
+        json.loads(m.payload)
+        for m in mqtt.published
+        if json.loads(m.payload).get("eventType") == "FILLING_UPDATED"
+    ]
+    assert len(fills) == 1
+    assert fills[0]["transactionId"] == "tx-live-1"
+    body = fills[0]["payload"]
+    assert body["raw_amount"] == 30000
+    assert body["status"] == "DISPENSING"
 
 @pytest.mark.asyncio
 async def test_live_fill_stream_does_not_publish_duplicate_after_hangup(

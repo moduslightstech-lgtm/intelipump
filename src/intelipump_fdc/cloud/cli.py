@@ -157,12 +157,13 @@ async def _async_main(args: argparse.Namespace) -> None:
         await cloud.stop()
         pending, age, delivered, failed = await cloud.pending_sync_snapshot()
         stats = {
-            "delivered": cloud.sync_stats.delivered,
-            "failed": cloud.sync_stats.failed,
+            # session_* = this process run; db_*_total = lifetime SQLite counters
+            "session_delivered": cloud.sync_stats.delivered,
+            "session_failed": cloud.sync_stats.failed,
             "pending": pending,
             "oldest_pending_age_seconds": age,
-            "db_delivered": delivered,
-            "db_failed": failed,
+            "db_delivered_total": delivered,
+            "db_failed_total": failed,
             "online_published": cloud.online_published,
             "heartbeat_last_published_at": (
                 cloud.heartbeat.last_published_at.isoformat()
@@ -171,6 +172,11 @@ async def _async_main(args: argparse.Namespace) -> None:
             ),
             "recovery_warnings": list(report.warnings)[:10],
             "mqtt_connected": cloud.mqtt.is_connected,
+            # Back-compat aliases (session counts / lifetime DB totals)
+            "delivered": cloud.sync_stats.delivered,
+            "failed": cloud.sync_stats.failed,
+            "db_delivered": delivered,
+            "db_failed": failed,
         }
         print(json.dumps(stats, indent=2))
         await dispose_engine(engine)

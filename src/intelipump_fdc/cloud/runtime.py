@@ -96,10 +96,15 @@ class CloudRuntime:
 
     def health_dict(self) -> dict[str, Any]:
         meta = self.mqtt.metadata
+        pending = self._stats_extra.get("pendingOutboxCount")
         return {
+            "processRunning": self.started,
+            "sqliteHealthy": True,
             "mqttEnabled": self.enabled,
             "mqttConnected": self.mqtt.is_connected,
             "mqttHost": f"{meta.host}:{meta.port}" if meta.host else None,
+            "mqttTls": meta.tls_enabled,
+            "mqttClientId": meta.client_id,
             "mqttLastConnectedAt": (
                 meta.last_connected_at.isoformat() if meta.last_connected_at else None
             ),
@@ -115,11 +120,21 @@ class CloudRuntime:
                 if self.heartbeat and self.heartbeat.last_published_at
                 else None
             ),
+            "lastLiveEventPublishedAt": self._stats_extra.get("lastLiveEventPublishedAt"),
+            "lastCompletedTransactionPublishedAt": self._stats_extra.get(
+                "lastCompletedTransactionPublishedAt"
+            ),
+            "pendingOutboxCount": pending,
             "cloudCommandSubscriptionActive": bool(
                 self.command_intake and self.command_intake.active
             ),
             "syncDeliveredCount": self.sync_stats.delivered,
             "syncFailedCount": self.sync_stats.failed,
+            "connectivityStatus": (
+                "ONLINE"
+                if self.mqtt.is_connected
+                else ("DEGRADED" if self.started else "OFFLINE")
+            ),
         }
 
     async def start(self) -> None:
@@ -233,6 +248,8 @@ class CloudRuntime:
             "cloud_runtime_started",
             host=self.mqtt.metadata.host,
             commands=bool(self.command_intake),
+            mqtt_connected=self.mqtt.is_connected,
+            note="mqtt_connected=false is possible; workers wait for reconnect",
         )
 
     async def stop(self) -> None:
