@@ -92,6 +92,9 @@ class PumpSession:
         self._last_dc2_volume: int | None = None
         self._insufficient_evidence_warned = False
         self._inferred_completion_key: str | None = None
+        # True only after FILLING is observed in this process (not retained COMPLETED).
+        self._filling_seen_this_boot = False
+        self._startup_baseline_fingerprint: str | None = None
 
     @property
     def address(self) -> int:
@@ -633,6 +636,7 @@ class PumpSession:
                     self.state.observed_status = observed
                 self.state.last_status_time = capture_mono
                 if status is WaynePumpStatus.FILLING:
+                    self._filling_seen_this_boot = True
                     self.state.sale_evidence.note_filling()
                     self.state.sale_lifecycle = SaleLifecycle.FILLING
                 elif status is WaynePumpStatus.AUTHORIZED:
@@ -746,6 +750,14 @@ class PumpSession:
                 context=result.context,
             )
         if before is not result.context.current_state:
+            finalize_unresolved = (
+                result.recovered_state is PumpState.FILLING_COMPLETE
+                and result.preserved_unresolved_transaction_id
+            )
+            retained_complete = (
+                result.recovered_state is PumpState.FILLING_COMPLETE
+                and not result.preserved_unresolved_transaction_id
+            )
             self._publish_state_changed(
                 before=before,
                 after=result.context.current_state,
@@ -753,11 +765,12 @@ class PumpSession:
                 context=result.context,
                 completion_evidence_key=(
                     f"restart-complete:{result.preserved_unresolved_transaction_id}"
-                    if result.recovered_state is PumpState.FILLING_COMPLETE
-                    and result.preserved_unresolved_transaction_id
+                    if finalize_unresolved
                     else None
                 ),
             )
+            if retained_complete:
+                self._publish_startup_baseline(mapped=mapped, context=result.context)
         elif (
             result.recovered_state is PumpState.FILLING_COMPLETE
             and result.preserved_unresolved_transaction_id
@@ -771,10 +784,69 @@ class PumpSession:
                 context=result.context.with_updates(awaiting_filling_complete=False),
                 completion_evidence_key=key,
             )
+        elif (
+            result.recovered_state is PumpState.FILLING_COMPLETE
+            and not result.preserved_unresolved_transaction_id
+        ):
+            # Retained completed face after restart/reconnect — baseline only.
+            self._publish_startup_baseline(mapped=mapped, context=result.context)
         else:
             # Continue applying this observation onto the reconciled context
             # (e.g. DC2 volume after FILLING restore) without duplicating txs.
             self._apply_mapped(mapped)
+
+    def _publish_startup_baseline(
+        self,
+        *,
+        mapped: MappedWayneObservation,
+        context: PumpContext,
+    ) -> None:
+        """Record the dispenser face totals as already-observed; never publish."""
+        vol = (
+            context.dispensed_volume_raw
+            if isinstance(context.dispensed_volume_raw, int)
+            else self.state.filled_volume_raw
+        )
+        amt = self.state.filled_amount_raw
+        # Retained COMPLETED face is not a new sale — clear in-memory evidence
+        # so later repeated COMPLETED frames cannot synthesize filling_observed.
+        self.state.sale_evidence.reset_attempt()
+        self.state.sale_lifecycle = SaleLifecycle.IDLE
+        self._filling_seen_this_boot = False
+        self.events.publish(
+            ControllerEvent(
+                type=ControllerEventType.STATE_CHANGED,
+                address=self.address,
+                timestamp=datetime.now(UTC),
+                detail="startup_baseline",
+                payload={
+                    "event": "STARTUP_BASELINE_OBSERVED",
+                    "previous_state": context.current_state.value,
+                    "normalized_state": context.current_state.value,
+                    "state_version": context.state_version,
+                    "selected_nozzle": mapped.selected_nozzle or context.selected_nozzle,
+                    "active_transaction_id": None,
+                    "communication_healthy": context.communication_healthy,
+                    "raw_wayne_status": context.last_raw_wayne_status,
+                    "source_frame_ref": context.last_source_frame_hex,
+                    "completion_evidence_key": None,
+                    "awaiting_filling_complete": False,
+                    "completion_inferred": False,
+                    "dispensed_volume_raw": vol,
+                    "filled_volume_raw": vol if isinstance(vol, int) else 0,
+                    "filled_amount_raw": amt if isinstance(amt, int) else 0,
+                    "filling_price_raw": mapped.filling_price_raw,
+                    "nozzle_out": context.nozzle_out,
+                    "has_unresolved_transaction": False,
+                    "startup_baseline": True,
+                    "may_publish_sale": False,
+                    "sale_lifecycle": SaleLifecycle.IDLE.value,
+                    "warnings": [
+                        "startup_baseline: retained completed sale observed; not published"
+                    ],
+                },
+            )
+        )
 
     def _apply_mapped(self, mapped: MappedWayneObservation) -> None:
         if (
@@ -782,16 +854,22 @@ class PumpSession:
             and mapped.completion_evidence_key in self._applied_completion_keys
         ):
             return
+        if mapped.event in {
+            PumpEvent.FILLING_STARTED,
+            PumpEvent.FILLING_UPDATED,
+        }:
+            self._filling_seen_this_boot = True
+            self.state.sale_evidence.note_filling()
         # Gate sale finalize: FILLING_COMPLETED without valid evidence → no sale.
         if mapped.event is PumpEvent.FILLING_COMPLETED:
             ctx0 = self.machine.context
-            # Sync evidence from live SM when poll path did not see every edge.
-            if ctx0.current_state in {
-                PumpState.FILLING,
-                PumpState.FILLING_COMPLETE,
-                PumpState.SUSPENDED,
-                PumpState.LIMIT_REACHED,
-            } or ctx0.previous_state is PumpState.FILLING:
+            # Credit filling only from a real FILLING observation this boot —
+            # never from a retained FILLING_COMPLETE face after restart.
+            if (
+                self._filling_seen_this_boot
+                or ctx0.current_state is PumpState.FILLING
+                or ctx0.previous_state is PumpState.FILLING
+            ):
                 self.state.sale_evidence.filling_observed = True
             if isinstance(ctx0.dispensed_volume_raw, int) and ctx0.dispensed_volume_raw > 0:
                 self.state.sale_evidence.note_dc2(
@@ -804,39 +882,70 @@ class PumpSession:
             may_sale, reason = self.state.sale_evidence.evaluate_filling_completed()
             self.state.sale_lifecycle = self.state.sale_evidence.lifecycle
             if not may_sale:
-                self._publish_state_changed(
-                    before=self.machine.context.current_state,
-                    after=self.machine.context.current_state,
-                    event_name="SALE_SUPPRESSED",
-                    context=self.machine.context.with_updates(
+                # Cold start / reconnect with retained COMPLETED face: baseline it.
+                if (
+                    reason == "filling_completed_without_filling"
+                    and self.state.sale_evidence.has_positive_delivery
+                    and not self._filling_seen_this_boot
+                ):
+                    self._publish_startup_baseline(mapped=mapped, context=ctx0)
+                    # Observe status in the SM without a publishable completion key.
+                    mapped = MappedWayneObservation(
+                        event=mapped.event,
+                        observation=mapped.observation,
+                        raw_wayne_status=mapped.raw_wayne_status,
+                        selected_nozzle=mapped.selected_nozzle,
+                        logical_nozzle_raw=mapped.logical_nozzle_raw,
+                        nozzle_out=mapped.nozzle_out,
+                        nozio_raw=mapped.nozio_raw,
+                        filling_price_raw=mapped.filling_price_raw,
+                        completion_evidence_key=None,
+                        awaiting_filling_complete=False,
+                        completion_inferred=mapped.completion_inferred,
+                        allow_implicit_authorize_to_filling=(
+                            mapped.allow_implicit_authorize_to_filling
+                        ),
+                        filling_inferred_from_dc2=mapped.filling_inferred_from_dc2,
+                        inferences=mapped.inferences,
                         warnings=(
-                            *self.machine.context.warnings,
-                            f"sale_suppressed:{reason}",
-                        )
-                    ),
-                    completion_evidence_key=None,
-                )
-                # Still allow SM to observe status, but strip completion key so
-                # persistence does not finalize a paid sale.
-                mapped = MappedWayneObservation(
-                    event=mapped.event,
-                    observation=mapped.observation,
-                    raw_wayne_status=mapped.raw_wayne_status,
-                    selected_nozzle=mapped.selected_nozzle,
-                    logical_nozzle_raw=mapped.logical_nozzle_raw,
-                    nozzle_out=mapped.nozzle_out,
-                    nozio_raw=mapped.nozio_raw,
-                    filling_price_raw=mapped.filling_price_raw,
-                    completion_evidence_key=None,
-                    awaiting_filling_complete=False,
-                    completion_inferred=mapped.completion_inferred,
-                    allow_implicit_authorize_to_filling=(
-                        mapped.allow_implicit_authorize_to_filling
-                    ),
-                    filling_inferred_from_dc2=mapped.filling_inferred_from_dc2,
-                    inferences=mapped.inferences,
-                    warnings=(*mapped.warnings, f"sale_suppressed:{reason}"),
-                )
+                            *mapped.warnings,
+                            "startup_baseline: retained completed sale; not published",
+                        ),
+                    )
+                else:
+                    self._publish_state_changed(
+                        before=self.machine.context.current_state,
+                        after=self.machine.context.current_state,
+                        event_name="SALE_SUPPRESSED",
+                        context=self.machine.context.with_updates(
+                            warnings=(
+                                *self.machine.context.warnings,
+                                f"sale_suppressed:{reason}",
+                            )
+                        ),
+                        completion_evidence_key=None,
+                    )
+                    # Still allow SM to observe status, but strip completion key so
+                    # persistence does not finalize a paid sale.
+                    mapped = MappedWayneObservation(
+                        event=mapped.event,
+                        observation=mapped.observation,
+                        raw_wayne_status=mapped.raw_wayne_status,
+                        selected_nozzle=mapped.selected_nozzle,
+                        logical_nozzle_raw=mapped.logical_nozzle_raw,
+                        nozzle_out=mapped.nozzle_out,
+                        nozio_raw=mapped.nozio_raw,
+                        filling_price_raw=mapped.filling_price_raw,
+                        completion_evidence_key=None,
+                        awaiting_filling_complete=False,
+                        completion_inferred=mapped.completion_inferred,
+                        allow_implicit_authorize_to_filling=(
+                            mapped.allow_implicit_authorize_to_filling
+                        ),
+                        filling_inferred_from_dc2=mapped.filling_inferred_from_dc2,
+                        inferences=mapped.inferences,
+                        warnings=(*mapped.warnings, f"sale_suppressed:{reason}"),
+                    )
         before_ctx = self.machine.context
         before = before_ctx.current_state
         was_awaiting = before_ctx.awaiting_filling_complete
@@ -928,10 +1037,21 @@ class PumpSession:
                     "sale_lifecycle": self.state.sale_lifecycle.value,
                     "may_publish_sale": (
                         completion_evidence_key is not None
-                        and self.state.sale_evidence.lifecycle
-                        is SaleLifecycle.FILLING_COMPLETED
-                        and self.state.sale_evidence.has_positive_delivery
-                        and not self.state.sale_evidence.aborted
+                        and (
+                            (
+                                self.state.sale_evidence.lifecycle
+                                is SaleLifecycle.FILLING_COMPLETED
+                                and self.state.sale_evidence.has_positive_delivery
+                                and not self.state.sale_evidence.aborted
+                            )
+                            or (
+                                isinstance(completion_evidence_key, str)
+                                and completion_evidence_key.startswith(
+                                    "restart-complete:"
+                                )
+                                and context.active_transaction_id is not None
+                            )
+                        )
                     ),
                     "filled_volume_raw": self.state.filled_volume_raw,
                     "filled_amount_raw": self.state.filled_amount_raw,

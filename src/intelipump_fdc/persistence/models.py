@@ -20,7 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 AUDIT_GENESIS_HASH = "GENESIS_V1"
 
 NAMING_CONVENTION = {
@@ -267,4 +267,37 @@ class ConfigurationVersionRow(Base):
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class NozzleSaleBaselineRow(Base):
+    """Persisted per-nozzle completed-sale baseline so restarts do not republish."""
+
+    __tablename__ = "nozzle_sale_baselines"
+    __table_args__ = (
+        UniqueConstraint(
+            "station_id",
+            "dart_address",
+            "nozzle_id",
+            name="uq_nozzle_sale_baselines_scope",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    station_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    pump_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    dart_address: Mapped[int] = mapped_column(Integer, nullable=False)
+    nozzle_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_completed_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_published_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_transaction_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_raw_volume: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_raw_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    initialized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

@@ -18,6 +18,7 @@ from intelipump_fdc.controller.session_events import (
 from intelipump_fdc.domain.pump_command import PumpCommand
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
+from intelipump_fdc.domain.sale_fingerprint import sale_fingerprint, stable_completion_key
 from intelipump_fdc.events.broker import EventBroker
 from intelipump_fdc.events.models import LiveEventType
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
@@ -467,6 +468,17 @@ class PersistenceBridge:
                 )
                 return
 
+            if event_name == "STARTUP_BASELINE_OBSERVED" or bool(
+                detail_payload.get("startup_baseline")
+            ):
+                await self._record_startup_baseline(
+                    uow,
+                    address=address,
+                    pump_db=pump_db,
+                    detail_payload=detail_payload,
+                )
+                return
+
             # Hang-up enters FILLING_COMPLETE while awaiting DC1 — do not
             # finalize the sale yet; keep accepting final DC2 updates.
             if (
@@ -535,17 +547,70 @@ class PersistenceBridge:
                     return
                 if not awaiting:
                     nozzle = detail_payload.get("selected_nozzle")
+                    nozzle_id = nozzle if isinstance(nozzle, int) else None
+                    price_raw = detail_payload.get("filling_price_raw")
+                    fp = sale_fingerprint(
+                        station_id=self._station_id,
+                        dart_address=address,
+                        nozzle_id=nozzle_id,
+                        raw_volume=int(vol_raw),
+                        raw_amount=int(amt_raw),
+                        raw_price=price_raw if isinstance(price_raw, int) else None,
+                    )
+                    baseline = await uow.nozzle_baselines.get(
+                        station_id=self._station_id,
+                        dart_address=address,
+                        nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
+                    )
+                    # Only suppress when there is no open/in-progress sale UUID.
+                    # A real IDLE→FILLING→COMPLETE lifecycle always has an
+                    # active candidate or mapped open row.
+                    open_mapped = await self._open_uuid(
+                        uow, self._tx_by_address.get(address) or active_tx_s
+                    )
+                    if (
+                        open_mapped is None
+                        and uow.nozzle_baselines.is_already_observed(baseline, fp)
+                    ):
+                        logger.info(
+                            "duplicate_transaction_ignored",
+                            event_name="duplicate_transaction_ignored",
+                            stationId=self._station_id,
+                            pumpId=logical,
+                            nozzleId=nozzle_id,
+                            fingerprint=fp,
+                            source="startup_baseline",
+                        )
+                        await uow.audit.append(
+                            actor="controller",
+                            source="state_machine",
+                            action="STARTUP_BASELINE_SUPPRESSED",
+                            station_id=self._station_id,
+                            pump_id=pump_db,
+                            previous_state=str(prev_state_s) if prev_state_s else None,
+                            resulting_state=new_state_s,
+                            result="IGNORED",
+                            details={
+                                "fingerprint": fp,
+                                "raw_volume": vol_raw,
+                                "raw_amount": amt_raw,
+                                "source": "startup_baseline",
+                            },
+                        )
+                        return
                     complete_uuid = await self._ensure_open_sale(
                         uow,
                         address=address,
                         pump_db=pump_db,
                         candidate=active_tx_s,
-                        nozzle_id=nozzle if isinstance(nozzle, int) else None,
+                        nozzle_id=nozzle_id,
                         reason="sale_complete",
                     )
                     key = (
                         completion_key_s
-                        or f"complete:{complete_uuid}:{new_state.value}"
+                        or stable_completion_key(
+                            transaction_uuid=complete_uuid, fingerprint=fp
+                        )
                     )
                     _tx, newly = await TransactionService(
                         uow, fill_book=self._fill_book
@@ -562,6 +627,17 @@ class PersistenceBridge:
                     )
                     # Keep mapping for duplicate DATA handling until new sale.
                     self._tx_by_address[address] = complete_uuid
+                    await uow.nozzle_baselines.upsert_baseline(
+                        station_id=self._station_id,
+                        pump_id=pump_db,
+                        dart_address=address,
+                        nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
+                        fingerprint=fp,
+                        raw_volume=int(vol_raw),
+                        raw_amount=int(amt_raw),
+                        transaction_uuid=complete_uuid,
+                        mark_published=newly,
+                    )
                     if newly:
                         await uow.audit.append(
                             actor="controller",
@@ -579,6 +655,7 @@ class PersistenceBridge:
                             details={
                                 "transaction_uuid": complete_uuid,
                                 "source_completion_key": key,
+                                "fingerprint": fp,
                                 "completion_inferred": completion_inferred,
                                 "warnings": list(warn_tuple),
                             },
@@ -595,9 +672,82 @@ class PersistenceBridge:
                             transaction_id=complete_uuid,
                             payload={
                                 "source_completion_key": key,
+                                "deduplicationKey": (
+                                    f"tx-completed:{self._station_id}:{key}"
+                                ),
                                 "completion_inferred": completion_inferred,
+                                "fingerprint": fp,
                             },
                         )
+
+    async def _record_startup_baseline(
+        self,
+        uow: Any,
+        *,
+        address: int,
+        pump_db: str,
+        detail_payload: dict[str, Any],
+    ) -> None:
+        nozzle = detail_payload.get("selected_nozzle")
+        nozzle_id = nozzle if isinstance(nozzle, int) else 0
+        vol = detail_payload.get("filled_volume_raw")
+        amt = detail_payload.get("filled_amount_raw")
+        if not isinstance(vol, int):
+            vol = detail_payload.get("dispensed_volume_raw")
+        if not isinstance(vol, int) or not isinstance(amt, int):
+            logger.info(
+                "startup_baseline_skipped_missing_totals",
+                stationId=self._station_id,
+                pumpId=pump_db,
+                address=address,
+            )
+            return
+        if vol <= 0 and amt <= 0:
+            return
+        price_raw = detail_payload.get("filling_price_raw")
+        fp = sale_fingerprint(
+            station_id=self._station_id,
+            dart_address=address,
+            nozzle_id=nozzle_id if nozzle_id else None,
+            raw_volume=vol,
+            raw_amount=amt,
+            raw_price=price_raw if isinstance(price_raw, int) else None,
+        )
+        await uow.nozzle_baselines.upsert_baseline(
+            station_id=self._station_id,
+            pump_id=pump_db,
+            dart_address=address,
+            nozzle_id=int(nozzle_id),
+            fingerprint=fp,
+            raw_volume=vol,
+            raw_amount=amt,
+            mark_published=True,
+        )
+        await uow.audit.append(
+            actor="controller",
+            source="reconciliation",
+            action="STARTUP_BASELINE_RECORDED",
+            station_id=self._station_id,
+            pump_id=pump_db,
+            resulting_state=str(detail_payload.get("normalized_state") or ""),
+            result="OK",
+            details={
+                "fingerprint": fp,
+                "raw_volume": vol,
+                "raw_amount": amt,
+                "nozzle_id": nozzle_id,
+                "source": "startup_baseline",
+            },
+        )
+        logger.info(
+            "startup_baseline_recorded",
+            event_name="duplicate_transaction_ignored",
+            stationId=self._station_id,
+            pumpId=pump_db,
+            nozzleId=nozzle_id,
+            fingerprint=fp,
+            source="startup_baseline",
+        )
 
     async def _handle_app_decoded(self, payload: dict[str, Any]) -> None:
         address = payload.get("address")
@@ -617,26 +767,51 @@ class PersistenceBridge:
             return
         nozzle = detail_payload.get("selected_nozzle")
         async with unit_of_work(self._factory) as uow:
-            tx_uuid = await self._ensure_open_sale(
-                uow,
-                address=address,
-                pump_db=pump_db,
-                candidate=self._tx_by_address.get(address),
-                nozzle_id=nozzle if isinstance(nozzle, int) else None,
-                raw_price=detail_payload.get("raw_price")
+            nozzle_id = nozzle if isinstance(nozzle, int) else None
+            price_raw = (
+                detail_payload.get("raw_price")
                 if isinstance(detail_payload.get("raw_price"), int)
-                else None,
-                price_decimals=detail_payload.get("price_decimals")
-                if isinstance(detail_payload.get("price_decimals"), int)
-                else None,
-                volume_decimals=detail_payload.get("volume_decimals")
-                if isinstance(detail_payload.get("volume_decimals"), int)
-                else None,
-                amount_decimals=detail_payload.get("amount_decimals")
-                if isinstance(detail_payload.get("amount_decimals"), int)
-                else None,
-                reason="dc2_tick",
+                else None
             )
+            fp = sale_fingerprint(
+                station_id=self._station_id,
+                dart_address=address,
+                nozzle_id=nozzle_id,
+                raw_volume=raw_volume,
+                raw_amount=raw_amount,
+                raw_price=price_raw,
+            )
+            open_mapped = await self._open_uuid(uow, self._tx_by_address.get(address))
+            baseline = await uow.nozzle_baselines.get(
+                station_id=self._station_id,
+                dart_address=address,
+                nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
+            )
+            if open_mapped is None and uow.nozzle_baselines.is_already_observed(baseline, fp):
+                logger.info(
+                    "duplicate_transaction_ignored",
+                    event_name="duplicate_transaction_ignored",
+                    stationId=self._station_id,
+                    pumpId=self._logical_by_address.get(address),
+                    nozzleId=nozzle_id,
+                    fingerprint=fp,
+                    source="startup_baseline",
+                    detail="dc2_tick_suppressed",
+                )
+                return
+            if open_mapped is None:
+                # Never mint a new sale UUID from retained DC2 face alone.
+                # New sales begin on FILLING_STARTED (IDLE→DISPENSING lifecycle).
+                logger.info(
+                    "dc2_tick_ignored_no_open_sale",
+                    stationId=self._station_id,
+                    pumpId=self._logical_by_address.get(address),
+                    nozzleId=nozzle_id,
+                    fingerprint=fp,
+                    source="awaiting_filling_lifecycle",
+                )
+                return
+            tx_uuid = open_mapped
             # Stable event key from scaled values — duplicate DATA with same
             # totals is ignored; progressive fills still update.
             event_key = f"fill:{tx_uuid}:{raw_volume}:{raw_amount}"

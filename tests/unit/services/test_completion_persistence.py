@@ -140,7 +140,7 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
             ]
             assert len(completed_sync) == 1
             assert completed_sync[0].deduplication_key == (
-                "tx-completed:complete:frame:5"
+                f"tx-completed:{STATION}:complete:frame:5"
             )
     finally:
         await persistence.shutdown()

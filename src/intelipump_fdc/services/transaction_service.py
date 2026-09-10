@@ -197,6 +197,8 @@ class TransactionService:
                         "environment": tx.environment,
                         "simulated": tx.simulated,
                     },
-                    deduplication_key=f"tx-completed:{req.source_completion_key}",
+                    deduplication_key=(
+                        f"tx-completed:{tx.station_id}:{req.source_completion_key}"
+                    ),
                 )
         return tx, newly

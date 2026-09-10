@@ -128,10 +128,10 @@ async def _completed_sale(factory, pump_id: str, uuid: str = "tx-600") -> None:
 
 
 @pytest.mark.asyncio
-async def test_dc2_ticks_open_new_sale_when_mapping_is_completed(
+async def test_dc2_ticks_do_not_mint_sale_without_filling_lifecycle(
     engine_factory: tuple,
 ) -> None:
-    """Lab 2026-09-07: ₦750 DC2 arrived while mapping still pointed at ₦600."""
+    """Retained DC2 after restart must not invent a new sale UUID."""
     _engine, factory = engine_factory
     async with unit_of_work(factory) as uow:
         pump = await uow.pumps.upsert(
@@ -163,11 +163,67 @@ async def test_dc2_ticks_open_new_sale_when_mapping_is_completed(
         assert old.status == "COMPLETED"
         assert old.raw_amount == 60000
         open_rows = await uow.transactions.list_unresolved(station_id=STATION)
-        assert len(open_rows) == 1
-        assert open_rows[0].transaction_uuid != "tx-600"
-        assert open_rows[0].raw_amount == 75000
-        assert open_rows[0].raw_volume == 63
-        assert bridge._tx_by_address[2] == open_rows[0].transaction_uuid
+        assert len(open_rows) == 0
+        assert bridge._tx_by_address[2] == "tx-600"
+
+
+@pytest.mark.asyncio
+async def test_dc2_ticks_update_sale_opened_by_filling(
+    engine_factory: tuple,
+) -> None:
+    """Lab path: FILLING opens sale; subsequent DC2 updates that row."""
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id=STATION, logical_pump_id="pump-2", dart_address=2
+        )
+        pump_id = pump.id
+    await _completed_sale(factory, pump_id)
+    bridge = _bridge(factory, pump_id)
+    bridge._tx_by_address[2] = "tx-600"
+
+    await bridge._handle_state_changed(
+        {
+            "address": 2,
+            "detail": "AUTHORIZED->FILLING",
+            "payload": {
+                "normalized_state": PumpState.FILLING.value,
+                "previous_state": PumpState.AUTHORIZED.value,
+                "active_transaction_id": "tx-600",
+                "selected_nozzle": 1,
+                "communication_healthy": True,
+                "state_version": 9,
+            },
+        }
+    )
+    minted = bridge._tx_by_address[2]
+    assert minted != "tx-600"
+
+    await bridge._handle_app_decoded(
+        {
+            "address": 2,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 63,
+                "raw_amount": 75000,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+            },
+        }
+    )
+
+    async with unit_of_work(factory) as uow:
+        old = await uow.transactions.get_by_uuid("tx-600")
+        assert old is not None
+        assert old.status == "COMPLETED"
+        assert old.raw_amount == 60000
+        row = await uow.transactions.get_by_uuid(minted)
+        assert row is not None
+        assert row.status == "ACTIVE"
+        assert row.raw_amount == 75000
+        assert row.raw_volume == 63
 
 
 @pytest.mark.asyncio
@@ -246,6 +302,23 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
     bridge = _bridge(factory, pump_id)
     bridge._tx_by_address[2] = "tx-600"
 
+    await bridge._handle_state_changed(
+        {
+            "address": 2,
+            "detail": "AUTHORIZED->FILLING",
+            "payload": {
+                "normalized_state": PumpState.FILLING.value,
+                "previous_state": PumpState.AUTHORIZED.value,
+                "active_transaction_id": "tx-600",
+                "selected_nozzle": 1,
+                "communication_healthy": True,
+                "state_version": 9,
+            },
+        }
+    )
+    open_uuid = bridge._tx_by_address[2]
+    assert open_uuid != "tx-600"
+
     await bridge._handle_app_decoded(
         {
             "address": 2,
@@ -253,8 +326,6 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
             "payload": {"raw_volume": 63, "raw_amount": 75000},
         }
     )
-    open_uuid = bridge._tx_by_address[2]
-    assert open_uuid != "tx-600"
 
     await bridge._handle_state_changed(
         {
@@ -263,7 +334,7 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
             "payload": {
                 "normalized_state": PumpState.FILLING_COMPLETE.value,
                 "previous_state": PumpState.FILLING.value,
-                "active_transaction_id": "tx-600",
+                "active_transaction_id": open_uuid,
                 "selected_nozzle": 1,
                 "communication_healthy": True,
                 "state_version": 11,
@@ -272,6 +343,7 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
                 "filled_volume_raw": 63,
                 "filled_amount_raw": 75000,
                 "sale_lifecycle": "FILLING_COMPLETED",
+                "may_publish_sale": True,
             },
         }
     )
