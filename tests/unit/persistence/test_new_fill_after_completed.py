@@ -133,7 +133,9 @@ async def _completed_sale(factory, pump_id: str, uuid: str = "tx-600") -> None:
 async def test_dc2_ticks_do_not_mint_sale_without_filling_lifecycle(
     engine_factory: tuple,
 ) -> None:
-    """Retained DC2 after restart must not invent a new sale UUID."""
+    """Retained DC2 matching the completed-sale baseline must not invent a UUID."""
+    from intelipump_fdc.domain.sale_fingerprint import sale_fingerprint
+
     _engine, factory = engine_factory
     async with unit_of_work(factory) as uow:
         pump = await uow.pumps.upsert(
@@ -141,6 +143,26 @@ async def test_dc2_ticks_do_not_mint_sale_without_filling_lifecycle(
         )
         pump_id = pump.id
     await _completed_sale(factory, pump_id)
+    fp = sale_fingerprint(
+        station_id=STATION,
+        dart_address=2,
+        nozzle_id=None,
+        raw_volume=51,
+        raw_amount=60000,
+        raw_price=1175,
+    )
+    async with unit_of_work(factory) as uow:
+        await uow.nozzle_baselines.upsert_baseline(
+            station_id=STATION,
+            pump_id=pump_id,
+            dart_address=2,
+            nozzle_id=0,
+            fingerprint=fp,
+            raw_volume=51,
+            raw_amount=60000,
+            transaction_uuid="tx-600",
+            mark_published=True,
+        )
     bridge = _bridge(factory, pump_id)
     bridge._tx_by_address[2] = "tx-600"
 
@@ -149,8 +171,8 @@ async def test_dc2_ticks_do_not_mint_sale_without_filling_lifecycle(
             "address": 2,
             "is_dc2": True,
             "payload": {
-                "raw_volume": 63,
-                "raw_amount": 75000,
+                "raw_volume": 51,
+                "raw_amount": 60000,
                 "volume_decimals": 2,
                 "amount_decimals": 2,
                 "raw_price": 1175,
@@ -167,6 +189,65 @@ async def test_dc2_ticks_do_not_mint_sale_without_filling_lifecycle(
         open_rows = await uow.transactions.list_unresolved(station_id=STATION)
         assert len(open_rows) == 0
         assert bridge._tx_by_address[2] == "tx-600"
+
+
+@pytest.mark.asyncio
+async def test_dc2_opens_sale_when_controller_stuck_discovering(
+    engine_factory: tuple,
+) -> None:
+    """Restart can leave SM/SQLite in DISCOVERING while a real fill runs."""
+    from intelipump_fdc.services.pump_state_service import PumpStateService
+    from intelipump_fdc.state_machine.models import PumpContext
+
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id=STATION, logical_pump_id="pump-1", dart_address=1
+        )
+        pump_id = pump.id
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump_id,
+            context=PumpContext(
+                pump_id="pump-1",
+                dart_address=1,
+                current_state=PumpState.DISCOVERING,
+                communication_healthy=True,
+                state_version=1,
+            ),
+            observed_at=datetime.now(UTC),
+        )
+    bridge = PersistenceBridge(
+        session_factory=factory,
+        station_id=STATION,
+        environment="LAB",
+        simulated=False,
+        worker=PersistenceWorker(),
+        pump_id_by_address={1: pump_id},
+        logical_by_address={1: "pump-1"},
+        events=EventBus(),
+    )
+
+    await bridge._handle_app_decoded(
+        {
+            "address": 1,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 10,
+                "raw_amount": 11750,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+                "selected_nozzle": 1,
+            },
+        }
+    )
+
+    async with unit_of_work(factory) as uow:
+        open_rows = await uow.transactions.list_unresolved(station_id=STATION)
+        assert len(open_rows) == 1
+        assert open_rows[0].raw_amount == 11750
+        assert open_rows[0].raw_volume == 10
 
 
 @pytest.mark.asyncio

@@ -860,6 +860,14 @@ class PumpSession:
         }:
             self._filling_seen_this_boot = True
             self.state.sale_evidence.note_filling()
+            # New FILLING_STARTED must not keep max() peaks from the prior sale
+            # face (e.g. volume stuck at 51 while amount climbs).
+            if mapped.event is PumpEvent.FILLING_STARTED:
+                self.state.filled_volume_raw = 0
+                self.state.filled_amount_raw = 0
+                self.state.sale_evidence.reset_attempt()
+                self.state.sale_evidence.note_filling()
+                self.state.sale_lifecycle = SaleLifecycle.IDLE
         # Gate sale finalize: FILLING_COMPLETED without valid evidence → no sale.
         if mapped.event is PumpEvent.FILLING_COMPLETED:
             ctx0 = self.machine.context

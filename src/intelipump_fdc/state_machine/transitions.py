@@ -15,6 +15,11 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     (PumpState.DISCOVERING, PumpEvent.CONFIGURATION_MISSING): PumpState.NOT_PROGRAMMED,
     (PumpState.DISCOVERING, PumpEvent.RESET_OBSERVED): PumpState.RESET,
     (PumpState.DISCOVERING, PumpEvent.READY_OBSERVED): PumpState.READY,
+    # After restart, live DC1 may show AUTHORIZED/FILLING before RESET/READY.
+    # Accept these so persistence can open an ACTIVE sale (never auto-authorize).
+    (PumpState.DISCOVERING, PumpEvent.AUTHORIZATION_CONFIRMED): PumpState.AUTHORIZED,
+    (PumpState.DISCOVERING, PumpEvent.FILLING_STARTED): PumpState.FILLING,
+    (PumpState.DISCOVERING, PumpEvent.NOZZLE_LIFTED): PumpState.NOZZLE_UP,
     (PumpState.NOT_PROGRAMMED, PumpEvent.RESET_OBSERVED): PumpState.RESET,
     (PumpState.NOT_PROGRAMMED, PumpEvent.READY_OBSERVED): PumpState.READY,
     # Documented Wayne CD5 price-accept path (DC1 0 → 5): not READY.
@@ -23,6 +28,7 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     (PumpState.RESET, PumpEvent.CONFIGURATION_MISSING): PumpState.NOT_PROGRAMMED,
     # Protocol-complete: AUTHORIZE may precede nozzle lift (Wayne RESET).
     (PumpState.RESET, PumpEvent.AUTHORIZATION_CONFIRMED): PumpState.AUTHORIZED,
+    (PumpState.RESET, PumpEvent.FILLING_STARTED): PumpState.FILLING,
     (PumpState.READY, PumpEvent.NOZZLE_LIFTED): PumpState.NOZZLE_UP,
     # Repeated DC1 RESET while application READY is not a demotion.
     (PumpState.READY, PumpEvent.RESET_OBSERVED): PumpState.READY,
@@ -49,6 +55,10 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     (PumpState.LIMIT_REACHED, PumpEvent.NOZZLE_RETURNED): PumpState.FILLING_COMPLETE,
     (PumpState.LIMIT_REACHED, PumpEvent.RESET_OBSERVED): PumpState.RESET,
     (PumpState.FILLING_COMPLETE, PumpEvent.RESET_OBSERVED): PumpState.RESET,
+    # Next sale may authorize/fill before RESET lands in the SM.
+    (PumpState.FILLING_COMPLETE, PumpEvent.AUTHORIZATION_CONFIRMED): PumpState.AUTHORIZED,
+    (PumpState.FILLING_COMPLETE, PumpEvent.FILLING_STARTED): PumpState.FILLING,
+    (PumpState.FILLING_COMPLETE, PumpEvent.NOZZLE_LIFTED): PumpState.NOZZLE_UP,
     (PumpState.FAULTED, PumpEvent.FAULT_CLEARED): PumpState.DISCOVERING,
     (PumpState.MAINTENANCE, PumpEvent.MAINTENANCE_EXITED): PumpState.DISCOVERING,
 }
