@@ -25,7 +25,7 @@ from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.sync_worker import SyncWorker, SyncWorkerStats
 from intelipump_fdc.cloud.topics import TopicBuilder
 from intelipump_fdc.controller.controller_loop import ControllerLoop
-from intelipump_fdc.cloud.channel_map import mappings_from_settings
+from intelipump_fdc.cloud.channel_map import safe_mappings_from_settings
 from intelipump_fdc.core.config import Settings
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 
@@ -134,10 +134,7 @@ class CloudRuntime:
             for x in self.settings.api.controller_addresses.split(",")
             if x.strip()
         ) or (1, 2)
-        try:
-            channel_mappings = mappings_from_settings(self.settings, addresses)
-        except Exception:
-            channel_mappings = {}
+        channel_mappings = safe_mappings_from_settings(self.settings, addresses)
 
         offline_payload = {
             "deviceId": device_id,

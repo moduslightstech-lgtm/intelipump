@@ -17,7 +17,7 @@ from intelipump_fdc.persistence.database import (
 )
 from intelipump_fdc.persistence.migrations import init_schema
 from intelipump_fdc.services.persistence_bridge import PersistenceBridge
-from intelipump_fdc.cloud.channel_map import ChannelMapping, mappings_from_settings, parse_channel_map
+from intelipump_fdc.cloud.channel_map import ChannelMapping, safe_mappings_from_settings
 from intelipump_fdc.core.config import get_settings
 from intelipump_fdc.services.persistence_worker import PersistenceWorker
 from intelipump_fdc.services.recovery_service import RecoveryReport, RecoveryService
@@ -64,10 +64,7 @@ async def start_persistence(
     worker.start()
     mapping = channel_map
     if mapping is None:
-        try:
-            mapping = mappings_from_settings(get_settings(), addresses)
-        except Exception:
-            mapping = parse_channel_map(None, addresses)
+        mapping = safe_mappings_from_settings(get_settings(), addresses)
     mqtt_pump = {a: mapping[a].pump_id for a in addresses if a in mapping}
     mqtt_nozzle = {a: mapping[a].nozzle_id for a in addresses if a in mapping}
     bridge = PersistenceBridge(

@@ -49,3 +49,44 @@ def test_enrich_does_not_discard_unmapped_sale():
     assert out["pump_id"] == "pump-99"
     assert out["amount"] == 100
     assert "nozzleId" not in out
+
+
+def test_safe_mappings_keeps_us_lab_on_load_failure(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from intelipump_fdc.cloud.channel_map import safe_mappings_from_settings
+
+    bad = tmp_path / "broken.json"
+    bad.write_text("{not-json", encoding="utf-8")
+    settings = SimpleNamespace(
+        channel_map_path=str(bad),
+        channel_map=None,
+        controller=SimpleNamespace(station_id="InteliPump-US-Lab"),
+    )
+    mapping = safe_mappings_from_settings(settings, (1, 2))
+    assert mapping[2].pump_id == "pump-1"
+    assert mapping[2].nozzle_id == "nozzle-2"
+    assert mapping[2].source_identifier == "pump-2"
+    assert mapping[1].pump_id == "pump-1"
+    assert mapping[1].nozzle_id == "nozzle-1"
+
+
+def test_default_address_2_is_not_physical_nozzle_2():
+    """Document the incorrect default that US Lab must override."""
+    mapping = parse_channel_map(None, (1, 2))
+    assert mapping[2].pump_id == "pump-2"
+    assert mapping[2].nozzle_id == "nozzle-1"
+
+
+def test_duplicate_nozzle_mapping_rejected():
+    import pytest
+    from intelipump_fdc.cloud.channel_map import DuplicateChannelMappingError
+
+    with pytest.raises(DuplicateChannelMappingError):
+        parse_channel_map(
+            {
+                "1": {"pump_id": "pump-1", "nozzle_id": "nozzle-1"},
+                "2": {"pump_id": "pump-1", "nozzle_id": "nozzle-1"},
+            },
+            (1, 2),
+        )
