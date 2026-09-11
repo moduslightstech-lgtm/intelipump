@@ -108,21 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-owned-lab-dispense-session",
         action="store_true",
         help=(
-            "OWNED LAB ONLY: enable CD5 price and RESET. "
-            "AUTHORIZE-on-lift is OFF by default (phantom-flow experiment); "
-            "pass --authorize-on-nozzle-lift to restore the old behavior. "
+            "OWNED LAB ONLY: enable CD5 price, RESET, and AUTHORIZE-on-lift. "
             "Requires --mode BENCH_CONTROL, --price, and the other confirm flags. "
             "Default remains poll-and-observe / LISTEN_ONLY."
         ),
     )
     parser.add_argument(
-        "--authorize-on-nozzle-lift",
+        "--no-authorize-on-nozzle-lift",
         action="store_true",
         help=(
-            "EXPERIMENT REVERT: with --confirm-owned-lab-dispense-session, "
-            "auto-AUTHORIZE when the nozzle is lifted (pre-2026-09-11 behavior). "
-            "Without this flag: arm-then-lift via /var/lib/intelipump/arm-<addr>, "
-            "or immediate AUTHORIZE via authorize-<addr> while nozzle is OUT."
+            "Disable AUTHORIZE-on-lift for this owned-lab session. "
+            "Use arm-<addr> then lift, or authorize-<addr> while nozzle is OUT."
         ),
     )
     parser.add_argument(
@@ -287,17 +283,14 @@ def run(argv: list[str] | None = None) -> None:
             log_frames=args.log_frames,
             log_dart_timing=args.log_dart_timing,
             log_all_frames=args.log_all_frames,
-            # EXPERIMENT 2026-09-11 (phantom flow): do NOT auto-AUTHORIZE on
-            # nozzle lift. Lift alone was enabling Wayne delivery and the face
-            # climbed without intentional squeeze.
-            # REVERT: pass --authorize-on-nozzle-lift (or set
-            # automatic_authorization=owned below again).
+            # Production owned-lab: AUTHORIZE on nozzle lift (POS-like local
+            # enable). Opt out with --no-authorize-on-nozzle-lift for arm-only.
             feature_flags=WayneFeatureFlags(
                 poll_and_observe=not owned,
                 automatic_startup_price_programming=owned,
                 automatic_reset=owned,
                 automatic_authorization=bool(
-                    owned and args.authorize_on_nozzle_lift
+                    owned and not args.no_authorize_on_nozzle_lift
                 ),
                 automatic_transaction_publishing=False,
             ),

@@ -1,29 +1,22 @@
-# EXPERIMENT NOTE — 2026-09-11 (phantom flow / unintended meter climb)
+# Owned-lab AUTHORIZE policy (updated 2026-09-11)
 #
-# Change: owned-lab no longer auto-AUTHORIZEs on nozzle lift.
-# Why: lift alone was enabling Wayne delivery; face climbed without intentional
-#      squeeze. Confirmed: AUTHORIZE enables delivery; pump meter can advance
-#      without a conscious dispense (hardware once authorized).
+# Default (production-like): AUTHORIZE on nozzle lift with
+# --confirm-owned-lab-dispense-session. No extra touch/arm command needed.
 #
-# Also:
-#   - post-RESET stale-_last_dc2 fix (AUTHORIZE not blocked forever after hang-up)
-#   - arm-then-lift (preferred UX without sudo authorize while OUT)
-#   - LiveFillStream no longer short-settles ACTIVE sales while snap is
-#     DISCOVERING (was dropping mid-sale after ~4s DC2 gaps)
-#   - DC2 path heals FILLING state + reopens after premature sidecar settle
+# Lab finding: once AUTHORIZE is sent, Wayne can advance the meter without a
+# conscious squeeze (hardware). Software cannot stop that after AUTHORIZE.
+# Keeping lift→AUTHORIZE matches intended site UX; treat post-auth climb as
+# pump/hardware behavior to investigate separately.
 #
-# How to test after deploy:
-#   1. Lift only → "AUTHORIZE deferred", face stays 0.00.
-#   2. Arm then lift (preferred):
-#        sudo touch /var/lib/intelipump/arm-1   # nozzle may be IN
-#        lift nozzle → AUTHORIZE once
-#   3. Or authorize while OUT:
-#        sudo touch /var/lib/intelipump/authorize-1
-#   4. After AUTHORIZE, expect live_source_event progress without
-#      possible_unintended_flow / DISCOVERING quarantine mid-sale.
+# Opt out (arm-only lab mode):
+#   Add --no-authorize-on-nozzle-lift to systemd ExecStart, then:
+#     sudo touch /var/lib/intelipump/arm-1   # then lift
+#     # or authorize-<addr> while nozzle OUT
 #
-# REVERT (restore lift → AUTHORIZE):
-#   Add --authorize-on-nozzle-lift to systemd ExecStart, daemon-reload, restart.
+# Related hardening kept regardless of auto-lift:
+#   - post-RESET stale-_last_dc2 must not block next AUTHORIZE
+#   - LiveFillStream must not short-settle ACTIVE sales while DISCOVERING
+#   - DC2 heals FILLING + reopens after premature sidecar settle
 #
 # Related files:
 #   src/intelipump_fdc/controller/cli.py

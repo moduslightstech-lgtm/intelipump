@@ -1320,9 +1320,9 @@ class ControllerLoop:
             session.state.nozzle_position is NozzlePosition.OUT
             and addr not in self._auth_this_lift
         ):
-            # EXPERIMENT 2026-09-11: auto-AUTHORIZE on lift is opt-in via
-            # --authorize-on-nozzle-lift. Default owned-lab uses arm-then-lift
-            # (arm-N file) or immediate authorize-N while nozzle is OUT.
+            # Production owned-lab: AUTHORIZE on lift when automatic_authorization
+            # is on. Optional arm-<addr> / authorize-<addr> still work when
+            # auto-lift is disabled (--no-authorize-on-nozzle-lift).
             self._refresh_arm_requests()
             manual = self._consume_manual_authorize_request(addr)
             armed = addr in self._armed_for_lift
