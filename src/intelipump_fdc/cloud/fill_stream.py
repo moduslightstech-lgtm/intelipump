@@ -27,7 +27,21 @@ logger = structlog.get_logger(__name__)
 # Do not auto-complete while the controller is still reporting a live fill.
 # A paused meter tick is not completion. Only age-out a truly stale FILLING snapshot.
 _LIVE_FILL_STATES = frozenset({"FILLING", "AUTHORIZED", "NOZZLE_UP", "SUSPENDED"})
+# Terminal / idle faces — safe for the short settle timer.
+_SETTLE_OK_STATES = frozenset(
+    {
+        "FILLING_COMPLETE",
+        "FILLING_COMPLETED",
+        "LIMIT_REACHED",
+        "RESET",
+        "READY",
+        "IDLE",
+        "CLOSED",
+    }
+)
 _LIVE_STATE_MAX_AGE_SECONDS = 90.0
+# ACTIVE row updated this recently ⇒ treat as live even if snap is DISCOVERING.
+_ACTIVE_TX_RECENT_SECONDS = 30.0
 # Pump face: 170 raw → 1.70 L (2 dp). Null decimals used to become 0.17 L on the cloud.
 _LAB_VOLUME_DECIMALS = 2
 _LAB_AMOUNT_DECIMALS = 2
@@ -49,7 +63,18 @@ def _pump_is_actively_filling(
         return True
     if observed.tzinfo is None:
         observed = observed.replace(tzinfo=UTC)
-    return (now - observed).total_seconds() < _LIVE_STATE_MAX_AGE_SECONDS
+    age = (now - observed).total_seconds()
+    return age <= _LIVE_STATE_MAX_AGE_SECONDS
+
+
+def _tx_recently_active(tx: TransactionRecord, now: datetime) -> bool:
+    """True when an ACTIVE sale was updated recently (DC2 gap ≠ hang-up)."""
+    stamp = tx.updated_at or tx.started_at
+    if stamp is None:
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    return (now - stamp).total_seconds() <= _ACTIVE_TX_RECENT_SECONDS
 
 
 @dataclass
@@ -161,11 +186,22 @@ class LiveFillStream:
                 continue
             prev = self._unchanged_since.get(tx.transaction_uuid)
             filling = filling_now.get(tx.pump_id, False)
+            # Short settle only on idle/complete faces (true hang-up), or when a
+            # twin COMPLETED already has the same totals (orphan ACTIVE after
+            # hang-up). FILLING/AUTHORIZED/DISCOVERING without a twin requires
+            # the long force timer so a DC2 gap cannot complete mid-hose.
+            state_u = (prev_state.get(tx.pump_id) or "").upper()
+            allow_short = state_u in _SETTLE_OK_STATES or (
+                tx.transaction_uuid in skip_fill_pub
+            )
+            if not allow_short and _tx_recently_active(tx, now):
+                filling = True
             if prev and prev[0] == raw_volume and prev[1] == raw_amount:
                 unchanged = (now - prev[2]).total_seconds()
-                ready = unchanged >= self.settle_seconds and (
-                    not filling or unchanged >= self.force_settle_seconds
-                )
+                if allow_short:
+                    ready = unchanged >= self.settle_seconds
+                else:
+                    ready = unchanged >= self.force_settle_seconds
                 if tx.transaction_uuid not in self._finalized and ready:
                     if await self._finalize_settled(
                         tx,

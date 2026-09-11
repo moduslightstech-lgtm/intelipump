@@ -26,12 +26,10 @@ def _lab_safety() -> ControllerSafetyContext:
     )
 
 
-@pytest.mark.asyncio
-async def test_manual_authorize_request_file_consumed(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("INTELIPUMP_AUTHORIZE_REQUEST_DIR", str(tmp_path))
+async def _loop() -> ControllerLoop:
     ctrl, _pump = create_memory_transport_pair()
     await ctrl.open()
-    loop = ControllerLoop(
+    return ControllerLoop(
         ControllerRuntime(
             transport=ctrl,
             safety=_lab_safety(),
@@ -44,6 +42,12 @@ async def test_manual_authorize_request_file_consumed(tmp_path: Path, monkeypatc
             ),
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_manual_authorize_request_file_consumed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("INTELIPUMP_AUTHORIZE_REQUEST_DIR", str(tmp_path))
+    loop = await _loop()
     req = tmp_path / "authorize-1"
     req.write_text("")
     assert loop._consume_manual_authorize_request(1) is True
@@ -54,19 +58,18 @@ async def test_manual_authorize_request_file_consumed(tmp_path: Path, monkeypatc
 @pytest.mark.asyncio
 async def test_manual_authorize_missing_file_is_false(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("INTELIPUMP_AUTHORIZE_REQUEST_DIR", str(tmp_path))
-    ctrl, _pump = create_memory_transport_pair()
-    await ctrl.open()
-    loop = ControllerLoop(
-        ControllerRuntime(
-            transport=ctrl,
-            safety=_lab_safety(),
-            config=PollSchedulerConfig(
-                addresses=(1,),
-                response_timeout_ms=50,
-                inter_poll_delay_ms=0,
-                idle_sleep_ms=0,
-                max_retries=0,
-            ),
-        )
-    )
+    loop = await _loop()
     assert loop._consume_manual_authorize_request(1) is False
+
+
+@pytest.mark.asyncio
+async def test_arm_file_arms_for_next_lift(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("INTELIPUMP_AUTHORIZE_REQUEST_DIR", str(tmp_path))
+    loop = await _loop()
+    (tmp_path / "arm-1").write_text("")
+    loop._refresh_arm_requests()
+    assert 1 in loop._armed_for_lift
+    assert not (tmp_path / "arm-1").exists()
+    # Second refresh does not clear armed state.
+    loop._refresh_arm_requests()
+    assert 1 in loop._armed_for_lift

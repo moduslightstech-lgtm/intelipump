@@ -1,8 +1,9 @@
 # OWNED LAB ONLY. CD5 price + RESET on startup; AUTHORIZE-on-lift OFF
-# (2026-09-11 phantom-flow experiment). To restore old lift→AUTHORIZE:
-#   add --authorize-on-nozzle-lift to ExecStart below.
-# Manual AUTHORIZE while nozzle OUT:
-#   sudo touch /var/lib/intelipump/authorize-1   # or authorize-2
+# (2026-09-11 phantom-flow experiment). Preferred lab flow:
+#   sudo touch /var/lib/intelipump/arm-1    # then lift nozzle → AUTHORIZE once
+# Immediate while nozzle OUT:
+#   sudo touch /var/lib/intelipump/authorize-1
+# Restore old lift→AUTHORIZE: add --authorize-on-nozzle-lift to ExecStart.
 # Remote authorization and MQTT stay off. Not for field stations.
 #
 # Install:

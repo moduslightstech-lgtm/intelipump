@@ -168,6 +168,7 @@ class ControllerLoop:
         self._startup_reset_done: set[int] = set()
         self._auth_this_lift: set[int] = set()
         self._auth_deferred_logged: set[int] = set()
+        self._armed_for_lift: set[int] = set()
         self._rs_poll_counter: dict[int, int] = {}
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
@@ -1141,6 +1142,8 @@ class ControllerLoop:
             if prev_pos is NozzlePosition.OUT and pos is NozzlePosition.IN:
                 self._auth_this_lift.discard(addr)
                 self._auth_deferred_logged.discard(addr)
+                # Keep arm across hang-up so operator can arm while nozzle IN,
+                # then lift to AUTHORIZE. Arm clears on successful authorize.
             self._last_nozzle[addr] = pos
         if prev_status is not status:
             if prev_status is not None or status is not ObservedStatus.UNKNOWN:
@@ -1224,6 +1227,8 @@ class ControllerLoop:
         if not self.runtime.safety.owned_lab_active_session:
             return
         addr = session.address
+        # Pick up arm-<addr> as soon as the operator creates it (often while IN).
+        self._refresh_arm_requests()
         unknown = (
             session.state.observed_status is ObservedStatus.UNKNOWN
             or session.state.nozzle_position is NozzlePosition.UNKNOWN
@@ -1316,12 +1321,24 @@ class ControllerLoop:
             and addr not in self._auth_this_lift
         ):
             # EXPERIMENT 2026-09-11: auto-AUTHORIZE on lift is opt-in via
-            # --authorize-on-nozzle-lift. Default owned-lab waits for a manual
-            # request file so lift alone cannot enable phantom delivery.
-            # REVERT: enable automatic_authorization (CLI flag) again.
+            # --authorize-on-nozzle-lift. Default owned-lab uses arm-then-lift
+            # (arm-N file) or immediate authorize-N while nozzle is OUT.
+            self._refresh_arm_requests()
             manual = self._consume_manual_authorize_request(addr)
-            if flags.automatic_authorization or manual:
-                if manual and not flags.automatic_authorization:
+            armed = addr in self._armed_for_lift
+            if flags.automatic_authorization or manual or armed:
+                if armed and not flags.automatic_authorization and not manual:
+                    self._armed_for_lift.discard(addr)
+                    logger.info(
+                        "owned_lab_armed_authorize_on_lift",
+                        address=addr,
+                        source="arm_request_file",
+                    )
+                    print(
+                        f"[OWNED-LAB addr={addr}] armed AUTHORIZE on lift "
+                        f"(arm-{addr} consumed)"
+                    )
+                elif manual and not flags.automatic_authorization:
                     logger.info(
                         "owned_lab_manual_authorize_requested",
                         address=addr,
@@ -1341,26 +1358,56 @@ class ControllerLoop:
                     controllerState=session.state.observed_status.value,
                     detail=(
                         "Nozzle OUT; AUTHORIZE not sent (auto-lift disabled). "
-                        f"Touch /var/lib/intelipump/authorize-{addr} to enable, "
-                        "or restart with --authorize-on-nozzle-lift to revert."
+                        f"Arm first: touch /var/lib/intelipump/arm-{addr}, "
+                        f"or authorize now: touch /var/lib/intelipump/authorize-{addr}."
                     ),
                 )
                 print(
                     f"[OWNED-LAB addr={addr}] nozzle OUT — AUTHORIZE deferred "
-                    f"(no auto-lift; touch /var/lib/intelipump/authorize-{addr} "
-                    "to enable delivery)"
+                    f"(arm with /var/lib/intelipump/arm-{addr}, then lift; "
+                    f"or touch authorize-{addr} while OUT)"
                 )
+
+    def _authorize_request_dir(self) -> Path:
+        return Path(
+            os.environ.get("INTELIPUMP_AUTHORIZE_REQUEST_DIR", "/var/lib/intelipump")
+        )
+
+    def _refresh_arm_requests(self) -> None:
+        """Load arm-<addr> files; arm persists until consumed on next lift AUTHORIZE."""
+        base = self._authorize_request_dir()
+        for addr in self.sessions:
+            path = base / f"arm-{addr}"
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.warning(
+                    "owned_lab_arm_request_unlink_failed",
+                    address=addr,
+                    path=str(path),
+                    error=str(exc),
+                )
+                continue
+            self._armed_for_lift.add(addr)
+            logger.info(
+                "owned_lab_armed_for_next_lift",
+                address=addr,
+                path=str(path),
+            )
+            print(
+                f"[OWNED-LAB addr={addr}] ARMED for next nozzle lift "
+                f"(will AUTHORIZE once)"
+            )
 
     def _consume_manual_authorize_request(self, address: int) -> bool:
         """True once if operator requested AUTHORIZE via request file.
 
-        EXPERIMENT helper while auto-AUTHORIZE-on-lift is disabled. File is
-        removed on consume so each touch is a single authorize attempt.
+        While auto-AUTHORIZE-on-lift is disabled: touch authorize-<addr> with
+        nozzle OUT for immediate AUTHORIZE, or arm-<addr> then lift.
         """
-        base = Path(
-            os.environ.get("INTELIPUMP_AUTHORIZE_REQUEST_DIR", "/var/lib/intelipump")
-        )
-        path = base / f"authorize-{address}"
+        path = self._authorize_request_dir() / f"authorize-{address}"
         if not path.is_file():
             return False
         try:

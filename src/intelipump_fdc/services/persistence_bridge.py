@@ -889,6 +889,69 @@ class PersistenceBridge:
                 raw_price=price_raw,
             )
             open_mapped = await self._open_uuid(uow, self._tx_by_address.get(address))
+            # Premature sidecar settle (ACTIVE→COMPLETED while hose still live)
+            # leaves _tx_by_address pointing at a COMPLETED row. If DC2 keeps
+            # climbing past that settle, reopen instead of quarantining.
+            if open_mapped is None:
+                prev_uuid = self._tx_by_address.get(address)
+                if prev_uuid:
+                    prev_row = await uow.transactions.get_by_uuid(prev_uuid)
+                    settle_key = (
+                        str(prev_row.source_completion_key or "")
+                        if prev_row is not None
+                        else ""
+                    )
+                    if (
+                        prev_row is not None
+                        and prev_row.status in {"COMPLETED", "COMPLETE"}
+                        and settle_key.startswith("sidecar-settle:")
+                        and (
+                            raw_volume > int(prev_row.raw_volume or 0)
+                            or raw_amount > int(prev_row.raw_amount or 0)
+                        )
+                    ):
+                        logger.warning(
+                            "live_sale_reopened_after_premature_settle",
+                            stationId=self._station_id,
+                            sourceAddress=address,
+                            previousUuid=prev_uuid,
+                            previousVolume=prev_row.raw_volume,
+                            previousAmount=prev_row.raw_amount,
+                            newVolume=raw_volume,
+                            newAmount=raw_amount,
+                        )
+                        open_mapped = await self._ensure_open_sale(
+                            uow,
+                            address=address,
+                            pump_db=pump_db,
+                            candidate=None,
+                            nozzle_id=nozzle_id,
+                            raw_price=price_raw,
+                            price_decimals=(
+                                detail_payload.get("price_decimals")
+                                if isinstance(detail_payload.get("price_decimals"), int)
+                                else None
+                            ),
+                            volume_decimals=(
+                                detail_payload.get("volume_decimals")
+                                if isinstance(detail_payload.get("volume_decimals"), int)
+                                else None
+                            ),
+                            amount_decimals=(
+                                detail_payload.get("amount_decimals")
+                                if isinstance(detail_payload.get("amount_decimals"), int)
+                                else None
+                            ),
+                            reason="reopen_after_premature_sidecar_settle",
+                        )
+                        await self._mark_controller_filling(
+                            uow,
+                            address=address,
+                            pump_db=pump_db,
+                            nozzle_id=nozzle_id,
+                            transaction_id=open_mapped,
+                            previous_state=PumpState.DISCOVERING.value,
+                        )
             baseline = await uow.nozzle_baselines.get(
                 station_id=self._station_id,
                 dart_address=address,
@@ -980,6 +1043,14 @@ class PersistenceBridge:
                     ),
                     reason=open_reason,
                 )
+                await self._mark_controller_filling(
+                    uow,
+                    address=address,
+                    pump_db=pump_db,
+                    nozzle_id=nozzle_id,
+                    transaction_id=open_mapped,
+                    previous_state=state_s or None,
+                )
                 logger.info(
                     "live_source_event_received",
                     kind="dc2_open_sale",
@@ -996,6 +1067,25 @@ class PersistenceBridge:
                     volumeLitres=round(raw_volume / 100.0, 2),
                     reason=open_reason,
                 )
+            else:
+                # Keep SQLite aligned with the live hose even when the SM
+                # snapshot briefly reports DISCOVERING mid-sale.
+                snap = await uow.states.latest(pump_db)
+                state_s = (snap.normalized_state or "").upper() if snap else ""
+                if state_s not in {
+                    PumpState.FILLING.value,
+                    PumpState.AUTHORIZED.value,
+                    PumpState.NOZZLE_UP.value,
+                    PumpState.SUSPENDED.value,
+                }:
+                    await self._mark_controller_filling(
+                        uow,
+                        address=address,
+                        pump_db=pump_db,
+                        nozzle_id=nozzle_id,
+                        transaction_id=open_mapped,
+                        previous_state=state_s or None,
+                    )
             tx_uuid = open_mapped
             # Stable event key from scaled values — duplicate DATA with same
             # totals is ignored; progressive fills still update.

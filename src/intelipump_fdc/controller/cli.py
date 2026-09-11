@@ -121,8 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "EXPERIMENT REVERT: with --confirm-owned-lab-dispense-session, "
             "auto-AUTHORIZE when the nozzle is lifted (pre-2026-09-11 behavior). "
-            "Without this flag, lift alone does not enable delivery; touch "
-            "/var/lib/intelipump/authorize-<addr> while nozzle is OUT to AUTHORIZE."
+            "Without this flag: arm-then-lift via /var/lib/intelipump/arm-<addr>, "
+            "or immediate AUTHORIZE via authorize-<addr> while nozzle is OUT."
         ),
     )
     parser.add_argument(

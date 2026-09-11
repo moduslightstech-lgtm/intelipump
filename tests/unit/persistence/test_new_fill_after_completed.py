@@ -506,3 +506,107 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
         assert sold.status == "COMPLETED"
         assert sold.raw_amount == 75000
         assert sold.raw_volume == 63
+
+
+@pytest.mark.asyncio
+async def test_dc2_reopens_after_premature_sidecar_settle(
+    engine_factory: tuple,
+) -> None:
+    """Climbing DC2 after sidecar-settle must open a new ACTIVE sale, not quarantine."""
+    from intelipump_fdc.services.pump_state_service import PumpStateService
+    from intelipump_fdc.services.transaction_models import (
+        BeginTransactionRequest,
+        CompleteTransactionRequest,
+        FillingUpdateRequest,
+    )
+    from intelipump_fdc.services.transaction_service import TransactionService
+    from intelipump_fdc.state_machine.models import PumpContext
+
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id=STATION, logical_pump_id="pump-1", dart_address=1
+        )
+        pump_id = pump.id
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump_id,
+            context=PumpContext(
+                pump_id="pump-1",
+                dart_address=1,
+                current_state=PumpState.DISCOVERING,
+                communication_healthy=True,
+                state_version=1,
+            ),
+            observed_at=datetime.now(UTC),
+        )
+        await TransactionService(uow).begin(
+            BeginTransactionRequest(
+                station_id=STATION,
+                pump_db_id=pump_id,
+                transaction_uuid="tx-premature",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="LAB",
+            )
+        )
+        await TransactionService(uow).update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-premature",
+                raw_volume=36,
+                raw_amount=42300,
+                event_key="fill:tx-premature:36:42300",
+            )
+        )
+        await TransactionService(uow).complete(
+            CompleteTransactionRequest(
+                transaction_uuid="tx-premature",
+                source_completion_key="sidecar-settle:tx-premature",
+                raw_volume=36,
+                raw_amount=42300,
+                completion_inferred=True,
+            )
+        )
+
+    bridge = PersistenceBridge(
+        session_factory=factory,
+        station_id=STATION,
+        environment="LAB",
+        simulated=False,
+        worker=PersistenceWorker(),
+        pump_id_by_address={1: pump_id},
+        logical_by_address={1: "pump-1"},
+        events=EventBus(),
+        mqtt_pump_by_address={1: "pump-1"},
+        mqtt_nozzle_by_address={1: "nozzle-1"},
+        mqtt_source_by_address={1: "pump-1"},
+    )
+    bridge._tx_by_address[1] = "tx-premature"
+
+    await bridge._handle_app_decoded(
+        {
+            "address": 1,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 37,
+                "raw_amount": 43475,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+                "selected_nozzle": 1,
+            },
+        }
+    )
+
+    async with unit_of_work(factory) as uow:
+        open_rows = await uow.transactions.list_unresolved(station_id=STATION)
+        assert len(open_rows) == 1
+        assert open_rows[0].transaction_uuid != "tx-premature"
+        assert open_rows[0].raw_volume == 37
+        snap = await uow.states.latest(pump_id)
+        assert snap is not None
+        assert snap.normalized_state == PumpState.FILLING.value
