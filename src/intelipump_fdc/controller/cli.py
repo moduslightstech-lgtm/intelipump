@@ -108,9 +108,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-owned-lab-dispense-session",
         action="store_true",
         help=(
-            "OWNED LAB ONLY: enable CD5 price, RESET, and authorize-on-lift. "
+            "OWNED LAB ONLY: enable CD5 price and RESET. "
+            "AUTHORIZE-on-lift is OFF by default (phantom-flow experiment); "
+            "pass --authorize-on-nozzle-lift to restore the old behavior. "
             "Requires --mode BENCH_CONTROL, --price, and the other confirm flags. "
             "Default remains poll-and-observe / LISTEN_ONLY."
+        ),
+    )
+    parser.add_argument(
+        "--authorize-on-nozzle-lift",
+        action="store_true",
+        help=(
+            "EXPERIMENT REVERT: with --confirm-owned-lab-dispense-session, "
+            "auto-AUTHORIZE when the nozzle is lifted (pre-2026-09-11 behavior). "
+            "Without this flag, lift alone does not enable delivery; touch "
+            "/var/lib/intelipump/authorize-<addr> while nozzle is OUT to AUTHORIZE."
         ),
     )
     parser.add_argument(
@@ -275,11 +287,18 @@ def run(argv: list[str] | None = None) -> None:
             log_frames=args.log_frames,
             log_dart_timing=args.log_dart_timing,
             log_all_frames=args.log_all_frames,
+            # EXPERIMENT 2026-09-11 (phantom flow): do NOT auto-AUTHORIZE on
+            # nozzle lift. Lift alone was enabling Wayne delivery and the face
+            # climbed without intentional squeeze.
+            # REVERT: pass --authorize-on-nozzle-lift (or set
+            # automatic_authorization=owned below again).
             feature_flags=WayneFeatureFlags(
                 poll_and_observe=not owned,
                 automatic_startup_price_programming=owned,
                 automatic_reset=owned,
-                automatic_authorization=owned,
+                automatic_authorization=bool(
+                    owned and args.authorize_on_nozzle_lift
+                ),
                 automatic_transaction_publishing=False,
             ),
             liveness=liveness,

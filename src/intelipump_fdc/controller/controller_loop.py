@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import structlog
 
@@ -165,6 +167,7 @@ class ControllerLoop:
         self._price_programmed: set[int] = set()
         self._startup_reset_done: set[int] = set()
         self._auth_this_lift: set[int] = set()
+        self._auth_deferred_logged: set[int] = set()
         self._rs_poll_counter: dict[int, int] = {}
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
@@ -1137,6 +1140,7 @@ class ControllerLoop:
                 )
             if prev_pos is NozzlePosition.OUT and pos is NozzlePosition.IN:
                 self._auth_this_lift.discard(addr)
+                self._auth_deferred_logged.discard(addr)
             self._last_nozzle[addr] = pos
         if prev_status is not status:
             if prev_status is not None or status is not ObservedStatus.UNKNOWN:
@@ -1308,11 +1312,68 @@ class ControllerLoop:
                     self._startup_reset_done.add(addr)
 
         if (
-            flags.automatic_authorization
-            and session.state.nozzle_position is NozzlePosition.OUT
+            session.state.nozzle_position is NozzlePosition.OUT
             and addr not in self._auth_this_lift
         ):
-            await self._owned_lab_authorize(session)
+            # EXPERIMENT 2026-09-11: auto-AUTHORIZE on lift is opt-in via
+            # --authorize-on-nozzle-lift. Default owned-lab waits for a manual
+            # request file so lift alone cannot enable phantom delivery.
+            # REVERT: enable automatic_authorization (CLI flag) again.
+            manual = self._consume_manual_authorize_request(addr)
+            if flags.automatic_authorization or manual:
+                if manual and not flags.automatic_authorization:
+                    logger.info(
+                        "owned_lab_manual_authorize_requested",
+                        address=addr,
+                        source="authorize_request_file",
+                    )
+                    print(
+                        f"[OWNED-LAB addr={addr}] manual AUTHORIZE request "
+                        f"(authorize-{addr} file)"
+                    )
+                await self._owned_lab_authorize(session)
+            elif addr not in self._auth_deferred_logged:
+                self._auth_deferred_logged.add(addr)
+                logger.info(
+                    "owned_lab_authorize_deferred_no_auto_lift",
+                    address=addr,
+                    nozzleState=session.state.nozzle_position.value,
+                    controllerState=session.state.observed_status.value,
+                    detail=(
+                        "Nozzle OUT; AUTHORIZE not sent (auto-lift disabled). "
+                        f"Touch /var/lib/intelipump/authorize-{addr} to enable, "
+                        "or restart with --authorize-on-nozzle-lift to revert."
+                    ),
+                )
+                print(
+                    f"[OWNED-LAB addr={addr}] nozzle OUT — AUTHORIZE deferred "
+                    f"(no auto-lift; touch /var/lib/intelipump/authorize-{addr} "
+                    "to enable delivery)"
+                )
+
+    def _consume_manual_authorize_request(self, address: int) -> bool:
+        """True once if operator requested AUTHORIZE via request file.
+
+        EXPERIMENT helper while auto-AUTHORIZE-on-lift is disabled. File is
+        removed on consume so each touch is a single authorize attempt.
+        """
+        base = Path(
+            os.environ.get("INTELIPUMP_AUTHORIZE_REQUEST_DIR", "/var/lib/intelipump")
+        )
+        path = base / f"authorize-{address}"
+        if not path.is_file():
+            return False
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning(
+                "owned_lab_authorize_request_unlink_failed",
+                address=address,
+                path=str(path),
+                error=str(exc),
+            )
+            return False
+        return True
 
     async def _owned_lab_authorize(self, session: PumpSession) -> None:
         addr = session.address
@@ -1341,25 +1402,34 @@ class ControllerLoop:
                 ExchangeResultStatus.LINK_ACKNOWLEDGED,
                 ExchangeResultStatus.APPLICATION_CONFIRMED,
             }:
+                # Do not retry endlessly on this lift.
+                self._auth_this_lift.add(addr)
                 return
-        # Require a verified zero meter face before AUTHORIZE. Non-zero after
-        # RESET means prior-sale residual or uncleared display — do not enable
-        # delivery until the face is clear (operator/tech recovery).
+            # Invalidate retained-sale DC2 cache. Wayne often keeps LCD totals
+            # after RESET without immediately emitting a zero DC2; stale cache
+            # must not permanently block AUTHORIZE.
+            self._last_dc2.pop(addr, None)
+            session.state.filled_volume_raw = 0
+            session.state.filled_amount_raw = 0
+            session.state.sale_evidence.reset_attempt()
+        # Require that any *fresh* DC2 after RESET is zero. Missing DC2 after
+        # RESET is normal (hold-display) and must not withhold AUTHORIZE.
         if not await self._verify_zero_meter_before_auth(session):
             logger.warning(
                 "pre_auth_nonzero_meter",
                 address=addr,
-                volumeMinorUnits=session.state.filled_volume_raw,
-                amountMinorUnits=session.state.filled_amount_raw,
+                volumeMinorUnits=(self._last_dc2.get(addr) or (0, 0))[0],
+                amountMinorUnits=(self._last_dc2.get(addr) or (0, 0))[1],
                 observedStatus=session.state.observed_status.value,
                 nozzle=session.state.nozzle_position.value,
-                detail="Unable to verify sale reset; AUTHORIZE withheld",
+                detail="Fresh non-zero DC2 after RESET; AUTHORIZE withheld",
             )
             print(
                 f"[OWNED-LAB addr={addr}] AUTHORIZE withheld — "
-                f"Unable to verify sale reset "
-                f"(vol={session.state.filled_volume_raw} amt={session.state.filled_amount_raw})"
+                f"fresh non-zero meter after RESET "
+                f"(last_dc2={self._last_dc2.get(addr)})"
             )
+            self._auth_this_lift.add(addr)
             return
         nozzle = session.state.logical_nozzle or 1
         cd2 = build_cd2_allowed_nozzles([nozzle])
@@ -1372,6 +1442,7 @@ class ControllerLoop:
         )
         print(f"[OWNED-LAB addr={addr}] CD2 result={cd2_res.status.value}")
         if not cd2_res.link_acknowledged:
+            self._auth_this_lift.add(addr)
             return
         auth = await self._run_owned_command(
             session,
@@ -1393,55 +1464,77 @@ class ControllerLoop:
             volumeMinorUnits=session.state.filled_volume_raw,
             amountMinorUnits=session.state.filled_amount_raw,
         )
-        if auth.status in {
-            ExchangeResultStatus.LINK_ACKNOWLEDGED,
-            ExchangeResultStatus.APPLICATION_CONFIRMED,
-        }:
-            self._auth_this_lift.add(addr)
+        # Record attempt for this lift whether or not APPLICATION_CONFIRMED —
+        # avoids RESET/AUTHORIZE spam on every owned-lab tick.
+        self._auth_this_lift.add(addr)
 
     async def _verify_zero_meter_before_auth(self, session: PumpSession) -> bool:
-        """Poll until latest DC2 face is zero, or fail closed.
+        """After RESET, only block AUTHORIZE on a *fresh* non-zero DC2.
 
-        Uses the most recent observed face (_last_dc2), not sale peaks — peaks
-        retain prior-sale highs via max() and would block every lift.
+        Retained LCD totals from the previous sale often remain in ``_last_dc2``
+        and on the face without a new zero DC2. Stale cache must not freeze
+        the hose. Fail closed only when a new DC2 frame after RESET reports
+        positive volume/amount.
         """
         addr = session.address
+        saw_fresh_nonzero = False
         for attempt in range(4):
-            latest = self._last_dc2.get(addr)
-            if latest is None:
-                vol = int(session.state.filled_volume_raw or 0)
-                amt = int(session.state.filled_amount_raw or 0)
-            else:
-                vol, amt = latest
-            if vol <= 0 and amt <= 0:
-                # Clear peaks so the next sale does not inherit prior face max().
-                session.state.filled_volume_raw = 0
-                session.state.filled_amount_raw = 0
-                session.state.sale_evidence.reset_attempt()
-                logger.info(
-                    "pre_auth_zero_baseline_confirmed",
-                    address=addr,
-                    attempt=attempt,
-                    volumeMinorUnits=vol,
-                    amountMinorUnits=amt,
-                )
-                return True
-            logger.info(
-                "pre_auth_waiting_zero_baseline",
-                address=addr,
-                attempt=attempt,
-                volumeMinorUnits=vol,
-                amountMinorUnits=amt,
-            )
+            before = self._last_dc2.get(addr)
             _ws, _wc = await self._write_frame(
                 session.build_poll(), address=addr, note="POLL_PRE_AUTH_ZERO"
             )
             await self._read_poll_session(session, not_before_mono=_ws)
             self._report_observed_changes(session)
+            after = self._last_dc2.get(addr)
+            if after is not None and after != before:
+                vol, amt = after
+                if vol <= 0 and amt <= 0:
+                    session.state.filled_volume_raw = 0
+                    session.state.filled_amount_raw = 0
+                    session.state.sale_evidence.reset_attempt()
+                    logger.info(
+                        "pre_auth_zero_baseline_confirmed",
+                        address=addr,
+                        attempt=attempt,
+                        volumeMinorUnits=vol,
+                        amountMinorUnits=amt,
+                        reason="fresh_zero_dc2",
+                    )
+                    return True
+                if vol > 0 or amt > 0:
+                    saw_fresh_nonzero = True
+                    logger.info(
+                        "pre_auth_waiting_zero_baseline",
+                        address=addr,
+                        attempt=attempt,
+                        volumeMinorUnits=vol,
+                        amountMinorUnits=amt,
+                        reason="fresh_nonzero_dc2",
+                    )
+            else:
+                logger.info(
+                    "pre_auth_waiting_zero_baseline",
+                    address=addr,
+                    attempt=attempt,
+                    volumeMinorUnits=(after or (None, None))[0],
+                    amountMinorUnits=(after or (None, None))[1],
+                    reason="no_fresh_dc2_after_reset",
+                )
             if self._bus_delays_enabled():
                 await asyncio.sleep(0.05)
-        latest = self._last_dc2.get(addr, (1, 1))
-        return latest[0] <= 0 and latest[1] <= 0
+        if saw_fresh_nonzero:
+            return False
+        session.state.filled_volume_raw = 0
+        session.state.filled_amount_raw = 0
+        session.state.sale_evidence.reset_attempt()
+        logger.info(
+            "pre_auth_zero_baseline_confirmed",
+            address=addr,
+            volumeMinorUnits=0,
+            amountMinorUnits=0,
+            reason="reset_without_fresh_nonzero_dc2",
+        )
+        return True
 
     async def _run_owned_command(
         self,
