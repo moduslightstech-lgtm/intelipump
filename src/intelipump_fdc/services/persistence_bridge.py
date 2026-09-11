@@ -56,6 +56,7 @@ class PersistenceBridge:
         automatic_transaction_publishing: bool = False,
         mqtt_pump_by_address: dict[int, str] | None = None,
         mqtt_nozzle_by_address: dict[int, str] | None = None,
+        mqtt_source_by_address: dict[int, str] | None = None,
     ) -> None:
         self._factory = session_factory
         self._station_id = station_id
@@ -66,11 +67,34 @@ class PersistenceBridge:
         self._logical_by_address = logical_by_address
         self._mqtt_pump_by_address = mqtt_pump_by_address or dict(logical_by_address)
         self._mqtt_nozzle_by_address = mqtt_nozzle_by_address or {}
+        self._mqtt_source_by_address = mqtt_source_by_address or {
+            a: f"pump-{a}" for a in logical_by_address
+        }
         self._events = events
         self._live = live_broker
         self._fill_book = fill_book
         self._auto_publish_sales = automatic_transaction_publishing
         self._tx_by_address: dict[int, str] = {}
+
+    def _channel_identity(self, address: int) -> tuple[str, str, str]:
+        """Immutable cloud identity for a DART address (pump, nozzle, source)."""
+        pump = self._mqtt_pump_by_address.get(
+            address, self._logical_by_address.get(address, f"pump-{address}")
+        )
+        nozzle = self._mqtt_nozzle_by_address.get(address) or "nozzle-1"
+        source = self._mqtt_source_by_address.get(address, f"pump-{address}")
+        return pump, nozzle, source
+
+    def _wayne_nozzle_index(self, address: int, selected: int | None) -> int | None:
+        if isinstance(selected, int):
+            return selected
+        _, nozzle, _ = self._channel_identity(address)
+        if nozzle.startswith("nozzle-"):
+            try:
+                return int(nozzle.rsplit("-", 1)[-1])
+            except ValueError:
+                return None
+        return None
 
     def attach(self) -> None:
         self._events.add_subscriber(self.on_event)
@@ -88,7 +112,60 @@ class PersistenceBridge:
         addr = self._address_for_pump_db(pump_db)
         if addr is None:
             return None
-        return self._logical_by_address.get(addr, f"pump-{addr}")
+        return self._mqtt_source_by_address.get(
+            addr, self._logical_by_address.get(addr, f"pump-{addr}")
+        )
+
+    async def _mark_controller_filling(
+        self,
+        uow: Any,
+        *,
+        address: int,
+        pump_db: str,
+        nozzle_id: int | None,
+        transaction_id: str | None,
+        previous_state: str | None,
+    ) -> None:
+        """Align SQLite controller state with a live fill so cloud-sync publishes.
+
+        Console DC1 AUTHORIZED→FILLING is ObservedStatus; the SM/states table can
+        remain DISCOVERING. Without FILLING here, LiveFillStream treats the sale
+        as retained/idle and never emits MQTT progress.
+        """
+        can_pump, can_nozzle, _ = self._channel_identity(address)
+        latest = await uow.states.latest(pump_db)
+        version = (latest.state_version + 1) if latest else 1
+        prev: PumpState | None = None
+        if previous_state:
+            try:
+                prev = PumpState(previous_state)
+            except ValueError:
+                prev = None
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump_db,
+            context=PumpContext(
+                pump_id=can_pump,
+                dart_address=address,
+                current_state=PumpState.FILLING,
+                previous_state=prev,
+                selected_nozzle=nozzle_id,
+                active_transaction_id=transaction_id,
+                communication_healthy=True,
+                state_version=version,
+            ),
+            observed_at=datetime.now(UTC),
+            enqueue_sync=False,
+        )
+        logger.info(
+            "controller_state_aligned_for_live_fill",
+            stationId=self._station_id,
+            sourceAddress=address,
+            pumpId=can_pump,
+            nozzleId=can_nozzle,
+            previousState=previous_state,
+            newState=PumpState.FILLING.value,
+            transactionId=transaction_id,
+        )
 
     async def _open_uuid(self, uow: Any, uuid: str | None) -> str | None:
         if not uuid:
@@ -105,20 +182,25 @@ class PersistenceBridge:
         pump_db: str,
         tx_uuid: str,
         nozzle_id: int | None,
+        address: int | None = None,
         raw_price: int | None = None,
         price_decimals: int | None = None,
         volume_decimals: int | None = None,
         amount_decimals: int | None = None,
     ) -> None:
+        addr = address if address is not None else self._address_for_pump_db(pump_db)
+        can_pump, can_nozzle, source = (
+            self._channel_identity(addr) if addr is not None else (None, None, None)
+        )
         await TransactionService(uow, fill_book=self._fill_book).begin(
             BeginTransactionRequest(
                 station_id=self._station_id,
                 pump_db_id=pump_db,
                 transaction_uuid=tx_uuid,
                 nozzle_id=nozzle_id,
-                canonical_pump_id=self._mqtt_pump_by_address.get(self._address_for_pump_db(pump_db)),
-                canonical_nozzle_id=self._mqtt_nozzle_by_address.get(self._address_for_pump_db(pump_db)),
-                source_identifier=self._source_for_pump_db(pump_db),
+                canonical_pump_id=can_pump,
+                canonical_nozzle_id=can_nozzle,
+                source_identifier=source or self._source_for_pump_db(pump_db),
                 raw_price=raw_price,
                 price_decimals=price_decimals,
                 volume_decimals=volume_decimals,
@@ -159,6 +241,7 @@ class PersistenceBridge:
                     pump_db=pump_db,
                     tx_uuid=candidate,
                     nozzle_id=nozzle_id,
+                    address=address,
                     raw_price=raw_price,
                     price_decimals=price_decimals,
                     volume_decimals=volume_decimals,
@@ -182,6 +265,7 @@ class PersistenceBridge:
             pump_db=pump_db,
             tx_uuid=tx_uuid,
             nozzle_id=nozzle_id,
+            address=address,
             raw_price=raw_price,
             price_decimals=price_decimals,
             volume_decimals=volume_decimals,
@@ -249,11 +333,9 @@ class PersistenceBridge:
             return
         logical = None
         nozzle_id = None
+        source_id = None
         if isinstance(event.address, int):
-            logical = self._mqtt_pump_by_address.get(
-                event.address, self._logical_by_address.get(event.address, f"pump-{event.address}")
-            )
-            nozzle_id = self._mqtt_nozzle_by_address.get(event.address)
+            logical, nozzle_id, source_id = self._channel_identity(event.address)
         mapping: dict[ControllerEventType, LiveEventType] = {
             ControllerEventType.PUMP_CONNECTED: LiveEventType.PUMP_CONNECTED,
             ControllerEventType.PUMP_DISCONNECTED: LiveEventType.PUMP_DISCONNECTED,
@@ -288,11 +370,7 @@ class PersistenceBridge:
                 "detail": event.detail,
                 **dict(detail_payload),
                 "nozzleId": nozzle_id,
-                "sourceIdentifier": (
-                    self._logical_by_address.get(event.address)
-                    if isinstance(event.address, int)
-                    else None
-                ),
+                "sourceIdentifier": source_id,
             },
             state_version=detail_payload.get("state_version")
             if isinstance(detail_payload.get("state_version"), int)
@@ -419,7 +497,10 @@ class PersistenceBridge:
             # ACTIVE row (orphaned after sidecar settle / missed STATE_CHANGED) heals.
             if new_state is PumpState.FILLING:
                 nozzle = detail_payload.get("selected_nozzle")
-                nozzle_id = nozzle if isinstance(nozzle, int) else None
+                nozzle_id = self._wayne_nozzle_index(
+                    address, nozzle if isinstance(nozzle, int) else None
+                )
+                can_pump, can_nozzle, _ = self._channel_identity(address)
                 previous = self._tx_by_address.get(address)
                 open_before = await self._open_uuid(uow, previous or active_tx_s)
                 reason = (
@@ -436,14 +517,27 @@ class PersistenceBridge:
                         nozzle_id=nozzle_id,
                         reason=reason,
                     )
+                    logger.info(
+                        "live_sale_session_opened",
+                        stationId=self._station_id,
+                        sourceAddress=address,
+                        pumpId=can_pump,
+                        nozzleId=can_nozzle,
+                        wayneNozzleIndex=nozzle_id,
+                        transactionId=tx_uuid,
+                        reason=reason,
+                        previousState=str(prev_state.value) if prev_state else None,
+                        newState=new_state.value,
+                    )
                     if self._live is not None and tx_uuid != previous:
                         self._live.publish_typed(
                             LiveEventType.TRANSACTION_CREATED,
                             station_id=self._station_id,
                             environment=self._environment,
                             simulated=self._simulated,
-                            pump_id=logical,
+                            pump_id=can_pump,
                             transaction_id=tx_uuid,
+                            payload={"nozzleId": can_nozzle},
                         )
 
             event_name = str(detail_payload.get("event") or "")
@@ -776,7 +870,11 @@ class PersistenceBridge:
             return
         nozzle = detail_payload.get("selected_nozzle")
         async with unit_of_work(self._factory) as uow:
-            nozzle_id = nozzle if isinstance(nozzle, int) else None
+            can_pump, can_nozzle, source_id = self._channel_identity(address)
+            wire_nozzle = nozzle if isinstance(nozzle, int) else None
+            # Channel-map hose for the sale row; wire nozzle for baseline keys only.
+            nozzle_id = self._wayne_nozzle_index(address, wire_nozzle)
+            baseline_nozzle_key = int(wire_nozzle if wire_nozzle is not None else 0)
             price_raw = (
                 detail_payload.get("raw_price")
                 if isinstance(detail_payload.get("raw_price"), int)
@@ -785,7 +883,7 @@ class PersistenceBridge:
             fp = sale_fingerprint(
                 station_id=self._station_id,
                 dart_address=address,
-                nozzle_id=nozzle_id,
+                nozzle_id=wire_nozzle,
                 raw_volume=raw_volume,
                 raw_amount=raw_amount,
                 raw_price=price_raw,
@@ -794,15 +892,15 @@ class PersistenceBridge:
             baseline = await uow.nozzle_baselines.get(
                 station_id=self._station_id,
                 dart_address=address,
-                nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
+                nozzle_id=baseline_nozzle_key,
             )
             if open_mapped is None and uow.nozzle_baselines.is_already_observed(baseline, fp):
                 logger.info(
                     "duplicate_transaction_ignored",
                     event_name="duplicate_transaction_ignored",
                     stationId=self._station_id,
-                    pumpId=self._logical_by_address.get(address),
-                    nozzleId=nozzle_id,
+                    pumpId=can_pump,
+                    nozzleId=can_nozzle,
                     fingerprint=fp,
                     source="startup_baseline",
                     detail="dc2_tick_suppressed",
@@ -843,8 +941,8 @@ class PersistenceBridge:
                     logger.info(
                         "dc2_tick_ignored_no_open_sale",
                         stationId=self._station_id,
-                        pumpId=self._logical_by_address.get(address),
-                        nozzleId=nozzle_id,
+                        pumpId=can_pump,
+                        nozzleId=can_nozzle,
                         fingerprint=fp,
                         source="awaiting_filling_lifecycle",
                         controllerState=state_s or None,
@@ -887,18 +985,29 @@ class PersistenceBridge:
                     ),
                     reason=open_reason,
                 )
+                if state_s != PumpState.FILLING.value:
+                    await self._mark_controller_filling(
+                        uow,
+                        address=address,
+                        pump_db=pump_db,
+                        nozzle_id=nozzle_id,
+                        transaction_id=open_mapped,
+                        previous_state=state_s or None,
+                    )
                 logger.info(
                     "live_source_event_received",
                     kind="dc2_open_sale",
                     stationId=self._station_id,
-                    pumpId=self._logical_by_address.get(address),
-                    nozzleId=nozzle_id,
+                    pumpId=can_pump,
+                    nozzleId=can_nozzle,
+                    sourceIdentifier=source_id,
                     sourceAddress=address,
-                    controllerState=state_s,
+                    controllerState=PumpState.FILLING.value,
+                    previousControllerState=state_s or None,
                     transactionId=open_mapped,
-                    amount=raw_amount,
-                    volume=raw_volume,
-                    amountScaled=round(raw_amount / 100.0, 2),
+                    amountMinorUnits=raw_amount,
+                    volumeMinorUnits=raw_volume,
+                    amount=round(raw_amount / 100.0, 2),
                     volumeLitres=round(raw_volume / 100.0, 2),
                     reason=open_reason,
                 )
@@ -926,14 +1035,15 @@ class PersistenceBridge:
                 "live_source_event_received",
                 kind="dc2_progress",
                 stationId=self._station_id,
-                pumpId=self._logical_by_address.get(address),
-                nozzleId=nozzle_id,
+                pumpId=can_pump,
+                nozzleId=can_nozzle,
+                sourceIdentifier=source_id,
                 sourceAddress=address,
                 transactionId=tx_uuid,
                 state="DISPENSING",
-                amount=raw_amount,
-                volume=raw_volume,
-                amountScaled=round(raw_amount / 100.0, 2),
+                amountMinorUnits=raw_amount,
+                volumeMinorUnits=raw_volume,
+                amount=round(raw_amount / 100.0, 2),
                 volumeLitres=round(raw_volume / 100.0, 2),
             )
             if self._live is not None:
@@ -942,9 +1052,16 @@ class PersistenceBridge:
                     station_id=self._station_id,
                     environment=self._environment,
                     simulated=self._simulated,
-                    pump_id=self._logical_by_address.get(address),
+                    pump_id=can_pump,
                     transaction_id=tx_uuid,
-                    payload={"raw_volume": raw_volume, "raw_amount": raw_amount},
+                    payload={
+                        "raw_volume": raw_volume,
+                        "raw_amount": raw_amount,
+                        "nozzleId": can_nozzle,
+                        "sourceIdentifier": source_id,
+                        "amount": round(raw_amount / 100.0, 2),
+                        "volumeLitres": round(raw_volume / 100.0, 2),
+                    },
                 )
 
     async def _handle_comm(self, payload: dict[str, Any]) -> None:

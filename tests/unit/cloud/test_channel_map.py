@@ -43,12 +43,36 @@ def test_enrich_legacy_queue_row_address_2():
     assert out["wayneNozzleIndex"] == 1
 
 
-def test_enrich_does_not_discard_unmapped_sale():
+def test_enrich_quarantines_canonical_identity_mismatch():
     mapping = parse_channel_map(US_LAB_CHANNEL_MAP, (1, 2))
-    out = enrich_transaction_payload({"pump_id": "pump-99", "amount": 100}, mapping)
-    assert out["pump_id"] == "pump-99"
-    assert out["amount"] == 100
-    assert "nozzleId" not in out
+    out = enrich_transaction_payload(
+        {
+            "transaction_uuid": "tx-lock",
+            "sourceIdentifier": "pump-2",
+            "canonical_pump_id": "pump-1",
+            "canonical_nozzle_id": "nozzle-1",
+            "pump_id": "pump-1",
+        },
+        mapping,
+    )
+    assert out.get("identityQuarantined") is True
+    assert out["canonical_nozzle_id"] == "nozzle-1"
+
+
+def test_enrich_keeps_locked_canonical_identity():
+    mapping = parse_channel_map(US_LAB_CHANNEL_MAP, (1, 2))
+    out = enrich_transaction_payload(
+        {
+            "transaction_uuid": "tx-ok",
+            "sourceIdentifier": "pump-2",
+            "canonical_pump_id": "pump-1",
+            "canonical_nozzle_id": "nozzle-2",
+        },
+        mapping,
+    )
+    assert out.get("identityQuarantined") is not True
+    assert out["pumpId"] == "pump-1"
+    assert out["nozzleId"] == "nozzle-2"
 
 
 def test_safe_mappings_keeps_us_lab_on_load_failure(monkeypatch, tmp_path):

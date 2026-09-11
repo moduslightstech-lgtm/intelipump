@@ -84,9 +84,59 @@ class SyncWorker:
             try:
                 topic, envelope, qos = self.mapper.map_record(record)
                 payload = json.dumps(envelope.to_dict(), separators=(",", ":")).encode()
+                env_dict = envelope.to_dict()
+                nested = env_dict.get("payload") if isinstance(env_dict.get("payload"), dict) else {}
+                event_id = str(
+                    env_dict.get("deduplicationKey")
+                    or record.deduplication_key
+                    or record.id
+                )
+                logger.info(
+                    "live_event_created",
+                    eventId=event_id,
+                    transactionId=env_dict.get("transactionId") or nested.get("transaction_uuid"),
+                    eventType=record.event_type,
+                    stationId=env_dict.get("stationId") or nested.get("station_id"),
+                    pumpId=env_dict.get("pumpId") or nested.get("pumpId") or nested.get("pump_id"),
+                    nozzleId=nested.get("nozzleId") or nested.get("nozzle_id"),
+                    sequence=env_dict.get("sequence"),
+                    mqttTopic=topic,
+                    durable=True,
+                    outboxId=record.id,
+                )
+                logger.info(
+                    "live_event_outbox_inserted",
+                    eventId=event_id,
+                    transactionId=env_dict.get("transactionId") or nested.get("transaction_uuid"),
+                    eventType=record.event_type,
+                    durable=True,
+                    outboxId=record.id,
+                    mqttTopic=topic,
+                )
+                logger.info(
+                    "live_event_publish_attempt",
+                    eventId=event_id,
+                    transactionId=env_dict.get("transactionId") or nested.get("transaction_uuid"),
+                    eventType=record.event_type,
+                    mqttTopic=topic,
+                    qos=qos,
+                    retain=False,
+                    outboxId=record.id,
+                )
                 result = await self.mqtt.publish(topic, payload, qos=qos, retain=False)
                 if qos > 0 and not result.acknowledged:
                     raise MqttError("publish not acknowledged")
+                logger.info(
+                    "live_event_publish_acknowledged",
+                    eventId=event_id,
+                    transactionId=env_dict.get("transactionId") or nested.get("transaction_uuid"),
+                    eventType=record.event_type,
+                    mqttTopic=topic,
+                    mqttMid=result.mid,
+                    acknowledged=result.acknowledged,
+                    qos=qos,
+                    outboxId=record.id,
+                )
                 async with unit_of_work(self.session_factory) as uow:
                     await uow.sync_queue.mark_delivered(record.id)
                 self.stats.delivered += 1

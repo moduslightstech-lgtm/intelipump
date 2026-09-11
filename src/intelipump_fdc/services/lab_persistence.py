@@ -67,6 +67,7 @@ async def start_persistence(
         mapping = safe_mappings_from_settings(get_settings(), addresses)
     mqtt_pump = {a: mapping[a].pump_id for a in addresses if a in mapping}
     mqtt_nozzle = {a: mapping[a].nozzle_id for a in addresses if a in mapping}
+    mqtt_source = {a: mapping[a].source_identifier for a in addresses if a in mapping}
     bridge = PersistenceBridge(
         session_factory=factory,
         station_id=station_id,
@@ -79,6 +80,7 @@ async def start_persistence(
         live_broker=live_broker,
         mqtt_pump_by_address=mqtt_pump or None,
         mqtt_nozzle_by_address=mqtt_nozzle or None,
+        mqtt_source_by_address=mqtt_source or None,
     )
     bridge.attach()
     return PersistenceRuntime(

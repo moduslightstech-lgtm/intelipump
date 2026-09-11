@@ -203,13 +203,18 @@ class LiveFillStream:
                     now,
                 )
                 if not filling:
+                    can_pump = tx.canonical_pump_id or logical.get(tx.pump_id)
                     logger.info(
                         "live_fill_startup_baseline_seeded",
                         transaction_id=tx.transaction_uuid,
-                        pump_id=logical.get(tx.pump_id),
+                        pump_id=can_pump,
+                        nozzle_id=tx.canonical_nozzle_id,
+                        source_identifier=tx.source_identifier,
                         controller_state=prev_state.get(tx.pump_id),
-                        amount=raw_amount,
-                        volume=raw_volume,
+                        amountMinorUnits=raw_amount,
+                        volumeMinorUnits=raw_volume,
+                        amount=round(raw_amount / 100.0, 2),
+                        volumeLitres=round(raw_volume / 100.0, 2),
                         reason="retained_or_idle_active_row",
                     )
                     continue
@@ -263,18 +268,24 @@ class LiveFillStream:
         reason: str,
     ) -> bool:
         pump_id = logical.get(tx.pump_id)
-        if not pump_id:
+        if not pump_id and not tx.canonical_pump_id:
             return False
         session_seq = self._tx_seq.get(tx.transaction_uuid, 0) + 1
         self._tx_seq[tx.transaction_uuid] = session_seq
+        amount = round(raw_amount / (10 ** _wire_decimals(tx.amount_decimals, _LAB_AMOUNT_DECIMALS)), 2)
+        volume_litres = round(
+            raw_volume / (10 ** _wire_decimals(tx.volume_decimals, _LAB_VOLUME_DECIMALS)), 2
+        )
+        locked_pump = tx.canonical_pump_id
+        locked_nozzle = tx.canonical_nozzle_id
         payload = {
             "transaction_uuid": tx.transaction_uuid,
             "station_id": tx.station_id,
-            "pump_id": tx.canonical_pump_id or pump_id,
-            "nozzle_id": (
-                tx.canonical_nozzle_id if tx.canonical_nozzle_id is not None else tx.nozzle_id
-            ),
-            "nozzleId": tx.canonical_nozzle_id,
+            "pump_id": locked_pump or pump_id,
+            "nozzle_id": locked_nozzle if locked_nozzle is not None else tx.nozzle_id,
+            "nozzleId": locked_nozzle,
+            "canonical_pump_id": locked_pump,
+            "canonical_nozzle_id": locked_nozzle,
             "sourceIdentifier": tx.source_identifier or pump_id,
             "raw_unit_price": tx.raw_price,
             "price_decimals": tx.price_decimals,
@@ -282,6 +293,8 @@ class LiveFillStream:
             "volume_decimals": _wire_decimals(tx.volume_decimals, _LAB_VOLUME_DECIMALS),
             "raw_amount": raw_amount,
             "amount_decimals": _wire_decimals(tx.amount_decimals, _LAB_AMOUNT_DECIMALS),
+            "amountMinorUnits": raw_amount,
+            "volumeMinorUnits": raw_volume,
             "started_at": tx.started_at.isoformat() if tx.started_at else None,
             "final_status": "DISPENSING",
             "status": "DISPENSING",
@@ -291,9 +304,44 @@ class LiveFillStream:
         }
         if self.channel_mappings:
             payload = enrich_transaction_payload(payload, self.channel_mappings)
+            if payload.get("identityQuarantined"):
+                logger.error(
+                    "transaction_identity_mismatch",
+                    transaction_id=tx.transaction_uuid,
+                    pump_id=payload.get("pumpId") or payload.get("pump_id"),
+                    nozzle_id=payload.get("nozzleId"),
+                    source_identifier=payload.get("sourceIdentifier"),
+                    reason="quarantined_before_publish",
+                )
+                self._tx_seq[tx.transaction_uuid] = max(session_seq - 1, 0)
+                return False
         mqtt_pump = str(payload.get("pumpId") or payload.get("pump_id") or pump_id)
         mqtt_nozzle = str(payload.get("nozzleId") or payload.get("nozzle_id") or "")
+        if locked_pump and mqtt_pump != locked_pump:
+            logger.error(
+                "transaction_identity_mismatch",
+                transaction_id=tx.transaction_uuid,
+                locked_pump=locked_pump,
+                published_pump=mqtt_pump,
+                locked_nozzle=locked_nozzle,
+                published_nozzle=mqtt_nozzle,
+            )
+            self._tx_seq[tx.transaction_uuid] = max(session_seq - 1, 0)
+            return False
+        if locked_nozzle and mqtt_nozzle and mqtt_nozzle != locked_nozzle:
+            logger.error(
+                "transaction_identity_mismatch",
+                transaction_id=tx.transaction_uuid,
+                locked_pump=locked_pump,
+                published_pump=mqtt_pump,
+                locked_nozzle=locked_nozzle,
+                published_nozzle=mqtt_nozzle,
+            )
+            self._tx_seq[tx.transaction_uuid] = max(session_seq - 1, 0)
+            return False
         self._seq += 1
+        topic = self.topics.transactions(self.station_id)
+        event_id = f"fill:{tx.transaction_uuid}:{session_seq}:{raw_volume}:{raw_amount}"
         envelope = build_envelope(
             event_type="FILLING_UPDATED",
             environment=self.environment,
@@ -301,23 +349,85 @@ class LiveFillStream:
             station_id=self.station_id,
             sequence=self._seq,
             simulated=bool(tx.simulated if tx.simulated is not None else self.simulated),
-            deduplication_key=f"fill:{tx.transaction_uuid}:{session_seq}:{raw_volume}:{raw_amount}",
+            deduplication_key=event_id,
             payload=payload,
             pump_id=mqtt_pump,
             transaction_id=tx.transaction_uuid,
             occurred_at=now.isoformat(),
         )
+        qos = qos_for_event("FILLING_UPDATED")
+        logger.info(
+            "live_event_created",
+            eventId=event_id,
+            transactionId=tx.transaction_uuid,
+            eventType="FILLING_UPDATED",
+            stationId=self.station_id,
+            pumpId=mqtt_pump,
+            nozzleId=mqtt_nozzle,
+            sequence=session_seq,
+            amountMinorUnits=raw_amount,
+            volumeMinorUnits=raw_volume,
+            amount=amount,
+            volumeLitres=volume_litres,
+            mqttTopic=topic,
+        )
+        logger.info(
+            "live_event_outbox_inserted",
+            eventId=event_id,
+            transactionId=tx.transaction_uuid,
+            eventType="FILLING_UPDATED",
+            durable=False,
+            reason="ephemeral_live_progress",
+            mqttTopic=topic,
+        )
+        logger.info(
+            "live_event_publish_attempt",
+            eventId=event_id,
+            transactionId=tx.transaction_uuid,
+            eventType="FILLING_UPDATED",
+            stationId=self.station_id,
+            pumpId=mqtt_pump,
+            nozzleId=mqtt_nozzle,
+            sequence=session_seq,
+            amount=amount,
+            volumeLitres=volume_litres,
+            mqttTopic=topic,
+            qos=qos,
+            retain=False,
+        )
         try:
-            await self.mqtt.publish(
-                self.topics.transactions(self.station_id),
+            result = await self.mqtt.publish(
+                topic,
                 json.dumps(envelope.to_dict(), separators=(",", ":")).encode(),
-                qos=qos_for_event("FILLING_UPDATED"),
+                qos=qos,
                 retain=False,
             )
         except (MqttNotConnectedError, MqttError) as exc:
-            logger.warning("live_fill_publish_failed", error=str(exc))
+            logger.warning(
+                "live_fill_publish_failed",
+                eventId=event_id,
+                transactionId=tx.transaction_uuid,
+                mqttTopic=topic,
+                error=str(exc),
+            )
             self._tx_seq[tx.transaction_uuid] = max(session_seq - 1, 0)
             return False
+        logger.info(
+            "live_event_publish_acknowledged",
+            eventId=event_id,
+            transactionId=tx.transaction_uuid,
+            eventType="FILLING_UPDATED",
+            stationId=self.station_id,
+            pumpId=mqtt_pump,
+            nozzleId=mqtt_nozzle,
+            sequence=session_seq,
+            amount=amount,
+            volumeLitres=volume_litres,
+            mqttTopic=topic,
+            mqttMid=result.mid,
+            acknowledged=result.acknowledged,
+            qos=qos,
+        )
         self._last_fill_publish[tx.transaction_uuid] = now
         logger.info(
             "live_fill_state_transition",
@@ -329,8 +439,10 @@ class LiveFillStream:
             new_state="DISPENSING",
             sequence=self._seq,
             session_sequence=session_seq,
-            volume=raw_volume,
-            amount=raw_amount,
+            amountMinorUnits=raw_amount,
+            volumeMinorUnits=raw_volume,
+            amount=amount,
+            volumeLitres=volume_litres,
             reason=reason,
         )
         return True

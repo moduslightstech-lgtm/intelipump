@@ -225,6 +225,9 @@ async def test_dc2_opens_sale_when_controller_stuck_discovering(
         pump_id_by_address={1: pump_id},
         logical_by_address={1: "pump-1"},
         events=EventBus(),
+        mqtt_pump_by_address={1: "pump-1"},
+        mqtt_nozzle_by_address={1: "nozzle-1"},
+        mqtt_source_by_address={1: "pump-1"},
     )
 
     await bridge._handle_app_decoded(
@@ -248,6 +251,11 @@ async def test_dc2_opens_sale_when_controller_stuck_discovering(
         assert len(open_rows) == 1
         assert open_rows[0].raw_amount == 11750
         assert open_rows[0].raw_volume == 10
+        snap = await uow.states.latest(pump_id)
+        assert snap is not None
+        assert snap.normalized_state == PumpState.FILLING.value
+        assert open_rows[0].canonical_pump_id == "pump-1"
+        assert open_rows[0].canonical_nozzle_id == "nozzle-1"
 
 
 @pytest.mark.asyncio

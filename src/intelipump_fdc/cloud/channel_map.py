@@ -283,12 +283,28 @@ def enrich_transaction_payload(
     hose = out.get("nozzle_id")
     if isinstance(hose, int):
         out["wayneNozzleIndex"] = hose
+    locked_pump = str(out.get("canonical_pump_id") or "").strip()
+    locked_nozzle = str(out.get("canonical_nozzle_id") or "").strip()
+    if locked_pump and locked_nozzle:
+        if locked_pump != mapping.pump_id or locked_nozzle != mapping.nozzle_id:
+            logger.error(
+                "transaction_identity_mismatch",
+                transaction_id=out.get("transactionId") or out.get("transaction_uuid"),
+                locked_pump=locked_pump,
+                locked_nozzle=locked_nozzle,
+                mapped_pump=mapping.pump_id,
+                mapped_nozzle=mapping.nozzle_id,
+                source=source,
+            )
+            out["identityQuarantined"] = True
+            return out
+    # Prefer immutable session identity when already set at sale open.
     out["sourceIdentifier"] = mapping.source_identifier
     out["source_identifier"] = mapping.source_identifier
-    out["pumpId"] = mapping.pump_id
-    out["pump_id"] = mapping.pump_id
-    out["nozzleId"] = mapping.nozzle_id
-    out["nozzle_id"] = mapping.nozzle_id
+    out["pumpId"] = locked_pump or mapping.pump_id
+    out["pump_id"] = locked_pump or mapping.pump_id
+    out["nozzleId"] = locked_nozzle or mapping.nozzle_id
+    out["nozzle_id"] = locked_nozzle or mapping.nozzle_id
     if mapping.side_id:
         out["sideId"] = mapping.side_id
         out["side_id"] = mapping.side_id
@@ -300,8 +316,8 @@ def enrich_transaction_payload(
             source_channel=source,
             received_pump=received_pump,
             received_nozzle=received_nozzle,
-            normalized_pump=mapping.pump_id,
-            normalized_nozzle=mapping.nozzle_id,
+            normalized_pump=out["pumpId"],
+            normalized_nozzle=out["nozzleId"],
             transaction_id=out.get("transactionId") or out.get("transaction_uuid"),
             accepted=True,
         )
