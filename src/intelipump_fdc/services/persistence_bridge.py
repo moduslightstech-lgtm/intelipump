@@ -909,10 +909,10 @@ class PersistenceBridge:
             if open_mapped is None:
                 # Retained COMPLETED face must not mint a sale. A live fill after
                 # AUTHORIZE often emits DC2 before DC1 FILLING / STATE_CHANGED —
-                # open from controller snapshot when the lifecycle is in progress.
-                # After restart the SM can sit in DISCOVERING while Wayne already
-                # reports FILLING (console DC1); still open on positive delivery
-                # once the fingerprint is not the startup baseline.
+                # open only when the controller snapshot is already in a live
+                # lifecycle. Positive DC2 while still DISCOVERING is quarantined
+                # (possible unintended flow / ambiguous session) — do not force
+                # FILLING or open a financial sale from that alone.
                 snap = await uow.states.latest(pump_db)
                 state_s = (snap.normalized_state or "").upper() if snap else ""
                 lifecycle_open = state_s in {
@@ -923,21 +923,26 @@ class PersistenceBridge:
                 }
                 if state_s == PumpState.AUTHORIZED.value and raw_volume <= 0:
                     lifecycle_open = False
-                stuck_discovering = state_s in {
-                    "",
-                    PumpState.DISCOVERING.value,
-                    PumpState.RESET.value,
-                    PumpState.READY.value,
-                    PumpState.FILLING_COMPLETE.value,
-                }
-                if (
-                    not lifecycle_open
-                    and stuck_discovering
-                    and raw_volume > 0
-                    and raw_amount > 0
-                ):
-                    lifecycle_open = True
                 if not lifecycle_open:
+                    logger.warning(
+                        "possible_unintended_flow",
+                        stationId=self._station_id,
+                        pumpId=can_pump,
+                        nozzleId=can_nozzle,
+                        sourceAddress=address,
+                        sourceIdentifier=source_id,
+                        controllerState=state_s or None,
+                        amountMinorUnits=raw_amount,
+                        volumeMinorUnits=raw_volume,
+                        amount=round(raw_amount / 100.0, 2),
+                        volumeLitres=round(raw_volume / 100.0, 2),
+                        fingerprint=fp,
+                        status="PENDING_REVIEW",
+                        detail=(
+                            "Positive DC2 without verified FILLING/AUTHORIZED "
+                            "lifecycle — quarantined, not published as a sale"
+                        ),
+                    )
                     logger.info(
                         "dc2_tick_ignored_no_open_sale",
                         stationId=self._station_id,
@@ -950,17 +955,7 @@ class PersistenceBridge:
                         volume=raw_volume,
                     )
                     return
-                open_reason = (
-                    "dc2_progress_while_filling"
-                    if state_s
-                    in {
-                        PumpState.FILLING.value,
-                        PumpState.AUTHORIZED.value,
-                        PumpState.NOZZLE_UP.value,
-                        PumpState.SUSPENDED.value,
-                    }
-                    else "dc2_progress_while_discovering"
-                )
+                open_reason = "dc2_progress_while_filling"
                 open_mapped = await self._ensure_open_sale(
                     uow,
                     address=address,
@@ -985,15 +980,6 @@ class PersistenceBridge:
                     ),
                     reason=open_reason,
                 )
-                if state_s != PumpState.FILLING.value:
-                    await self._mark_controller_filling(
-                        uow,
-                        address=address,
-                        pump_db=pump_db,
-                        nozzle_id=nozzle_id,
-                        transaction_id=open_mapped,
-                        previous_state=state_s or None,
-                    )
                 logger.info(
                     "live_source_event_received",
                     kind="dc2_open_sale",
@@ -1002,8 +988,7 @@ class PersistenceBridge:
                     nozzleId=can_nozzle,
                     sourceIdentifier=source_id,
                     sourceAddress=address,
-                    controllerState=PumpState.FILLING.value,
-                    previousControllerState=state_s or None,
+                    controllerState=state_s,
                     transactionId=open_mapped,
                     amountMinorUnits=raw_amount,
                     volumeMinorUnits=raw_volume,

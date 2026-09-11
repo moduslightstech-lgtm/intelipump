@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+import structlog
+
 from intelipump_fdc.controller.comm_health import (
     HealthThresholds,
     HealthTransitionLog,
@@ -53,6 +55,8 @@ from intelipump_fdc.protocol.dart.line.frame_builder import build_ack, build_dat
 from intelipump_fdc.protocol.dart.transport.base import ByteTransport
 from intelipump_fdc.simulator.config import next_sequence
 from intelipump_fdc.simulator.encoding import encode_cd1_command, encode_cd5_price_update
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -951,6 +955,7 @@ class ControllerLoop:
                         write_start_mono=write_start,
                         sequence=seq,
                         preserved=preserved,
+                        frame_is_stale=True,
                     )
                 return None
 
@@ -1061,9 +1066,30 @@ class ControllerLoop:
         write_start_mono: float | None = None,
         sequence: int | None = None,
         preserved: int = 0,
+        frame_is_stale: bool = False,
     ) -> ExchangeResult | None:
         if not self._observation_satisfies_command(session, item):
             return None
+        # Status-expecting commands must see DC1 observed after this TX.
+        # Stale DATA must not APPLICATION_CONFIRM AUTHORIZE/RESET.
+        if item.expect_status_after_tx is not None:
+            floor = command_tx_mono if command_tx_mono is not None else write_start_mono
+            if floor is None or not session.status_observed_after(
+                ObservedStatus(item.expect_status_after_tx),
+                not_before_mono=floor,
+            ):
+                logger.info(
+                    "stale_response_rejected",
+                    address=session.address,
+                    command=item.command_type.value,
+                    expected=item.expect_status_after_tx,
+                    observed=session.state.observed_status.value,
+                    frame_is_stale=frame_is_stale,
+                    last_status_time=session.state.last_status_time,
+                    command_tx_mono=command_tx_mono,
+                    reason="status_not_fresh_after_command",
+                )
+                return None
         session.note_link_ack(ack_mono=time.monotonic(), sequence=sequence)
         return ExchangeResult(
             status=ExchangeResultStatus.APPLICATION_CONFIRMED,
@@ -1089,15 +1115,11 @@ class ControllerLoop:
         for _ in range(max_polls):
             if session.status_observed_after(expected, not_before_mono=not_before_mono):
                 return True
-            if session.state.observed_status is expected:
-                return True
             _write_start, _write_complete = await self._write_frame(
                 session.build_poll(), address=session.address, note="POLL_CONFIRM"
             )
             await self._read_poll_session(session, not_before_mono=_write_start)
             if session.status_observed_after(expected, not_before_mono=not_before_mono):
-                return True
-            if session.state.observed_status is expected:
                 return True
         return False
 
@@ -1294,26 +1316,51 @@ class ControllerLoop:
 
     async def _owned_lab_authorize(self, session: PumpSession) -> None:
         addr = session.address
+        before_status = session.state.observed_status.value
+        before_noz = session.state.nozzle_position.value
         await self._drain_pending_data(session)
         if self._bus_delays_enabled():
             await asyncio.sleep(0.08)
-        if session.state.observed_status is not ObservedStatus.RESET:
+        latest = self._last_dc2.get(addr)
+        face_nonzero = bool(latest and (latest[0] > 0 or latest[1] > 0))
+        if session.state.observed_status is not ObservedStatus.RESET or face_nonzero:
             reset = await self._run_owned_command(
                 session,
                 encode_cd1_command(PumpControlCommand.RESET),
                 PumpCommand.RESET,
                 expect_status=ObservedStatus.RESET,
                 idempotency=IdempotencyClass.NON_IDEMPOTENT,
+                command_label="CD1_RESET_PRE_AUTH",
             )
             print(
                 f"[OWNED-LAB addr={addr}] pre-auth RESET "
                 f"result={reset.status.value}"
+                f"{' (clear retained face)' if face_nonzero else ''}"
             )
             if reset.status not in {
                 ExchangeResultStatus.LINK_ACKNOWLEDGED,
                 ExchangeResultStatus.APPLICATION_CONFIRMED,
             }:
                 return
+        # Require a verified zero meter face before AUTHORIZE. Non-zero after
+        # RESET means prior-sale residual or uncleared display — do not enable
+        # delivery until the face is clear (operator/tech recovery).
+        if not await self._verify_zero_meter_before_auth(session):
+            logger.warning(
+                "pre_auth_nonzero_meter",
+                address=addr,
+                volumeMinorUnits=session.state.filled_volume_raw,
+                amountMinorUnits=session.state.filled_amount_raw,
+                observedStatus=session.state.observed_status.value,
+                nozzle=session.state.nozzle_position.value,
+                detail="Unable to verify sale reset; AUTHORIZE withheld",
+            )
+            print(
+                f"[OWNED-LAB addr={addr}] AUTHORIZE withheld — "
+                f"Unable to verify sale reset "
+                f"(vol={session.state.filled_volume_raw} amt={session.state.filled_amount_raw})"
+            )
+            return
         nozzle = session.state.logical_nozzle or 1
         cd2 = build_cd2_allowed_nozzles([nozzle])
         cd2_res = await self._run_owned_command(
@@ -1321,6 +1368,7 @@ class ControllerLoop:
             cd2.application_payload,
             PumpCommand.AUTHORIZE,
             idempotency=IdempotencyClass.NON_IDEMPOTENT,
+            command_label="CD2_ALLOWED_NOZZLES",
         )
         print(f"[OWNED-LAB addr={addr}] CD2 result={cd2_res.status.value}")
         if not cd2_res.link_acknowledged:
@@ -1331,13 +1379,69 @@ class ControllerLoop:
             PumpCommand.AUTHORIZE,
             expect_status=ObservedStatus.AUTHORIZED,
             idempotency=IdempotencyClass.NON_IDEMPOTENT,
+            command_label="CD1_AUTHORIZE",
         )
         print(f"[OWNED-LAB addr={addr}] AUTHORIZE result={auth.status.value}")
+        logger.info(
+            "owned_lab_authorize_finished",
+            address=addr,
+            beforeStatus=before_status,
+            afterStatus=session.state.observed_status.value,
+            beforeNozzle=before_noz,
+            afterNozzle=session.state.nozzle_position.value,
+            authResult=auth.status.value,
+            volumeMinorUnits=session.state.filled_volume_raw,
+            amountMinorUnits=session.state.filled_amount_raw,
+        )
         if auth.status in {
             ExchangeResultStatus.LINK_ACKNOWLEDGED,
             ExchangeResultStatus.APPLICATION_CONFIRMED,
         }:
             self._auth_this_lift.add(addr)
+
+    async def _verify_zero_meter_before_auth(self, session: PumpSession) -> bool:
+        """Poll until latest DC2 face is zero, or fail closed.
+
+        Uses the most recent observed face (_last_dc2), not sale peaks — peaks
+        retain prior-sale highs via max() and would block every lift.
+        """
+        addr = session.address
+        for attempt in range(4):
+            latest = self._last_dc2.get(addr)
+            if latest is None:
+                vol = int(session.state.filled_volume_raw or 0)
+                amt = int(session.state.filled_amount_raw or 0)
+            else:
+                vol, amt = latest
+            if vol <= 0 and amt <= 0:
+                # Clear peaks so the next sale does not inherit prior face max().
+                session.state.filled_volume_raw = 0
+                session.state.filled_amount_raw = 0
+                session.state.sale_evidence.reset_attempt()
+                logger.info(
+                    "pre_auth_zero_baseline_confirmed",
+                    address=addr,
+                    attempt=attempt,
+                    volumeMinorUnits=vol,
+                    amountMinorUnits=amt,
+                )
+                return True
+            logger.info(
+                "pre_auth_waiting_zero_baseline",
+                address=addr,
+                attempt=attempt,
+                volumeMinorUnits=vol,
+                amountMinorUnits=amt,
+            )
+            _ws, _wc = await self._write_frame(
+                session.build_poll(), address=addr, note="POLL_PRE_AUTH_ZERO"
+            )
+            await self._read_poll_session(session, not_before_mono=_ws)
+            self._report_observed_changes(session)
+            if self._bus_delays_enabled():
+                await asyncio.sleep(0.05)
+        latest = self._last_dc2.get(addr, (1, 1))
+        return latest[0] <= 0 and latest[1] <= 0
 
     async def _run_owned_command(
         self,
@@ -1347,7 +1451,9 @@ class ControllerLoop:
         *,
         expect_status: ObservedStatus | None = None,
         idempotency: IdempotencyClass,
+        command_label: str | None = None,
     ) -> ExchangeResult:
+        label = command_label or command_type.value
         item = OutboundDataItem.create(
             address=session.address,
             application_payload=payload,
@@ -1372,6 +1478,18 @@ class ControllerLoop:
                 detail=",".join(decision.reasons),
             )
         self.runtime.outbound.drop_for_address(session.address)
+        logger.info(
+            "command_sent",
+            address=session.address,
+            command=label,
+            commandType=command_type.value,
+            rawHex=payload.hex(" "),
+            correlationId=item.correlation_id,
+            expectStatus=expect_status.value if expect_status else None,
+            controllerState=session.state.observed_status.value,
+            nozzleState=session.state.nozzle_position.value,
+            mono=time.monotonic(),
+        )
         try:
             self.runtime.outbound.enqueue(item, self.runtime.safety)
         except OutboundRejectedError as exc:
@@ -1382,10 +1500,45 @@ class ControllerLoop:
             )
         result = await self._maybe_send_outbound(session)
         if result is None:
+            logger.warning(
+                "command_timed_out",
+                address=session.address,
+                command=label,
+                correlationId=item.correlation_id,
+            )
             return ExchangeResult(
                 status=ExchangeResultStatus.REJECTED,
                 address=session.address,
                 detail="outbound_not_sent",
+            )
+        if result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED:
+            logger.info(
+                "command_link_acknowledged",
+                address=session.address,
+                command=label,
+                correlationId=item.correlation_id,
+                sequence=result.sequence,
+            )
+        elif result.status is ExchangeResultStatus.APPLICATION_CONFIRMED:
+            logger.info(
+                "command_application_confirmed",
+                address=session.address,
+                command=label,
+                correlationId=item.correlation_id,
+                sequence=result.sequence,
+                controllerState=session.state.observed_status.value,
+            )
+        elif result.status in {
+            ExchangeResultStatus.TIMED_OUT,
+            ExchangeResultStatus.REJECTED,
+        }:
+            logger.warning(
+                "command_timed_out" if result.status is ExchangeResultStatus.TIMED_OUT else "command_rejected",
+                address=session.address,
+                command=label,
+                correlationId=item.correlation_id,
+                detail=result.detail,
+                status=result.status.value,
             )
         return result
 

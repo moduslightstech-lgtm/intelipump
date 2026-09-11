@@ -32,7 +32,8 @@ async def test_address_2_opens_with_pump1_nozzle2_without_wayne_nozzle(
             context=PumpContext(
                 pump_id="pump-2",
                 dart_address=2,
-                current_state=PumpState.DISCOVERING,
+                current_state=PumpState.FILLING,
+                previous_state=PumpState.AUTHORIZED,
                 communication_healthy=True,
                 state_version=1,
             ),

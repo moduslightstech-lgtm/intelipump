@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime, timedelta
 
+import structlog
+
 from intelipump_fdc.controller.comm_health import HealthThresholds, HealthTransitionLog
 from intelipump_fdc.controller.sale_lifecycle import SaleLifecycle
 from intelipump_fdc.controller.session_events import (
@@ -44,6 +46,8 @@ from intelipump_fdc.state_machine.wayne_mapper import (
     MapperContext,
     map_wayne_observation,
 )
+
+logger = structlog.get_logger(__name__)
 
 # Cleared when a valid EOT/DATA proves the link is healthy again.
 # Historical counters (timeout_count, etc.) are never decremented.
@@ -609,9 +613,17 @@ class PumpSession:
             )
             self._update_observed_from_mapped(mapped, capture_mono=obs_mono)
             if self._needs_restart_reconcile:
-                self._reconcile_then_apply(mapped, raw_volume=raw_volume)
+                self._reconcile_then_apply(
+                    mapped,
+                    raw_volume=raw_volume if isinstance(raw_volume, int) else None,
+                )
             else:
-                self._apply_mapped(mapped)
+                self._apply_mapped(
+                    mapped,
+                    dispensed_volume_raw=(
+                        raw_volume if isinstance(raw_volume, int) else None
+                    ),
+                )
 
     def _update_observed_from_mapped(
         self, mapped: MappedWayneObservation, *, capture_mono: float
@@ -848,7 +860,12 @@ class PumpSession:
             )
         )
 
-    def _apply_mapped(self, mapped: MappedWayneObservation) -> None:
+    def _apply_mapped(
+        self,
+        mapped: MappedWayneObservation,
+        *,
+        dispensed_volume_raw: int | None = None,
+    ) -> None:
         if (
             mapped.completion_evidence_key
             and mapped.completion_evidence_key in self._applied_completion_keys
@@ -860,14 +877,22 @@ class PumpSession:
         }:
             self._filling_seen_this_boot = True
             self.state.sale_evidence.note_filling()
-            # New FILLING_STARTED must not keep max() peaks from the prior sale
-            # face (e.g. volume stuck at 51 while amount climbs).
+            # New FILLING_STARTED must not keep max() peaks from a prior sale
+            # face. Do not wipe meter progress that already arrived while
+            # AUTHORIZED (DC2 often precedes the FILLING DC1).
             if mapped.event is PumpEvent.FILLING_STARTED:
-                self.state.filled_volume_raw = 0
-                self.state.filled_amount_raw = 0
-                self.state.sale_evidence.reset_attempt()
+                prior = self.machine.context.current_state
+                if prior not in {
+                    PumpState.AUTHORIZED,
+                    PumpState.FILLING,
+                    PumpState.NOZZLE_UP,
+                    PumpState.SUSPENDED,
+                }:
+                    self.state.filled_volume_raw = 0
+                    self.state.filled_amount_raw = 0
+                    self.state.sale_evidence.reset_attempt()
                 self.state.sale_evidence.note_filling()
-                self.state.sale_lifecycle = SaleLifecycle.IDLE
+                self.state.sale_lifecycle = SaleLifecycle.FILLING
         # Gate sale finalize: FILLING_COMPLETED without valid evidence → no sale.
         if mapped.event is PumpEvent.FILLING_COMPLETED:
             ctx0 = self.machine.context
@@ -879,14 +904,62 @@ class PumpSession:
                 or ctx0.previous_state is PumpState.FILLING
             ):
                 self.state.sale_evidence.filling_observed = True
-            if isinstance(ctx0.dispensed_volume_raw, int) and ctx0.dispensed_volume_raw > 0:
+            # Prefer live DC2 peaks. Fall back to SM dispensed_volume_raw only when
+            # live peaks are empty (timeout finalize without a recent DC2 tick).
+            # Never max() a stale SM volume onto a non-zero live peak (42 vs 19).
+            live_vol = int(self.state.filled_volume_raw or 0)
+            live_amt = int(self.state.filled_amount_raw or 0)
+            stale_sm = ctx0.dispensed_volume_raw
+            if live_vol > 0 or live_amt > 0:
                 self.state.sale_evidence.note_dc2(
-                    volume_raw=ctx0.dispensed_volume_raw,
-                    amount_raw=max(self.state.filled_amount_raw, 1),
+                    volume_raw=live_vol if live_vol > 0 else None,
+                    amount_raw=live_amt if live_amt > 0 else None,
                 )
-                self.state.filled_volume_raw = max(
-                    self.state.filled_volume_raw, ctx0.dispensed_volume_raw
+                if (
+                    isinstance(stale_sm, int)
+                    and stale_sm > 0
+                    and live_vol > 0
+                    and stale_sm != live_vol
+                ):
+                    logger.warning(
+                        "sale_totals_inconsistent",
+                        address=self.address,
+                        reason="stale_sm_volume_ignored",
+                        liveVolumeMinorUnits=live_vol,
+                        staleSmVolumeMinorUnits=stale_sm,
+                        liveAmountMinorUnits=live_amt,
+                        unitPriceMinorUnits=self.state.unit_price_raw,
+                    )
+            elif isinstance(stale_sm, int) and stale_sm > 0:
+                self.state.sale_evidence.note_dc2(
+                    volume_raw=stale_sm,
+                    amount_raw=max(live_amt, 1) if live_amt <= 0 else live_amt,
                 )
+                self.state.filled_volume_raw = stale_sm
+            price = self.state.unit_price_raw
+            if (
+                isinstance(price, int)
+                and price > 0
+                and int(self.state.filled_volume_raw or 0) > 0
+                and int(self.state.filled_amount_raw or 0) > 0
+            ):
+                # Face price is ₦/L integer (1175). Volume/amount minor units are
+                # 2 dp: amount_raw = volume_raw * price_raw
+                # (e.g. 19 * 1175 = 22325 → ₦223.25 for 0.19 L).
+                fv = int(self.state.filled_volume_raw)
+                fa = int(self.state.filled_amount_raw)
+                expected_amt = fv * price
+                tol = max(price // 100, 1)
+                if abs(fa - expected_amt) > tol:
+                    logger.warning(
+                        "sale_totals_inconsistent",
+                        address=self.address,
+                        reason="amount_volume_price_mismatch",
+                        volumeMinorUnits=fv,
+                        amountMinorUnits=fa,
+                        unitPriceMinorUnits=price,
+                        expectedAmountMinorUnits=expected_amt,
+                    )
             may_sale, reason = self.state.sale_evidence.evaluate_filling_completed()
             self.state.sale_lifecycle = self.state.sale_evidence.lifecycle
             if not may_sale:
@@ -957,7 +1030,20 @@ class PumpSession:
         before_ctx = self.machine.context
         before = before_ctx.current_state
         was_awaiting = before_ctx.awaiting_filling_complete
-        result = self.machine.apply_mapped(mapped)
+        sm_volume = dispensed_volume_raw
+        if sm_volume is None and mapped.event in {
+            PumpEvent.FILLING_UPDATED,
+            PumpEvent.FILLING_STARTED,
+            PumpEvent.FILLING_COMPLETED,
+        }:
+            sm_volume = (
+                int(self.state.filled_volume_raw)
+                if self.state.filled_volume_raw
+                else None
+            )
+        result = self.machine.apply_mapped(
+            mapped, dispensed_volume_raw=sm_volume
+        )
         after_ctx = result.context
         after = after_ctx.current_state
         self.state.last_state = after

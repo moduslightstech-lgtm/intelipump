@@ -192,10 +192,10 @@ async def test_dc2_ticks_do_not_mint_sale_without_filling_lifecycle(
 
 
 @pytest.mark.asyncio
-async def test_dc2_opens_sale_when_controller_stuck_discovering(
+async def test_dc2_while_discovering_is_quarantined_not_opened(
     engine_factory: tuple,
 ) -> None:
-    """Restart can leave SM/SQLite in DISCOVERING while a real fill runs."""
+    """Positive DC2 while SQLite is DISCOVERING must not force a financial sale."""
     from intelipump_fdc.services.pump_state_service import PumpStateService
     from intelipump_fdc.state_machine.models import PumpContext
 
@@ -248,14 +248,10 @@ async def test_dc2_opens_sale_when_controller_stuck_discovering(
 
     async with unit_of_work(factory) as uow:
         open_rows = await uow.transactions.list_unresolved(station_id=STATION)
-        assert len(open_rows) == 1
-        assert open_rows[0].raw_amount == 11750
-        assert open_rows[0].raw_volume == 10
+        assert len(open_rows) == 0
         snap = await uow.states.latest(pump_id)
         assert snap is not None
-        assert snap.normalized_state == PumpState.FILLING.value
-        assert open_rows[0].canonical_pump_id == "pump-1"
-        assert open_rows[0].canonical_nozzle_id == "nozzle-1"
+        assert snap.normalized_state == PumpState.DISCOVERING.value
 
 
 @pytest.mark.asyncio
