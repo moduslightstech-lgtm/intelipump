@@ -154,8 +154,8 @@ def test_outstanding_request_resolves_dc1() -> None:
     assert mapped.event is PumpEvent.RESET_OBSERVED
 
 
-def test_dc2_after_authorize_infers_filling_started() -> None:
-    """Post-authorize DC2 with volume must open FILLING (not only FILLING_UPDATED)."""
+def test_dc2_after_authorize_does_not_infer_filling_started() -> None:
+    """DC1 must report FILLING independently — DC2 alone never opens FILLING."""
     tx = decode_data_payload(
         bytes.fromhex("02 08 00 00 00 25 00 03 00 00")
     ).transactions[0]
@@ -167,8 +167,8 @@ def test_dc2_after_authorize_infers_filling_started() -> None:
             resolve_as_dc1=True,
         ),
     )
-    assert mapped.event is PumpEvent.FILLING_STARTED
-    assert mapped.filling_inferred_from_dc2 is True
+    assert mapped.event is PumpEvent.FILLING_UPDATED
+    assert mapped.filling_inferred_from_dc2 is False
 
 
 def test_dc2_does_not_infer_filling_from_completed_face() -> None:

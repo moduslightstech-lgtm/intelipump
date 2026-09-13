@@ -121,7 +121,13 @@ def test_cloud_sync_cli_defaults_are_publish_only() -> None:
 
 
 def test_queue_publish_filter_includes_live_fills() -> None:
-    assert PUBLISHABLE_QUEUE_EVENTS == {"TRANSACTION_COMPLETED", "FILLING_UPDATED"}
+    assert PUBLISHABLE_QUEUE_EVENTS == {
+        "TRANSACTION_COMPLETED",
+        "TRANSACTION_STARTED",
+        "FILLING_UPDATED",
+        "POSSIBLE_UNINTENDED_FLOW",
+        "CANCELLED_NO_SALE",
+    }
 
 
 def test_raw_scaled_values_remain_integers() -> None:

@@ -62,6 +62,7 @@ async def test_new_fill_mints_uuid_after_completed_sale(engine_factory: tuple) -
         events=EventBus(),
     )
     bridge._tx_by_address[2] = "tx-8000"
+    _seed_verified(bridge, address=2, pump_id="pump-2")
 
     await bridge._handle_state_changed(
         {
@@ -74,6 +75,22 @@ async def test_new_fill_mints_uuid_after_completed_sale(engine_factory: tuple) -
                 "selected_nozzle": 1,
                 "communication_healthy": True,
                 "state_version": 9,
+            },
+        }
+    )
+    # Verified sale opens on volume increase after DC1 FILLING — not FILLING alone.
+    await bridge._handle_app_decoded(
+        {
+            "address": 2,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 10,
+                "raw_amount": 11750,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+                "selected_nozzle": 1,
             },
         }
     )
@@ -100,6 +117,30 @@ def _bridge(factory, pump_id: str) -> PersistenceBridge:
         pump_id_by_address={2: pump_id},
         logical_by_address={2: "pump-2"},
         events=EventBus(),
+    )
+
+
+def _seed_verified(
+    bridge: PersistenceBridge,
+    *,
+    address: int = 2,
+    pump_id: str = "pump-2",
+    nozzle_id: str = "nozzle-1",
+    baseline: int = 0,
+) -> None:
+    """Satisfy lift ∧ authorize before FILLING/DC2 (required for verified sale)."""
+    can_pump = bridge._mqtt_pump_by_address.get(
+        address, bridge._logical_by_address.get(address, pump_id)
+    )
+    can_nozzle = bridge._mqtt_nozzle_by_address.get(address) or nozzle_id
+    bridge._verified.note_nozzle_lifted(
+        pump_id=can_pump, nozzle_id=can_nozzle, dart_address=address
+    )
+    bridge._verified.note_authorized(
+        pump_id=can_pump,
+        nozzle_id=can_nozzle,
+        dart_address=address,
+        baseline_volume_raw=baseline,
     )
 
 
@@ -290,6 +331,10 @@ async def test_dc2_opens_sale_when_controller_already_filling(
         logical_by_address={1: "pump-1"},
         events=EventBus(),
     )
+    _seed_verified(bridge, address=1, pump_id="pump-1", nozzle_id="nozzle-1")
+    bridge._verified.note_dc1_state(
+        pump_id="pump-1", nozzle_id="nozzle-1", dc1_state="FILLING", dart_address=1
+    )
 
     await bridge._handle_app_decoded(
         {
@@ -319,7 +364,7 @@ async def test_dc2_opens_sale_when_controller_already_filling(
 async def test_dc2_ticks_update_sale_opened_by_filling(
     engine_factory: tuple,
 ) -> None:
-    """Lab path: FILLING opens sale; subsequent DC2 updates that row."""
+    """Lab path: verified FILLING+volume opens sale; subsequent DC2 updates that row."""
     _engine, factory = engine_factory
     async with unit_of_work(factory) as uow:
         pump = await uow.pumps.upsert(
@@ -329,6 +374,7 @@ async def test_dc2_ticks_update_sale_opened_by_filling(
     await _completed_sale(factory, pump_id)
     bridge = _bridge(factory, pump_id)
     bridge._tx_by_address[2] = "tx-600"
+    _seed_verified(bridge, address=2, pump_id="pump-2")
 
     await bridge._handle_state_changed(
         {
@@ -341,6 +387,21 @@ async def test_dc2_ticks_update_sale_opened_by_filling(
                 "selected_nozzle": 1,
                 "communication_healthy": True,
                 "state_version": 9,
+            },
+        }
+    )
+    await bridge._handle_app_decoded(
+        {
+            "address": 2,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 10,
+                "raw_amount": 11750,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+                "selected_nozzle": 1,
             },
         }
     )
@@ -387,6 +448,7 @@ async def test_later_state_event_does_not_rebind_completed_uuid(
     await _completed_sale(factory, pump_id)
     bridge = _bridge(factory, pump_id)
     bridge._tx_by_address[2] = "tx-600"
+    _seed_verified(bridge, address=2, pump_id="pump-2")
 
     await bridge._handle_state_changed(
         {
@@ -399,6 +461,21 @@ async def test_later_state_event_does_not_rebind_completed_uuid(
                 "selected_nozzle": 1,
                 "communication_healthy": True,
                 "state_version": 9,
+            },
+        }
+    )
+    await bridge._handle_app_decoded(
+        {
+            "address": 2,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 10,
+                "raw_amount": 11750,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+                "selected_nozzle": 1,
             },
         }
     )
@@ -449,6 +526,7 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
     await _completed_sale(factory, pump_id)
     bridge = _bridge(factory, pump_id)
     bridge._tx_by_address[2] = "tx-600"
+    _seed_verified(bridge, address=2, pump_id="pump-2")
 
     await bridge._handle_state_changed(
         {
@@ -461,6 +539,21 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
                 "selected_nozzle": 1,
                 "communication_healthy": True,
                 "state_version": 9,
+            },
+        }
+    )
+    await bridge._handle_app_decoded(
+        {
+            "address": 2,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 10,
+                "raw_amount": 11750,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+                "selected_nozzle": 1,
             },
         }
     )

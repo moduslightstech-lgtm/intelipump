@@ -15,6 +15,10 @@ from intelipump_fdc.controller.session_events import (
     ControllerEventType,
     EventBus,
 )
+from intelipump_fdc.controller.verified_dispensing import (
+    VerifiedDispensingBook,
+    VerifiedPhase,
+)
 from intelipump_fdc.domain.pump_command import PumpCommand
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
@@ -75,6 +79,7 @@ class PersistenceBridge:
         self._fill_book = fill_book
         self._auto_publish_sales = automatic_transaction_publishing
         self._tx_by_address: dict[int, str] = {}
+        self._verified = VerifiedDispensingBook(station_id=station_id)
 
     def _channel_identity(self, address: int) -> tuple[str, str, str]:
         """Immutable cloud identity for a DART address (pump, nozzle, source)."""
@@ -493,52 +498,87 @@ class PersistenceBridge:
                 observed_at=datetime.now(UTC),
             )
 
-            # Entering FILLING always opens a sale. Remaining in FILLING without an
-            # ACTIVE row (orphaned after sidecar settle / missed STATE_CHANGED) heals.
+            # Entering FILLING records DC1 independently. A financial sale opens
+            # only when verified dispensing is true (lift ∧ auth ∧ FILLING ∧ volume↑).
             if new_state is PumpState.FILLING:
                 nozzle = detail_payload.get("selected_nozzle")
                 nozzle_id = self._wayne_nozzle_index(
                     address, nozzle if isinstance(nozzle, int) else None
                 )
                 can_pump, can_nozzle, _ = self._channel_identity(address)
-                previous = self._tx_by_address.get(address)
-                open_before = await self._open_uuid(uow, previous or active_tx_s)
-                reason = (
-                    "filling_started"
-                    if prev_state is not PumpState.FILLING
-                    else "heal_orphaned_filling"
+                verified = self._verified.note_dc1_state(
+                    pump_id=can_pump,
+                    nozzle_id=can_nozzle,
+                    dc1_state="FILLING",
+                    dart_address=address,
                 )
-                if open_before is None or prev_state is not PumpState.FILLING:
-                    tx_uuid = await self._ensure_open_sale(
-                        uow,
-                        address=address,
-                        pump_db=pump_db,
-                        candidate=active_tx_s,
-                        nozzle_id=nozzle_id,
-                        reason=reason,
-                    )
+                logger.info(
+                    "verified_dispensing_diagnostic",
+                    **verified.diagnostic(),
+                )
+                if verified.verified_dispensing:
+                    tx_uuid = self._verified.begin_verified_sale_if_needed(verified)
+                    if tx_uuid:
+                        previous = self._tx_by_address.get(address)
+                        open_before = await self._open_uuid(uow, previous or active_tx_s or tx_uuid)
+                        if open_before is None:
+                            opened = await self._ensure_open_sale(
+                                uow,
+                                address=address,
+                                pump_db=pump_db,
+                                candidate=tx_uuid,
+                                nozzle_id=nozzle_id,
+                                reason="verified_dispensing_started",
+                            )
+                            self._tx_by_address[address] = opened
+                            verified.transaction_id = opened
+                            logger.info(
+                                "live_sale_session_opened",
+                                stationId=self._station_id,
+                                sourceAddress=address,
+                                pumpId=can_pump,
+                                nozzleId=can_nozzle,
+                                wayneNozzleIndex=nozzle_id,
+                                transactionId=opened,
+                                reason="verified_dispensing_started",
+                                previousState=str(prev_state.value) if prev_state else None,
+                                newState=new_state.value,
+                            )
+                else:
                     logger.info(
-                        "live_sale_session_opened",
+                        "filling_observed_awaiting_volume",
                         stationId=self._station_id,
-                        sourceAddress=address,
                         pumpId=can_pump,
                         nozzleId=can_nozzle,
-                        wayneNozzleIndex=nozzle_id,
-                        transactionId=tx_uuid,
-                        reason=reason,
-                        previousState=str(prev_state.value) if prev_state else None,
-                        newState=new_state.value,
+                        presentation=verified.presentation_status(),
+                        phase=verified.phase.value,
                     )
-                    if self._live is not None and tx_uuid != previous:
-                        self._live.publish_typed(
-                            LiveEventType.TRANSACTION_CREATED,
-                            station_id=self._station_id,
-                            environment=self._environment,
-                            simulated=self._simulated,
-                            pump_id=can_pump,
-                            transaction_id=tx_uuid,
-                            payload={"nozzleId": can_nozzle},
-                        )
+
+            if new_state is PumpState.AUTHORIZED:
+                can_pump, can_nozzle, _ = self._channel_identity(address)
+                baseline = detail_payload.get("dispensed_volume_raw")
+                verified = self._verified.note_authorized(
+                    pump_id=can_pump,
+                    nozzle_id=can_nozzle,
+                    dart_address=address,
+                    baseline_volume_raw=baseline if isinstance(baseline, int) else None,
+                )
+                self._verified.note_dc1_state(
+                    pump_id=can_pump,
+                    nozzle_id=can_nozzle,
+                    dc1_state="AUTHORIZED",
+                    dart_address=address,
+                )
+                logger.info("verified_dispensing_diagnostic", **verified.diagnostic())
+
+            if new_state is PumpState.NOZZLE_UP:
+                can_pump, can_nozzle, _ = self._channel_identity(address)
+                verified = self._verified.note_nozzle_lifted(
+                    pump_id=can_pump,
+                    nozzle_id=can_nozzle,
+                    dart_address=address,
+                )
+                logger.info("verified_dispensing_diagnostic", **verified.diagnostic())
 
             event_name = str(detail_payload.get("event") or "")
             awaiting = bool(detail_payload.get("awaiting_filling_complete"))
@@ -620,7 +660,10 @@ class PersistenceBridge:
                 sale_lifecycle = detail_payload.get("sale_lifecycle")
                 suppress = (
                     may_publish is False
-                    or sale_lifecycle == "ABORTED_NO_DELIVERY"
+                    or sale_lifecycle in {
+                        "ABORTED_NO_DELIVERY",
+                        "CANCELLED_NO_SALE",
+                    }
                     or event_name == "SALE_SUPPRESSED"
                     or (
                         may_publish is True
@@ -628,16 +671,31 @@ class PersistenceBridge:
                         and amt_raw <= 0
                     )
                 )
+                can_pump, can_nozzle, _ = self._channel_identity(address)
+                returned = self._verified.note_nozzle_returned(
+                    pump_id=can_pump,
+                    nozzle_id=can_nozzle,
+                    dart_address=address,
+                )
+                logger.info("verified_dispensing_diagnostic", **returned.diagnostic())
+                if returned.phase is VerifiedPhase.CANCELLED_NO_SALE or (
+                    not returned.verified_dispensing
+                    and returned.transaction_id is None
+                    and not returned.possible_unintended_flow
+                ):
+                    suppress = True
                 if suppress:
                     await uow.audit.append(
                         actor="controller",
                         source="state_machine",
-                        action="SALE_SUPPRESSED_NO_DELIVERY",
+                        action="CANCELLED_NO_SALE"
+                        if returned.phase is VerifiedPhase.CANCELLED_NO_SALE
+                        else "SALE_SUPPRESSED_NO_DELIVERY",
                         station_id=self._station_id,
                         pump_id=pump_db,
                         previous_state=str(prev_state_s) if prev_state_s else None,
                         resulting_state=new_state_s,
-                        result="ABORTED_NO_DELIVERY",
+                        result=returned.phase.value,
                         details={
                             "active_transaction_id": active_tx_s,
                             "sale_lifecycle": sale_lifecycle,
@@ -645,8 +703,24 @@ class PersistenceBridge:
                             "filled_amount_raw": amt_raw,
                             "may_publish_sale": may_publish,
                             "warnings": list(warn_tuple),
+                            "verified": returned.diagnostic(),
                         },
                     )
+                    if self._auto_publish_sales and returned.phase is VerifiedPhase.CANCELLED_NO_SALE:
+                        await uow.sync_queue.enqueue(
+                            entity_type="nozzle",
+                            entity_id=f"{can_pump}:{can_nozzle}",
+                            event_type="CANCELLED_NO_SALE",
+                            deduplication_key=(
+                                f"cancel:{self._station_id}:{can_pump}:{can_nozzle}:"
+                                f"{returned.completed_at.isoformat() if returned.completed_at else 'x'}"
+                            ),
+                            payload={
+                                **returned.diagnostic(),
+                                "status": "CANCELLED_NO_SALE",
+                                "includeInFinancialTotals": False,
+                            },
+                        )
                     return
                 if not awaiting:
                     nozzle = detail_payload.get("selected_nozzle")
@@ -970,23 +1044,61 @@ class PersistenceBridge:
                 )
                 return
             if open_mapped is None:
-                # Retained COMPLETED face must not mint a sale. A live fill after
-                # AUTHORIZE often emits DC2 before DC1 FILLING / STATE_CHANGED —
-                # open only when the controller snapshot is already in a live
-                # lifecycle. Positive DC2 while still DISCOVERING is quarantined
-                # (possible unintended flow / ambiguous session) — do not force
-                # FILLING or open a financial sale from that alone.
+                # Verified dispensing only: lift ∧ authorize ∧ DC1 FILLING ∧ volume↑.
+                # Positive DC2 before FILLING → POSSIBLE_UNINTENDED_FLOW (preserve,
+                # do not open a financial sale). AUTHORIZED/NOZZLE_UP without volume
+                # increase stays READY — never DISPENSING.
+                can_pump, can_nozzle, source_id = self._channel_identity(address)
                 snap = await uow.states.latest(pump_db)
                 state_s = (snap.normalized_state or "").upper() if snap else ""
-                lifecycle_open = state_s in {
-                    PumpState.FILLING.value,
-                    PumpState.AUTHORIZED.value,
-                    PumpState.NOZZLE_UP.value,
-                    PumpState.SUSPENDED.value,
-                }
-                if state_s == PumpState.AUTHORIZED.value and raw_volume <= 0:
-                    lifecycle_open = False
-                if not lifecycle_open:
+                verified = self._verified.note_volume(
+                    pump_id=can_pump,
+                    nozzle_id=can_nozzle,
+                    volume_raw=raw_volume,
+                    amount_raw=raw_amount,
+                    dart_address=address,
+                    raw_frame=str(detail_payload.get("source_frame_ref") or "") or None,
+                )
+                if state_s == "FILLING" or verified.dc1_state == "FILLING":
+                    verified = self._verified.note_dc1_state(
+                        pump_id=can_pump,
+                        nozzle_id=can_nozzle,
+                        dc1_state="FILLING",
+                        dart_address=address,
+                    )
+                logger.info("verified_dispensing_diagnostic", **verified.diagnostic())
+
+                if verified.possible_unintended_flow and not verified.verified_dispensing:
+                    await uow.audit.append(
+                        actor="controller",
+                        source="verified_dispensing",
+                        action="POSSIBLE_UNINTENDED_FLOW",
+                        station_id=self._station_id,
+                        pump_id=pump_db,
+                        previous_state=state_s or None,
+                        resulting_state="POSSIBLE_UNINTENDED_FLOW",
+                        result="PENDING_REVIEW",
+                        details=verified.diagnostic(),
+                    )
+                    if self._auto_publish_sales:
+                        await uow.sync_queue.enqueue(
+                            entity_type="incident",
+                            entity_id=f"{can_pump}:{can_nozzle}",
+                            event_type="POSSIBLE_UNINTENDED_FLOW",
+                            deduplication_key=(
+                                f"unintended:{self._station_id}:{can_pump}:{can_nozzle}:"
+                                f"{raw_volume}:{raw_amount}"
+                            ),
+                            payload={
+                                **verified.diagnostic(),
+                                "status": "POSSIBLE_UNINTENDED_FLOW",
+                                "amount": round(raw_amount / 100.0, 2),
+                                "volumeLitres": round(raw_volume / 100.0, 2),
+                                "raw_volume": raw_volume,
+                                "raw_amount": raw_amount,
+                                "includeInFinancialTotals": False,
+                            },
+                        )
                     logger.warning(
                         "possible_unintended_flow",
                         stationId=self._station_id,
@@ -1002,28 +1114,34 @@ class PersistenceBridge:
                         fingerprint=fp,
                         status="PENDING_REVIEW",
                         detail=(
-                            "Positive DC2 without verified FILLING/AUTHORIZED "
-                            "lifecycle — quarantined, not published as a sale"
+                            "Volume increased without DC1 FILLING — "
+                            "quarantined, not published as a sale"
                         ),
                     )
+                    return
+
+                if not verified.verified_dispensing:
                     logger.info(
-                        "dc2_tick_ignored_no_open_sale",
+                        "dc2_tick_ignored_awaiting_verified_dispensing",
                         stationId=self._station_id,
                         pumpId=can_pump,
                         nozzleId=can_nozzle,
                         fingerprint=fp,
-                        source="awaiting_filling_lifecycle",
+                        presentation=verified.presentation_status(),
+                        phase=verified.phase.value,
                         controllerState=state_s or None,
                         amount=raw_amount,
                         volume=raw_volume,
                     )
                     return
-                open_reason = "dc2_progress_while_filling"
+
+                open_reason = "verified_dispensing"
+                tx_candidate = self._verified.begin_verified_sale_if_needed(verified)
                 open_mapped = await self._ensure_open_sale(
                     uow,
                     address=address,
                     pump_db=pump_db,
-                    candidate=None,
+                    candidate=tx_candidate,
                     nozzle_id=nozzle_id,
                     raw_price=price_raw,
                     price_decimals=(
@@ -1043,6 +1161,7 @@ class PersistenceBridge:
                     ),
                     reason=open_reason,
                 )
+                verified.transaction_id = open_mapped
                 await self._mark_controller_filling(
                     uow,
                     address=address,

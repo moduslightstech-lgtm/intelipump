@@ -513,7 +513,7 @@ def test_aborted_no_delivery_zero_volume() -> None:
     ev = SaleEvidence()
     ev.note_nozzle_out()
     ev.note_authorized(application_confirmed=True)
-    assert ev.note_nozzle_in_zero_delivery() is SaleLifecycle.ABORTED_NO_DELIVERY
+    assert ev.note_nozzle_in_zero_delivery() is SaleLifecycle.CANCELLED_NO_SALE
     may, reason = ev.evaluate_filling_completed()
     assert may is False
     assert reason == "already_aborted"

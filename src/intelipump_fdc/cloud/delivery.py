@@ -13,7 +13,15 @@ from intelipump_fdc.persistence.dto import SyncQueueRecord
 # Completed sales are durable. In-progress fills are also published so the
 # dashboard can stream volume/amount during a dispense (sidecar also polls
 # ACTIVE rows if the controller has not queued FILLING_UPDATED yet).
-PUBLISHABLE_QUEUE_EVENTS = frozenset({"TRANSACTION_COMPLETED", "FILLING_UPDATED"})
+PUBLISHABLE_QUEUE_EVENTS = frozenset(
+    {
+        "TRANSACTION_COMPLETED",
+        "TRANSACTION_STARTED",
+        "FILLING_UPDATED",
+        "POSSIBLE_UNINTENDED_FLOW",
+        "CANCELLED_NO_SALE",
+    }
+)
 
 
 class DeliveryMapper:
@@ -75,7 +83,11 @@ class DeliveryMapper:
         return topic, envelope, qos_for_event(event_type)
 
     def _topic_for(self, event_type: str, *, pump_id: str | None) -> str:
-        if event_type.startswith("TRANSACTION") or event_type == "FILLING_UPDATED":
+        if event_type.startswith("TRANSACTION") or event_type in {
+            "FILLING_UPDATED",
+            "POSSIBLE_UNINTENDED_FLOW",
+            "CANCELLED_NO_SALE",
+        }:
             return self._topics.transactions(self._station_id)
         if event_type.startswith("ALARM"):
             return self._topics.alarms(self._station_id)

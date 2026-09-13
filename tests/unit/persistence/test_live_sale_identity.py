@@ -53,6 +53,18 @@ async def test_address_2_opens_with_pump1_nozzle2_without_wayne_nozzle(
         mqtt_nozzle_by_address={2: "nozzle-2"},
         mqtt_source_by_address={2: "pump-2"},
     )
+    bridge._verified.note_nozzle_lifted(
+        pump_id="pump-1", nozzle_id="nozzle-2", dart_address=2
+    )
+    bridge._verified.note_authorized(
+        pump_id="pump-1",
+        nozzle_id="nozzle-2",
+        dart_address=2,
+        baseline_volume_raw=0,
+    )
+    bridge._verified.note_dc1_state(
+        pump_id="pump-1", nozzle_id="nozzle-2", dc1_state="FILLING", dart_address=2
+    )
 
     await bridge._handle_app_decoded(
         {
@@ -107,6 +119,15 @@ async def test_filling_state_resolves_nozzle_from_channel_map(
         mqtt_nozzle_by_address={2: "nozzle-2"},
         mqtt_source_by_address={2: "pump-2"},
     )
+    bridge._verified.note_nozzle_lifted(
+        pump_id="pump-1", nozzle_id="nozzle-2", dart_address=2
+    )
+    bridge._verified.note_authorized(
+        pump_id="pump-1",
+        nozzle_id="nozzle-2",
+        dart_address=2,
+        baseline_volume_raw=0,
+    )
 
     await bridge._handle_state_changed(
         {
@@ -117,6 +138,20 @@ async def test_filling_state_resolves_nozzle_from_channel_map(
                 "previous_state": PumpState.AUTHORIZED.value,
                 "communication_healthy": True,
                 "state_version": 3,
+            },
+        }
+    )
+    await bridge._handle_app_decoded(
+        {
+            "address": 2,
+            "is_dc2": True,
+            "payload": {
+                "raw_volume": 8,
+                "raw_amount": 9400,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
             },
         }
     )

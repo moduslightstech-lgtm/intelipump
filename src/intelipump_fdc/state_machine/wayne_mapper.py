@@ -301,44 +301,23 @@ def _map_dc2(
     obs: ObservationRef,
     ctx: MapperContext,
 ) -> MappedWayneObservation:
-    """DC2 is supporting volume/amount evidence; FILLING is primarily DC1."""
-    body = tx.decoded_body or {}
-    volume = body.get("volume") if isinstance(body.get("volume"), dict) else {}
-    vol_raw = volume.get("raw_scaled") if isinstance(volume, dict) else None
+    """DC2 is supporting volume/amount evidence only.
+
+    FILLING entry must come from DC1 independently. Never force
+    DISCOVERING/AUTHORIZED → FILLING merely because a DC2 meter value is
+    positive (retained previous-sale faces and unintended flow look the same).
+    """
     inferences = (
         "INFERENCE: TRANS 0x02 LNG=8 decoded as DC2 (VOL+AMO); "
         "maps to FILLING_UPDATED as supporting evidence. "
-        "FILLING entry remains DC1-driven.",
+        "FILLING entry remains DC1-driven — no DC2→FILLING inference.",
     )
-    warnings: tuple[str, ...] = ()
-    # After AUTHORIZE the pump often emits DC2 before the next DC1 FILLING.
-    # Infer FILLING_STARTED so the SM opens a sale and live ticks are not dropped.
-    # Do not infer from a retained COMPLETED face (status 5) or while already FILLING.
-    if (
-        ctx.current_state in {PumpState.AUTHORIZED, PumpState.NOZZLE_UP}
-        and isinstance(vol_raw, int)
-        and vol_raw > 0
-        and ctx.previous_wayne_status
-        not in {
-            int(WaynePumpStatus.FILLING),
-            int(WaynePumpStatus.FILLING_COMPLETED),
-        }
-    ):
-        return MappedWayneObservation(
-            event=PumpEvent.FILLING_STARTED,
-            observation=obs,
-            filling_inferred_from_dc2=True,
-            warnings=(
-                "DC1 FILLING not yet observed; inferring FILLING_STARTED from DC2 "
-                "volume while AUTHORIZED/NOZZLE_UP (marked inferred).",
-            ),
-            inferences=inferences,
-        )
     return MappedWayneObservation(
         event=PumpEvent.FILLING_UPDATED,
         observation=obs,
+        filling_inferred_from_dc2=False,
         inferences=inferences,
-        warnings=warnings,
+        warnings=(),
     )
 
 

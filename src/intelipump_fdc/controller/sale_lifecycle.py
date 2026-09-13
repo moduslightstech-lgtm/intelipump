@@ -17,6 +17,7 @@ class SaleLifecycle(StrEnum):
     FILLING = "FILLING"
     FILLING_COMPLETED = "FILLING_COMPLETED"
     ABORTED_NO_DELIVERY = "ABORTED_NO_DELIVERY"
+    CANCELLED_NO_SALE = "CANCELLED_NO_SALE"
     ABORTED = "ABORTED"
     CLOSED = "CLOSED"
 
@@ -76,9 +77,9 @@ class SaleEvidence:
             self.peak_amount_raw = amount_raw
 
     def note_nozzle_in_zero_delivery(self) -> SaleLifecycle:
-        """Zero-delivery lift-return → ABORTED_NO_DELIVERY (no completed sale)."""
+        """Zero-delivery lift-return → CANCELLED_NO_SALE (no completed sale)."""
         self.aborted = True
-        self.lifecycle = SaleLifecycle.ABORTED_NO_DELIVERY
+        self.lifecycle = SaleLifecycle.CANCELLED_NO_SALE
         return self.lifecycle
 
     def evaluate_filling_completed(self) -> tuple[bool, str]:
@@ -89,7 +90,10 @@ class SaleEvidence:
         FILLING_COMPLETED without FILLING never publish a sale.
         """
         self.filling_completed_observed = True
-        if self.aborted or self.lifecycle is SaleLifecycle.ABORTED_NO_DELIVERY:
+        if self.aborted or self.lifecycle in {
+            SaleLifecycle.ABORTED_NO_DELIVERY,
+            SaleLifecycle.CANCELLED_NO_SALE,
+        }:
             return False, "already_aborted"
         if self.lifecycle is SaleLifecycle.ABORTED:
             return False, "already_aborted"

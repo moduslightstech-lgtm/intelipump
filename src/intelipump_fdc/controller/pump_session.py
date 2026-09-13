@@ -689,7 +689,7 @@ class PumpSession:
                         SaleLifecycle.AUTHORIZED,
                     } and not ev.has_positive_delivery:
                         self.state.sale_evidence.note_nozzle_in_zero_delivery()
-                        self.state.sale_lifecycle = SaleLifecycle.ABORTED_NO_DELIVERY
+                        self.state.sale_lifecycle = SaleLifecycle.CANCELLED_NO_SALE
             self.state.last_nozio_time = capture_mono
             if mapped.logical_nozzle_raw is not None:
                 self.state.logical_nozzle = mapped.logical_nozzle_raw

@@ -23,6 +23,71 @@ async def _flush() -> None:
     await asyncio.sleep(0.4)
 
 
+def _seed_verified_ready(bridge, *, address: int = 1, tx: str | None = None) -> None:
+    """Lift + authorize + baseline so FILLING+volume can open a verified sale."""
+    can_pump, can_nozzle, _ = bridge._channel_identity(address)
+    bridge._verified.note_nozzle_lifted(
+        pump_id=can_pump, nozzle_id=can_nozzle, dart_address=address
+    )
+    bridge._verified.note_authorized(
+        pump_id=can_pump,
+        nozzle_id=can_nozzle,
+        dart_address=address,
+        baseline_volume_raw=0,
+    )
+    if tx:
+        state = bridge._verified.get_or_create(
+            pump_id=can_pump, nozzle_id=can_nozzle, dart_address=address
+        )
+        state.transaction_id = tx
+
+
+async def _open_verified_sale(
+    events: EventBus,
+    bridge,
+    *,
+    address: int = 1,
+    tx: str,
+) -> str:
+    _seed_verified_ready(bridge, address=address, tx=tx)
+    events.publish(
+        ControllerEvent(
+            type=ControllerEventType.STATE_CHANGED,
+            address=address,
+            detail="AUTHORIZED->FILLING",
+            payload={
+                "event": "FILLING_STARTED",
+                "previous_state": "AUTHORIZED",
+                "normalized_state": "FILLING",
+                "state_version": 2,
+                "selected_nozzle": 1,
+                "active_transaction_id": tx,
+                "communication_healthy": True,
+            },
+        )
+    )
+    await _flush()
+    events.publish(
+        ControllerEvent(
+            type=ControllerEventType.APPLICATION_TRANSACTION_DECODED,
+            address=address,
+            detail="DC2",
+            payload={
+                "raw_volume": 25,
+                "raw_amount": 30000,
+                "volume_decimals": 2,
+                "amount_decimals": 2,
+                "raw_price": 1175,
+                "price_decimals": 2,
+                "selected_nozzle": 1,
+            },
+        )
+    )
+    await _flush()
+    opened = bridge._tx_by_address.get(address) or tx
+    return opened
+
+
 @pytest.mark.asyncio
 async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> None:
     db = f"sqlite+aiosqlite:///{tmp_path / 'comp.db'}"
@@ -35,23 +100,9 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
         events=events,
     )
     try:
-        events.publish(
-            ControllerEvent(
-                type=ControllerEventType.STATE_CHANGED,
-                address=1,
-                detail="AUTHORIZED->FILLING",
-                payload={
-                    "event": "FILLING_STARTED",
-                    "previous_state": "AUTHORIZED",
-                    "normalized_state": "FILLING",
-                    "state_version": 2,
-                    "selected_nozzle": 1,
-                    "active_transaction_id": "sale-await",
-                    "communication_healthy": True,
-                },
-            )
+        sale_id = await _open_verified_sale(
+            events, persistence.bridge, address=1, tx="sale-await"
         )
-        await _flush()
 
         events.publish(
             ControllerEvent(
@@ -64,7 +115,7 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
                     "normalized_state": "FILLING_COMPLETE",
                     "state_version": 3,
                     "selected_nozzle": 1,
-                    "active_transaction_id": "sale-await",
+                    "active_transaction_id": sale_id,
                     "communication_healthy": True,
                     "awaiting_filling_complete": True,
                     "completion_evidence_key": "hang:1",
@@ -74,7 +125,7 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
         await _flush()
 
         async with unit_of_work(persistence.session_factory) as uow:
-            tx = await uow.transactions.get_by_uuid("sale-await")
+            tx = await uow.transactions.get_by_uuid(sale_id)
             assert tx is not None
             assert tx.status != "COMPLETED"
             assert await uow.transactions.count_completed(station_id=STATION) == 0
@@ -91,7 +142,7 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
                     "previous_state": "FILLING_COMPLETE",
                     "normalized_state": "FILLING_COMPLETE",
                     "state_version": 4,
-                    "active_transaction_id": "sale-await",
+                    "active_transaction_id": sale_id,
                     "communication_healthy": True,
                     "awaiting_filling_complete": False,
                     "completion_inferred": False,
@@ -111,7 +162,7 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
                     "previous_state": "FILLING_COMPLETE",
                     "normalized_state": "FILLING_COMPLETE",
                     "state_version": 5,
-                    "active_transaction_id": "sale-await",
+                    "active_transaction_id": sale_id,
                     "awaiting_filling_complete": False,
                     "completion_evidence_key": "complete:frame:5",
                 },
@@ -121,7 +172,7 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
 
         async with unit_of_work(persistence.session_factory) as uow:
             assert await uow.transactions.count_completed(station_id=STATION) == 1
-            tx = await uow.transactions.get_by_uuid("sale-await")
+            tx = await uow.transactions.get_by_uuid(sale_id)
             assert tx is not None
             assert tx.source_completion_key == "complete:frame:5"
             evs = await uow.transactions.list_events(tx.id)
@@ -158,23 +209,9 @@ async def test_inferred_completion_distinguishable(tmp_path: Path) -> None:
         events=events,
     )
     try:
-        events.publish(
-            ControllerEvent(
-                type=ControllerEventType.STATE_CHANGED,
-                address=1,
-                detail="AUTHORIZED->FILLING",
-                payload={
-                    "event": "FILLING_STARTED",
-                    "previous_state": PumpState.AUTHORIZED.value,
-                    "normalized_state": PumpState.FILLING.value,
-                    "state_version": 1,
-                    "active_transaction_id": "sale-inf",
-                    "selected_nozzle": 1,
-                    "communication_healthy": True,
-                },
-            )
+        sale_id = await _open_verified_sale(
+            events, persistence.bridge, address=1, tx="sale-inf"
         )
-        await _flush()
         events.publish(
             ControllerEvent(
                 type=ControllerEventType.STATE_CHANGED,
@@ -185,7 +222,7 @@ async def test_inferred_completion_distinguishable(tmp_path: Path) -> None:
                     "previous_state": "FILLING_COMPLETE",
                     "normalized_state": "FILLING_COMPLETE",
                     "state_version": 2,
-                    "active_transaction_id": "sale-inf",
+                    "active_transaction_id": sale_id,
                     "awaiting_filling_complete": False,
                     "completion_inferred": True,
                     "completion_evidence_key": "inferred:sale-inf:hangup-timeout",
@@ -197,7 +234,7 @@ async def test_inferred_completion_distinguishable(tmp_path: Path) -> None:
         )
         await _flush()
         async with unit_of_work(persistence.session_factory) as uow:
-            tx = await uow.transactions.get_by_uuid("sale-inf")
+            tx = await uow.transactions.get_by_uuid(sale_id)
             assert tx is not None
             assert tx.status == "COMPLETED"
             evs = await uow.transactions.list_events(tx.id)
@@ -232,29 +269,15 @@ async def test_restart_already_completed_does_not_republish(tmp_path: Path) -> N
         events=events,
     )
     try:
-        events.publish(
-            ControllerEvent(
-                type=ControllerEventType.STATE_CHANGED,
-                address=1,
-                detail="AUTHORIZED->FILLING",
-                payload={
-                    "event": "FILLING_STARTED",
-                    "previous_state": "AUTHORIZED",
-                    "normalized_state": "FILLING",
-                    "state_version": 1,
-                    "active_transaction_id": "sale-done",
-                    "selected_nozzle": 1,
-                    "communication_healthy": True,
-                },
-            )
+        sale_id = await _open_verified_sale(
+            events, persistence.bridge, address=1, tx="sale-done"
         )
-        await _flush()
         payload = {
             "event": "FILLING_COMPLETED",
             "previous_state": "FILLING",
             "normalized_state": "FILLING_COMPLETE",
             "state_version": 2,
-            "active_transaction_id": "sale-done",
+            "active_transaction_id": sale_id,
             "awaiting_filling_complete": False,
             "completion_evidence_key": "complete:sale-done",
         }

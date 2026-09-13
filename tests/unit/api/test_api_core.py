@@ -25,7 +25,7 @@ def test_health_response(api_client: TestClient) -> None:
     assert body["mode"] == "LISTEN_ONLY"
     assert body["active_commands_enabled"] is False
     assert body["database_status"] == "OK"
-    assert body["schema_version"] == 1
+    assert body["schema_version"] == 3
     assert "X-Correlation-ID" in r.headers
 
 
