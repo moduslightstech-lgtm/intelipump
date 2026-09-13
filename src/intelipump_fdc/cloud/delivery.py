@@ -66,19 +66,34 @@ class DeliveryMapper:
             payload.get("transaction_uuid") or payload.get("transaction_id")
         )
         topic = self._topic_for(event_type, pump_id=pump_id)
+        # Prefer per-transaction sessionSequence so COMPLETED continues progress
+        # (…17 → 18) instead of DeliveryMapper's process-wide 1,2,3 counter.
+        session_seq = payload.get("sessionSequence")
+        if session_seq is None:
+            session_seq = payload.get("sequence")
+        try:
+            envelope_seq = int(session_seq) if session_seq is not None else self.next_sequence()
+        except (TypeError, ValueError):
+            envelope_seq = self.next_sequence()
+        if envelope_seq <= 0:
+            envelope_seq = self.next_sequence()
         envelope = build_envelope(
             event_type=event_type,
             environment=self._environment,
             device_id=self._device_id,
             station_id=self._station_id,
-            sequence=self.next_sequence(),
+            sequence=envelope_seq,
             simulated=bool(payload.get("simulated", self._simulated)),
             deduplication_key=record.deduplication_key,
             payload=payload,
             pump_id=pump_id,
             transaction_id=transaction_id,
             correlation_id=_as_str(payload.get("correlation_id")),
-            occurred_at=_as_str(payload.get("occurred_at")),
+            occurred_at=_as_str(
+                payload.get("occurred_at")
+                or payload.get("completedAt")
+                or payload.get("completed_at")
+            ),
         )
         return topic, envelope, qos_for_event(event_type)
 

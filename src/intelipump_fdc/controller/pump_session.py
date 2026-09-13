@@ -949,7 +949,9 @@ class PumpSession:
                 fv = int(self.state.filled_volume_raw)
                 fa = int(self.state.filled_amount_raw)
                 expected_amt = fv * price
-                tol = max(price // 100, 1)
+                # Allow ±1 display litre unit of face rounding (0.29 L × 1175
+                # vs preset ₦350) — never reject a confirmed face amount.
+                tol = max(price, price // 50, 1)
                 if abs(fa - expected_amt) > tol:
                     logger.warning(
                         "sale_totals_inconsistent",

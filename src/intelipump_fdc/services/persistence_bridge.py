@@ -624,6 +624,7 @@ class PersistenceBridge:
 
             # Hang-up enters FILLING_COMPLETE while awaiting DC1 — do not
             # finalize the sale yet; keep accepting final DC2 updates.
+            # LIMIT_REACHED / FILLING_COMPLETED still finalize below.
             if (
                 new_state in {PumpState.FILLING_COMPLETE, PumpState.LIMIT_REACHED}
                 and awaiting
@@ -722,7 +723,15 @@ class PersistenceBridge:
                             },
                         )
                     return
-                if not awaiting:
+                # Authoritative FILLING_COMPLETED / LIMIT_REACHED finalize even if
+                # awaiting was stuck true (do not wait for the 90s sidecar path).
+                authoritative_complete = event_name in {
+                    PumpEvent.FILLING_COMPLETED.value,
+                    PumpEvent.LIMIT_REACHED.value,
+                    "FILLING_COMPLETED",
+                    "LIMIT_REACHED",
+                }
+                if not awaiting or authoritative_complete:
                     nozzle = detail_payload.get("selected_nozzle")
                     nozzle_id = nozzle if isinstance(nozzle, int) else None
                     price_raw = detail_payload.get("filling_price_raw")
@@ -1188,7 +1197,8 @@ class PersistenceBridge:
                 )
             else:
                 # Keep SQLite aligned with the live hose even when the SM
-                # snapshot briefly reports DISCOVERING mid-sale.
+                # snapshot briefly reports DISCOVERING mid-sale. Never force
+                # FILLING over an authoritative complete/reset face.
                 snap = await uow.states.latest(pump_db)
                 state_s = (snap.normalized_state or "").upper() if snap else ""
                 if state_s not in {
@@ -1196,6 +1206,13 @@ class PersistenceBridge:
                     PumpState.AUTHORIZED.value,
                     PumpState.NOZZLE_UP.value,
                     PumpState.SUSPENDED.value,
+                    PumpState.FILLING_COMPLETE.value,
+                    PumpState.LIMIT_REACHED.value,
+                    PumpState.RESET.value,
+                    PumpState.READY.value,
+                    "IDLE",
+                    "FILLING_COMPLETED",
+                    "MAX_AMOUNT_VOLUME_REACHED",
                 }:
                     await self._mark_controller_filling(
                         uow,

@@ -159,6 +159,34 @@ class TransactionService:
                     is_final=True,
                 )
             if req.publish_completion:
+                vol_dec = (
+                    tx.volume_decimals if tx.volume_decimals is not None else 2
+                )
+                amt_dec = (
+                    tx.amount_decimals if tx.amount_decimals is not None else 2
+                )
+                price_dec = (
+                    tx.price_decimals if tx.price_decimals is not None else 2
+                )
+                raw_vol = int(tx.raw_volume or 0)
+                raw_amt = int(tx.raw_amount or 0)
+                raw_price = tx.raw_price
+                amount = round(raw_amt / (10**amt_dec), 2)
+                volume_litres = round(raw_vol / (10**vol_dec), 2)
+                price_per_litre = (
+                    round(int(raw_price) / (10**price_dec), 2)
+                    if isinstance(raw_price, int) and raw_price > 0
+                    else None
+                )
+                # Wire as decimal strings — envelope forbids float money keys.
+                amount_s = f"{amount:.2f}"
+                volume_s = f"{volume_litres:.2f}"
+                price_s = (
+                    f"{price_per_litre:.2f}" if price_per_litre is not None else None
+                )
+                completed_iso = (
+                    tx.completed_at.isoformat() if tx.completed_at else None
+                )
                 await self._uow.sync_queue.enqueue_checked(
                     entity_type="transaction",
                     entity_id=tx.transaction_uuid,
@@ -178,20 +206,24 @@ class TransactionService:
                         "raw_unit_price": tx.raw_price,
                         "price_decimals": tx.price_decimals,
                         "raw_volume": tx.raw_volume,
-                        "volume_decimals": tx.volume_decimals
-                        if tx.volume_decimals is not None
-                        else 2,
+                        "volume_decimals": vol_dec,
                         "raw_amount": tx.raw_amount,
-                        "amount_decimals": tx.amount_decimals
-                        if tx.amount_decimals is not None
-                        else 2,
+                        "amount_decimals": amt_dec,
+                        "amount": amount_s,
+                        "amountMinorUnits": raw_amt,
+                        "volumeLitres": volume_s,
+                        "volumeMinorUnits": raw_vol,
+                        "pricePerLitre": price_s,
+                        "pricePerLiter": price_s,
                         "started_at": (
                             tx.started_at.isoformat() if tx.started_at else None
                         ),
-                        "completed_at": (
-                            tx.completed_at.isoformat() if tx.completed_at else None
-                        ),
-                        "final_status": tx.status,
+                        "completed_at": completed_iso,
+                        "completedAt": completed_iso,
+                        "final_status": "COMPLETED",
+                        "status": "COMPLETED",
+                        "sessionSequence": req.session_sequence,
+                        "sequence": req.session_sequence,
                         "source_completion_key": req.source_completion_key,
                         "completion_inferred": req.completion_inferred,
                         "environment": tx.environment,

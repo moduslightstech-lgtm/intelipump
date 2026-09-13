@@ -27,12 +27,13 @@ logger = structlog.get_logger(__name__)
 # Do not auto-complete while the controller is still reporting a live fill.
 # A paused meter tick is not completion. Only age-out a truly stale FILLING snapshot.
 _LIVE_FILL_STATES = frozenset({"FILLING", "AUTHORIZED", "NOZZLE_UP", "SUSPENDED"})
-# Terminal / idle faces — safe for the short settle timer.
+# Terminal / idle faces — finalize immediately (no 90s hang).
 _SETTLE_OK_STATES = frozenset(
     {
         "FILLING_COMPLETE",
         "FILLING_COMPLETED",
         "LIMIT_REACHED",
+        "MAX_AMOUNT_VOLUME_REACHED",
         "RESET",
         "READY",
         "IDLE",
@@ -42,6 +43,8 @@ _SETTLE_OK_STATES = frozenset(
 _LIVE_STATE_MAX_AGE_SECONDS = 90.0
 # ACTIVE row updated this recently ⇒ treat as live even if snap is DISCOVERING.
 _ACTIVE_TX_RECENT_SECONDS = 30.0
+# Flat meter while snapshot still says FILLING (display-hold) — complete quickly.
+_HANGUP_FLAT_METER_SECONDS = 3.0
 # Pump face: 170 raw → 1.70 L (2 dp). Null decimals used to become 0.17 L on the cloud.
 _LAB_VOLUME_DECIMALS = 2
 _LAB_AMOUNT_DECIMALS = 2
@@ -90,10 +93,12 @@ class LiveFillStream:
     environment: str
     simulated: bool
     poll_interval_seconds: float = 1.0
-    settle_seconds: float = 4.0
-    # Hang-up often leaves Wayne snapshot as FILLING. Complete only after a long pause.
-    force_settle_seconds: float = 90.0
+    settle_seconds: float = 0.0
+    # Stuck FILLING snapshot after hang-up (display hold). Prefer immediate
+    # settle-ok; this is only a backstop when the snapshot never leaves FILLING.
+    force_settle_seconds: float = 5.0
     keepalive_seconds: float = 10.0
+    hangup_flat_meter_seconds: float = _HANGUP_FLAT_METER_SECONDS
     channel_mappings: dict | None = None
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
@@ -186,10 +191,10 @@ class LiveFillStream:
                 continue
             prev = self._unchanged_since.get(tx.transaction_uuid)
             filling = filling_now.get(tx.pump_id, False)
-            # Short settle only on idle/complete faces (true hang-up), or when a
+            # Short settle on idle/complete faces (true hang-up), or when a
             # twin COMPLETED already has the same totals (orphan ACTIVE after
-            # hang-up). FILLING/AUTHORIZED/DISCOVERING without a twin requires
-            # the long force timer so a DC2 gap cannot complete mid-hose.
+            # hang-up). Flat meter after progress also settles quickly even if
+            # the snapshot is stuck on FILLING (owned-lab display hold).
             state_u = (prev_state.get(tx.pump_id) or "").upper()
             allow_short = state_u in _SETTLE_OK_STATES or (
                 tx.transaction_uuid in skip_fill_pub
@@ -200,6 +205,17 @@ class LiveFillStream:
                 unchanged = (now - prev[2]).total_seconds()
                 if allow_short:
                     ready = unchanged >= self.settle_seconds
+                elif (
+                    state_u not in _LIVE_FILL_STATES
+                    and unchanged >= self.hangup_flat_meter_seconds
+                    and (
+                        tx.transaction_uuid in self._last_fill_publish
+                        or tx.transaction_uuid in self._tx_seq
+                    )
+                ):
+                    # Meter stopped and snapshot left live FILLING (e.g. DISCOVERING).
+                    ready = True
+                    allow_short = True
                 else:
                     ready = unchanged >= self.force_settle_seconds
                 if tx.transaction_uuid not in self._finalized and ready:
@@ -209,8 +225,16 @@ class LiveFillStream:
                         raw_amount,
                         dart=dart_by_pump.get(tx.pump_id),
                         controller_state=prev_state.get(tx.pump_id),
+                        reason=(
+                            "controller_terminal_state"
+                            if state_u in _SETTLE_OK_STATES
+                            else "flat_meter_after_progress"
+                        ),
                     ):
                         published += 1
+                    continue
+                # Never keepalive after hang-up / terminal face.
+                if allow_short or state_u in _SETTLE_OK_STATES:
                     continue
                 if (
                     filling
@@ -491,13 +515,22 @@ class LiveFillStream:
         *,
         dart: int | None = None,
         controller_state: str | None = None,
+        reason: str = "sidecar_settle_after_hangup",
     ) -> bool:
         """Hang-up holds DISPLAY; controller may leave the SQLite row ACTIVE.
 
         Complete it here so TRANSACTION_COMPLETED is queued without touching
-        the Wayne loop.
+        the Wayne loop. sessionSequence continues from the last progress tick.
         """
         published = False
+        session_seq = self._tx_seq.get(tx.transaction_uuid, 0) + 1
+        self._tx_seq[tx.transaction_uuid] = session_seq
+        amount = round(
+            raw_amount / (10 ** _wire_decimals(tx.amount_decimals, _LAB_AMOUNT_DECIMALS)), 2
+        )
+        volume_litres = round(
+            raw_volume / (10 ** _wire_decimals(tx.volume_decimals, _LAB_VOLUME_DECIMALS)), 2
+        )
         try:
             async with unit_of_work(self.session_factory) as uow:
                 already = await uow.transactions.find_recent_completed_same_totals(
@@ -515,8 +548,9 @@ class LiveFillStream:
                         raw_volume=raw_volume,
                         raw_amount=raw_amount,
                         completion_inferred=True,
-                        completion_warnings=("sidecar_settle_after_hangup",),
+                        completion_warnings=(reason,),
                         publish_completion=already is None,
+                        session_sequence=session_seq,
                     )
                 )
                 published = bool(newly and already is None)
@@ -551,10 +585,12 @@ class LiveFillStream:
                 transaction_id=tx.transaction_uuid,
                 previous_state=controller_state or "DISPENSING",
                 new_state="COMPLETED",
-                sequence=self._seq,
-                session_sequence=self._tx_seq.get(tx.transaction_uuid),
-                volume=raw_volume,
-                amount=raw_amount,
-                reason="sidecar_settle_after_hangup",
+                sequence=session_seq,
+                session_sequence=session_seq,
+                volumeMinorUnits=raw_volume,
+                amountMinorUnits=raw_amount,
+                amount=amount,
+                volumeLitres=volume_litres,
+                reason=reason,
             )
         return published

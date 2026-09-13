@@ -45,3 +45,5 @@ class CompleteTransactionRequest:
     completion_inferred: bool = False
     completion_warnings: tuple[str, ...] = ()
     publish_completion: bool = True
+    # Continues the live FILLING_UPDATED sessionSequence (progress N → completed N+1).
+    session_sequence: int | None = None
