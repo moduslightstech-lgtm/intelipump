@@ -156,6 +156,7 @@ sudo install -d -o root -g root -m 0755 "$ETC_DIR"
 echo "==> Writing ${ENV_DST}"
 TMP_ENV="$(mktemp)"
 sed \
+  -e "s|/home/intelipump/intelipump/intelipump-fdc|${REPO_ROOT}|g" \
   -e "s|^INTELIPUMP_DART__SERIAL_PORT=.*|INTELIPUMP_DART__SERIAL_PORT=${PORT}|" \
   -e "s|^INTELIPUMP_CONTROLLER__DEVICE_ID=.*|INTELIPUMP_CONTROLLER__DEVICE_ID=${DEVICE_ID}|" \
   -e "s|^INTELIPUMP_CONTROLLER__STATION_ID=.*|INTELIPUMP_CONTROLLER__STATION_ID=${STATION_ID}|" \

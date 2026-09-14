@@ -169,20 +169,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sale-display-hold-seconds",
         type=float,
-        default=8.0,
+        default=-1.0,
         help=(
-            "After a completed sale, keep totals on the pump face for N seconds "
-            "while hung up, then RESET so the next lift AUTHORIZEs quickly "
-            "(default 8). Use 0 to RESET as soon as hung. "
-            "Ignored when --hold-display-until-lift is set."
+            "After a completed sale, keep totals on the pump face. "
+            "Default -1 = until next nozzle lift (RESET on lift). "
+            "Use N>=0 to hold N seconds then RESET while hung (faster next "
+            "AUTHORIZE, clears face early). Ignored when "
+            "--hold-display-until-lift is set."
         ),
     )
     parser.add_argument(
         "--hold-display-until-lift",
         action="store_true",
         help=(
-            "Legacy: keep sale totals until the next nozzle lift (RESET runs on "
-            "lift). Delays motor start on the next sale."
+            "Keep sale totals until the next nozzle lift (same as "
+            "--sale-display-hold-seconds -1). RESET runs on lift before AUTHORIZE."
         ),
     )
     return parser
@@ -324,7 +325,7 @@ def run(argv: list[str] | None = None) -> None:
         hold_s = (
             -1.0
             if getattr(args, "hold_display_until_lift", False)
-            else float(getattr(args, "sale_display_hold_seconds", 8.0))
+            else float(getattr(args, "sale_display_hold_seconds", -1.0))
         )
         startup_price = args.price if owned else None
         price_source = "cli --price"
@@ -410,8 +411,8 @@ def run(argv: list[str] | None = None) -> None:
             f"watchdog={notifier.enabled}"
         )
         if owned:
-            hold_s = float(getattr(args, "sale_display_hold_seconds", 8.0))
-            if getattr(args, "hold_display_until_lift", False):
+            hold_s = float(getattr(args, "sale_display_hold_seconds", -1.0))
+            if getattr(args, "hold_display_until_lift", False) or hold_s < 0:
                 hold_desc = "until-next-lift (RESET on lift)"
             else:
                 hold_desc = f"{hold_s:.0f}s then RESET while hung"

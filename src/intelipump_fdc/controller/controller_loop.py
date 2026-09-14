@@ -99,11 +99,11 @@ class ControllerRuntime:
     health_transitions: HealthTransitionLog = field(default_factory=HealthTransitionLog)
     startup_unit_price: int | None = None
     logical_nozzle_count: int = 1
-    # After a completed sale with nozzle hung up, keep totals on the face for
-    # this many seconds, then RESET while still IN so the next lift can
-    # AUTHORIZE without a pre-auth RESET. Use a negative value to hold until
-    # the next lift (legacy; motor start is delayed by RESET on lift).
-    sale_display_hold_seconds: float = 8.0
+    # After a completed sale with nozzle hung up, keep totals on the face.
+    # Negative = until next lift (default for SAO / POS-like display hold).
+    # Non-negative = hold N seconds then RESET while hung (faster next-lift
+    # AUTHORIZE, but clears the face before the next lift).
+    sale_display_hold_seconds: float = -1.0
 
 
 class ControllerLoop:
@@ -1200,14 +1200,13 @@ class ControllerLoop:
             self._last_sale[addr] = life
 
     def _should_hold_sale_display(self, session: PumpSession) -> bool:
-        """Keep FILLING_COMPLETED totals on the pump briefly after hang-up.
+        """Keep FILLING_COMPLETED totals on the pump after hang-up.
 
-        Default: timed hold (``sale_display_hold_seconds``), then RESET while
-        the nozzle is still IN so the next lift can AUTHORIZE without a
-        pre-auth RESET (motor starts much sooner).
+        Default (negative ``sale_display_hold_seconds``): hold until the next
+        lift; RESET runs as part of AUTHORIZE-on-lift (face stays until lift).
 
-        Negative hold seconds = legacy hold until next lift (RESET on lift).
-        Do not hold after a zero-delivery hang-up (ABORTED_NO_DELIVERY).
+        Non-negative: timed hold, then RESET while hung for a faster next lift
+        (face clears before lift). Do not hold after zero-delivery hang-up.
         """
         if session.state.nozzle_position is not NozzlePosition.IN:
             return False
@@ -1674,6 +1673,9 @@ class ControllerLoop:
         and on the face without a new zero DC2. Stale cache must not freeze
         the hose. Fail closed only when a new DC2 frame after RESET reports
         positive volume/amount.
+
+        After display-hold RESET, Wayne usually sends no DC2 at all — do not
+        burn four polls waiting; one empty poll is enough to proceed.
         """
         addr = session.address
         saw_fresh_nonzero = False
@@ -1711,14 +1713,19 @@ class ControllerLoop:
                         reason="fresh_nonzero_dc2",
                     )
             else:
+                # No fresh DC2 after RESET (normal after display-hold). Proceed.
+                session.state.filled_volume_raw = 0
+                session.state.filled_amount_raw = 0
+                session.state.sale_evidence.reset_attempt()
                 logger.info(
-                    "pre_auth_waiting_zero_baseline",
+                    "pre_auth_zero_baseline_confirmed",
                     address=addr,
                     attempt=attempt,
-                    volumeMinorUnits=(after or (None, None))[0],
-                    amountMinorUnits=(after or (None, None))[1],
-                    reason="no_fresh_dc2_after_reset",
+                    volumeMinorUnits=0,
+                    amountMinorUnits=0,
+                    reason="reset_without_fresh_dc2",
                 )
+                return True
             if self._bus_delays_enabled():
                 await asyncio.sleep(0.05)
         if saw_fresh_nonzero:
