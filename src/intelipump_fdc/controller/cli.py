@@ -271,6 +271,9 @@ def run(argv: list[str] | None = None) -> None:
 
     async def _main() -> None:
         owned = bool(args.confirm_owned_lab_dispense_session)
+        prod_sole = bool(
+            getattr(args, "confirm_production_sole_controller_dispense", False)
+        )
         safety = ControllerSafetyContext(
             environment=settings.environment,
             mode=mode,
@@ -280,6 +283,7 @@ def run(argv: list[str] | None = None) -> None:
             and owned,
             allow_virtual_polling=True,
             owned_lab_active_session=owned,
+            production_sole_controller_session=owned and prod_sole,
         )
         # Keep default LAB helper available for tests; CLI always overrides.
         _ = default_lab_safety

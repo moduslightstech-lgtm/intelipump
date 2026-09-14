@@ -39,6 +39,8 @@ class ControllerSafetyContext:
     allow_lab_simulator_commands: bool = False
     # Explicit owned-lab physical session (CD5/RESET/AUTHORIZE). Default OFF.
     owned_lab_active_session: bool = False
+    # PRODUCTION sole pump controller (same command set as owned-lab). Default OFF.
+    production_sole_controller_session: bool = False
 
 
 def evaluate_outbound_safety(
@@ -110,13 +112,20 @@ def evaluate_outbound_safety(
     return SafetyDecision(allowed=False, reasons=tuple(dict.fromkeys(reasons)))
 
 
+def _owned_lab_environment_ok(ctx: ControllerSafetyContext) -> bool:
+    env = ctx.environment.upper()
+    if env == "LAB":
+        return True
+    return env in {"PRODUCTION", "PROD"} and ctx.production_sole_controller_session
+
+
 def _evaluate_owned_lab_active(
     item: OutboundDataItem,
     ctx: ControllerSafetyContext,
 ) -> SafetyDecision:
     """Allow a narrow command set on an explicitly confirmed owned-lab session."""
     reasons: list[str] = []
-    if ctx.environment.upper() != "LAB":
+    if not _owned_lab_environment_ok(ctx):
         reasons.append("owned_lab_requires_LAB")
     if ctx.mode is not ControllerMode.BENCH_CONTROL:
         reasons.append("owned_lab_requires_BENCH_CONTROL")

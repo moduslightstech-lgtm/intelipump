@@ -145,6 +145,49 @@ def test_owned_lab_allows_authorize_reset_price() -> None:
         assert evaluate_outbound_safety(item, ctx).allowed is True, command
 
 
+def test_production_sole_controller_allows_owned_lab_commands() -> None:
+    ctx = ControllerSafetyContext(
+        environment="PRODUCTION",
+        mode=ControllerMode.BENCH_CONTROL,
+        active_commands_enabled=True,
+        require_physical_control_enable=True,
+        physical_enable_present=True,
+        allow_virtual_polling=True,
+        owned_lab_active_session=True,
+        production_sole_controller_session=True,
+    )
+    item = OutboundDataItem.create(
+        address=1,
+        application_payload=b"\x01\x01\x00",
+        command_type=PumpCommand.READ_STATUS,
+        simulator_only=False,
+        idempotency=IdempotencyClass.IDEMPOTENT,
+    )
+    assert evaluate_outbound_safety(item, ctx).allowed is True
+
+
+def test_production_without_sole_controller_flag_blocks_owned_lab() -> None:
+    ctx = ControllerSafetyContext(
+        environment="PRODUCTION",
+        mode=ControllerMode.BENCH_CONTROL,
+        active_commands_enabled=True,
+        require_physical_control_enable=True,
+        physical_enable_present=True,
+        owned_lab_active_session=True,
+        production_sole_controller_session=False,
+    )
+    item = OutboundDataItem.create(
+        address=1,
+        application_payload=b"\x01\x01\x00",
+        command_type=PumpCommand.READ_STATUS,
+        simulator_only=False,
+        idempotency=IdempotencyClass.IDEMPOTENT,
+    )
+    decision = evaluate_outbound_safety(item, ctx)
+    assert decision.allowed is False
+    assert "owned_lab_requires_LAB" in decision.reasons
+
+
 def test_owned_lab_requires_physical_enable() -> None:
     ctx = ControllerSafetyContext(
         environment="LAB",
