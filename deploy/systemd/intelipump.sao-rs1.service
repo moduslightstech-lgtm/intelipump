@@ -47,6 +47,7 @@ ExecStart=/home/intelipump/intelipump/intelipump-fdc/.venv/bin/intelipump-contro
   --enable-active-commands \
   --confirm-physical-control-enable \
   --price 1400 \
+  --sale-display-hold-seconds 8 \
   --logical-nozzle-count 1 \
   --confirm-logical-nozzle-mapping \
   --confirm-price-scale-raw-bcd \

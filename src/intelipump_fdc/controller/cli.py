@@ -166,6 +166,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Confirm --price is raw BCD digits (not inferred decimals).",
     )
+    parser.add_argument(
+        "--sale-display-hold-seconds",
+        type=float,
+        default=8.0,
+        help=(
+            "After a completed sale, keep totals on the pump face for N seconds "
+            "while hung up, then RESET so the next lift AUTHORIZEs quickly "
+            "(default 8). Use 0 to RESET as soon as hung. "
+            "Ignored when --hold-display-until-lift is set."
+        ),
+    )
+    parser.add_argument(
+        "--hold-display-until-lift",
+        action="store_true",
+        help=(
+            "Legacy: keep sale totals until the next nozzle lift (RESET runs on "
+            "lift). Delays motor start on the next sale."
+        ),
+    )
     return parser
 
 
@@ -302,6 +321,11 @@ def run(argv: list[str] | None = None) -> None:
                 parity=SerialParity.ODD,
             )
         )
+        hold_s = (
+            -1.0
+            if getattr(args, "hold_display_until_lift", False)
+            else float(getattr(args, "sale_display_hold_seconds", 8.0))
+        )
         runtime = ControllerRuntime(
             transport=transport,
             safety=safety,
@@ -332,6 +356,7 @@ def run(argv: list[str] | None = None) -> None:
             status_interval_s=settings.watchdog.status_interval_s,
             startup_unit_price=args.price if owned else None,
             logical_nozzle_count=args.logical_nozzle_count,
+            sale_display_hold_seconds=hold_s,
         )
         loop_ctrl = ControllerLoop(runtime)
         persistence = None
@@ -376,10 +401,15 @@ def run(argv: list[str] | None = None) -> None:
             f"watchdog={notifier.enabled}"
         )
         if owned:
+            hold_s = float(getattr(args, "sale_display_hold_seconds", 8.0))
+            if getattr(args, "hold_display_until_lift", False):
+                hold_desc = "until-next-lift (RESET on lift)"
+            else:
+                hold_desc = f"{hold_s:.0f}s then RESET while hung"
             print(
                 "[OWNED-LAB] dispense session ON: CD5 "
-                f"price={args.price} hold-display-until-lift=yes "
-                "RESET-on-next-lift=yes AUTHORIZE-on-lift=yes "
+                f"price={args.price} hold-display={hold_desc} "
+                "AUTHORIZE-on-lift=yes "
                 "(this process only; not persisted)"
             )
         # READY only after config, safety, DB recovery, and serial runtime init.

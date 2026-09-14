@@ -99,6 +99,11 @@ class ControllerRuntime:
     health_transitions: HealthTransitionLog = field(default_factory=HealthTransitionLog)
     startup_unit_price: int | None = None
     logical_nozzle_count: int = 1
+    # After a completed sale with nozzle hung up, keep totals on the face for
+    # this many seconds, then RESET while still IN so the next lift can
+    # AUTHORIZE without a pre-auth RESET. Use a negative value to hold until
+    # the next lift (legacy; motor start is delayed by RESET on lift).
+    sale_display_hold_seconds: float = 8.0
 
 
 class ControllerLoop:
@@ -161,6 +166,7 @@ class ControllerLoop:
         self._last_unit_price: dict[int, int] = {}
         self._last_completed_sale: dict[int, dict[str, int | None]] = {}
         self._sale_display_held: set[int] = set()
+        self._sale_display_hold_since: dict[int, float] = {}
         self._startup_price_attempted: set[int] = set()
         self._startup_reset_attempted: set[int] = set()
         self._bus_silent_warned: set[int] = set()
@@ -1194,11 +1200,13 @@ class ControllerLoop:
             self._last_sale[addr] = life
 
     def _should_hold_sale_display(self, session: PumpSession) -> bool:
-        """Keep FILLING_COMPLETED totals on the pump until the next lift.
+        """Keep FILLING_COMPLETED totals on the pump briefly after hang-up.
 
-        Normal Wayne / ePump sequence: hang-up shows volume and amount; RESET
-        (which clears the display) runs only when the nozzle is lifted again.
-        Do not copy the working-controller immediate RESET on completion.
+        Default: timed hold (``sale_display_hold_seconds``), then RESET while
+        the nozzle is still IN so the next lift can AUTHORIZE without a
+        pre-auth RESET (motor starts much sooner).
+
+        Negative hold seconds = legacy hold until next lift (RESET on lift).
         Do not hold after a zero-delivery hang-up (ABORTED_NO_DELIVERY).
         """
         if session.state.nozzle_position is not NozzlePosition.IN:
@@ -1221,7 +1229,43 @@ class ControllerLoop:
             ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
         }:
             return False
-        return session.state.sale_evidence.has_positive_delivery
+        if not session.state.sale_evidence.has_positive_delivery:
+            return False
+        hold_s = float(self.runtime.sale_display_hold_seconds)
+        if hold_s < 0:
+            return True
+        addr = session.address
+        now = time.monotonic()
+        started = self._sale_display_hold_since.get(addr)
+        if started is None:
+            self._sale_display_hold_since[addr] = now
+            return hold_s > 0
+        return (now - started) < hold_s
+
+    async def _reset_after_sale_display_hold(self, session: PumpSession) -> None:
+        """Clear retained face while hung up so the next lift is authorize-fast."""
+        addr = session.address
+        reset = await self._run_owned_command(
+            session,
+            encode_cd1_command(PumpControlCommand.RESET),
+            PumpCommand.RESET,
+            expect_status=ObservedStatus.RESET,
+            idempotency=IdempotencyClass.NON_IDEMPOTENT,
+            command_label="CD1_RESET_AFTER_SALE_HOLD",
+        )
+        print(
+            f"[OWNED-LAB addr={addr}] post-sale RESET after display hold "
+            f"result={reset.status.value}"
+        )
+        if reset.status in {
+            ExchangeResultStatus.LINK_ACKNOWLEDGED,
+            ExchangeResultStatus.APPLICATION_CONFIRMED,
+        }:
+            self._startup_reset_done.add(addr)
+            self._last_dc2.pop(addr, None)
+            session.state.filled_volume_raw = 0
+            session.state.filled_amount_raw = 0
+            session.state.sale_evidence.reset_attempt()
 
     async def _owned_lab_tick(self, session: PumpSession) -> None:
         flags = self.runtime.feature_flags
@@ -1263,12 +1307,34 @@ class ControllerLoop:
             self._startup_reset_done.add(addr)
             if addr not in self._sale_display_held:
                 self._sale_display_held.add(addr)
-                print(
-                    f"[OWNED-LAB addr={addr}] holding pump display until next lift "
-                    "(RESET deferred)"
-                )
+                hold_s = float(self.runtime.sale_display_hold_seconds)
+                if hold_s < 0:
+                    print(
+                        f"[OWNED-LAB addr={addr}] holding pump display until next lift "
+                        "(RESET deferred)"
+                    )
+                else:
+                    print(
+                        f"[OWNED-LAB addr={addr}] holding pump display for "
+                        f"{hold_s:.0f}s then RESET while hung "
+                        "(next lift AUTHORIZE-fast)"
+                    )
             return
-        self._sale_display_held.discard(session.address)
+
+        was_holding = addr in self._sale_display_held
+        self._sale_display_held.discard(addr)
+        self._sale_display_hold_since.pop(addr, None)
+        if (
+            was_holding
+            and session.state.nozzle_position is NozzlePosition.IN
+            and session.state.observed_status
+            in {
+                ObservedStatus.FILLING_COMPLETED,
+                ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+            }
+        ):
+            await self._reset_after_sale_display_hold(session)
+            return
 
         if (
             flags.automatic_startup_price_programming

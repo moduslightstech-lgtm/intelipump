@@ -694,6 +694,7 @@ def test_hold_sale_display_until_next_lift() -> None:
             transport=ctrl,
             safety=_lab_safety(),
             config=PollSchedulerConfig(addresses=(1,)),
+            sale_display_hold_seconds=-1.0,
         )
     )
     session = loop.sessions[1]
@@ -716,6 +717,50 @@ def test_hold_sale_display_until_next_lift() -> None:
     session.state.observed_status = ObservedStatus.FILLING_COMPLETED
     session.state.sale_lifecycle = SaleLifecycle.ABORTED_NO_DELIVERY
     session.state.sale_evidence.lifecycle = SaleLifecycle.ABORTED_NO_DELIVERY
+    session.state.filled_volume_raw = 833
+    assert loop._should_hold_sale_display(session) is False
+
+
+def test_timed_sale_display_hold_expires() -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    loop = ControllerLoop(
+        ControllerRuntime(
+            transport=ctrl,
+            safety=_lab_safety(),
+            config=PollSchedulerConfig(addresses=(1,)),
+            sale_display_hold_seconds=0.05,
+        )
+    )
+    session = loop.sessions[1]
+    session.state.nozzle_position = NozzlePosition.IN
+    session.state.observed_status = ObservedStatus.FILLING_COMPLETED
+    session.state.sale_lifecycle = SaleLifecycle.FILLING_COMPLETED
+    session.state.sale_evidence.lifecycle = SaleLifecycle.FILLING_COMPLETED
+    session.state.sale_evidence.peak_volume_raw = 833
+    session.state.sale_evidence.peak_amount_raw = 100000
+    session.state.filled_volume_raw = 833
+    assert loop._should_hold_sale_display(session) is True
+    loop._sale_display_hold_since[1] = time.monotonic() - 1.0
+    assert loop._should_hold_sale_display(session) is False
+
+
+def test_zero_sale_display_hold_does_not_hold() -> None:
+    ctrl, _pump = create_memory_transport_pair()
+    loop = ControllerLoop(
+        ControllerRuntime(
+            transport=ctrl,
+            safety=_lab_safety(),
+            config=PollSchedulerConfig(addresses=(1,)),
+            sale_display_hold_seconds=0.0,
+        )
+    )
+    session = loop.sessions[1]
+    session.state.nozzle_position = NozzlePosition.IN
+    session.state.observed_status = ObservedStatus.FILLING_COMPLETED
+    session.state.sale_lifecycle = SaleLifecycle.FILLING_COMPLETED
+    session.state.sale_evidence.lifecycle = SaleLifecycle.FILLING_COMPLETED
+    session.state.sale_evidence.peak_volume_raw = 833
+    session.state.sale_evidence.peak_amount_raw = 100000
     session.state.filled_volume_raw = 833
     assert loop._should_hold_sale_display(session) is False
 
