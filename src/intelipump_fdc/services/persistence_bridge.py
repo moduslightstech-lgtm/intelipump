@@ -10,6 +10,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from intelipump_fdc.cloud.fill_throttle import FillPublishBook
+from intelipump_fdc.controller.amount_scale import coerce_amount_raw_to_2dp
 from intelipump_fdc.controller.session_events import (
     ControllerEvent,
     ControllerEventType,
@@ -963,6 +964,21 @@ class PersistenceBridge:
                 if isinstance(detail_payload.get("raw_price"), int)
                 else None
             )
+            coerced_amount = coerce_amount_raw_to_2dp(
+                volume_raw=raw_volume,
+                amount_raw=raw_amount,
+                unit_price_raw=price_raw,
+            )
+            if coerced_amount != raw_amount:
+                logger.info(
+                    "dc2_amount_scaled_to_2dp",
+                    sourceAddress=address,
+                    volumeRaw=raw_volume,
+                    wireAmountRaw=raw_amount,
+                    scaledAmountRaw=coerced_amount,
+                    unitPriceRaw=price_raw,
+                )
+                raw_amount = coerced_amount
             fp = sale_fingerprint(
                 station_id=self._station_id,
                 dart_address=address,

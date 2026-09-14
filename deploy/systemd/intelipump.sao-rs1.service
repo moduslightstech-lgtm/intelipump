@@ -1,5 +1,5 @@
 # SAO Redeemed Station 1 — sole pump controller (authorize on nozzle lift).
-# Day-1: one physical pump, DART addresses 1,2 → nozzle-1 / nozzle-2, PMS @ 1350.
+# Day-1: one physical pump, DART addresses 1,2 → nozzle-1 / nozzle-2, PMS @ 1400.
 # Remote authorization and MQTT stay off on this unit (cloud-sync publishes).
 #
 # Install via: ./scripts/install_sao_rs1_pi.sh --confirm-sao-authorize-install --start
@@ -45,7 +45,7 @@ ExecStart=/home/intelipump/intelipump/intelipump-fdc/.venv/bin/intelipump-contro
   --confirm-production-sole-controller-dispense \
   --enable-active-commands \
   --confirm-physical-control-enable \
-  --price 1350 \
+  --price 1400 \
   --logical-nozzle-count 1 \
   --confirm-logical-nozzle-mapping \
   --confirm-price-scale-raw-bcd \

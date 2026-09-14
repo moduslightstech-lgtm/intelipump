@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 
+from intelipump_fdc.controller.amount_scale import coerce_amount_raw_to_2dp
 from intelipump_fdc.controller.comm_health import HealthThresholds, HealthTransitionLog
 from intelipump_fdc.controller.sale_lifecycle import SaleLifecycle
 from intelipump_fdc.controller.session_events import (
@@ -561,6 +562,30 @@ class PumpSession:
             raw_amount = (
                 amount.get("raw_scaled") if isinstance(amount, dict) else None
             )
+            if isinstance(raw_volume, int) and isinstance(raw_amount, int):
+                price_hint = (
+                    price.get("raw_scaled")
+                    if isinstance(price, dict)
+                    and isinstance(price.get("raw_scaled"), int)
+                    else self.state.unit_price_raw
+                )
+                coerced = coerce_amount_raw_to_2dp(
+                    volume_raw=raw_volume,
+                    amount_raw=raw_amount,
+                    unit_price_raw=price_hint
+                    if isinstance(price_hint, int)
+                    else None,
+                )
+                if coerced != raw_amount:
+                    logger.info(
+                        "dc2_amount_scaled_to_2dp",
+                        address=self.address,
+                        volumeRaw=raw_volume,
+                        wireAmountRaw=raw_amount,
+                        scaledAmountRaw=coerced,
+                        unitPriceRaw=price_hint,
+                    )
+                    raw_amount = coerced
             self.events.publish(
                 ControllerEvent(
                     type=ControllerEventType.APPLICATION_TRANSACTION_DECODED,

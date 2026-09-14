@@ -19,7 +19,7 @@ CONFIRM=0
 START=0
 INSTALL_SYNC=1
 PORT="${INTELIPUMP_SERIAL_PORT:-/dev/ttyUSB0}"
-PRICE="${INTELIPUMP_UNIT_PRICE:-1350}"
+PRICE="${INTELIPUMP_UNIT_PRICE:-1400}"
 ADDRESSES="${INTELIPUMP_ADDRESSES:-1,2}"
 REPO_USER="${INTELIPUMP_RUN_USER:-intelipump}"
 STATION_ID="SAO-Redeemed-Station-1"
@@ -32,7 +32,7 @@ Install InteliPump SAO Redeemed Station 1 (authorize-on-lift, prod MQTT).
 Day-1 layout (same as US Lab):
   DART address 1 → pump-1 / nozzle-1 (PMS)
   DART address 2 → pump-1 / nozzle-2 (PMS)
-  Unit price default: 1350 (raw BCD)
+  Unit price default: 1400 (raw BCD)
 
 Required:
   --confirm-sao-authorize-install   Acknowledge sole-controller authorize install
@@ -41,7 +41,7 @@ Optional:
   --start                       enable --now controller + cloud-sync after install
   --no-cloud-sync               skip cloud-sync unit/env install
   --port PATH                   Serial device (default /dev/ttyUSB0)
-  --price N                     Raw BCD unit price (default 1350)
+  --price N                     Raw BCD unit price (default 1400)
   --addresses LIST              Pump addresses (default 1,2)
   --user NAME                   Service user (default intelipump)
   -h, --help
@@ -171,7 +171,7 @@ sed \
   -e "s|Group=intelipump|Group=${REPO_USER}|g" \
   -e "s|--port /dev/ttyUSB0|--port ${PORT}|g" \
   -e "s|--addresses 1,2|--addresses ${ADDRESSES}|g" \
-  -e "s|--price 1350|--price ${PRICE}|g" \
+  -e "s|--price 1400|--price ${PRICE}|g" \
   -e "s|InteliPump-SAO-RS1-pi-001|${DEVICE_ID}|g" \
   -e "s|SAO-Redeemed-Station-1|${STATION_ID}|g" \
   "$UNIT_SRC" >"$TMP_UNIT"
