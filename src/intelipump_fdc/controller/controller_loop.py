@@ -1447,6 +1447,7 @@ class ControllerLoop:
         from intelipump_fdc.cloud.set_price_request import (
             consume_set_price_request,
             read_set_price_request,
+            write_persisted_unit_price,
         )
 
         pending = read_set_price_request()
@@ -1478,6 +1479,7 @@ class ControllerLoop:
         self.runtime.startup_unit_price = req.unit_price_raw
         self._price_programmed.clear()
         self._startup_price_attempted.clear()
+        any_ok = False
         for addr, session in self.sessions.items():
             payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
             result = await self._run_owned_command(
@@ -1504,6 +1506,24 @@ class ControllerLoop:
                 ExchangeResultStatus.APPLICATION_CONFIRMED,
             }:
                 self._price_programmed.add(addr)
+                any_ok = True
+        if any_ok:
+            try:
+                path = write_persisted_unit_price(
+                    req.unit_price_raw,
+                    tuple(prices[:nozzle_n]),
+                    source="cloud",
+                )
+                print(
+                    f"[CLOUD-PRICE] persisted {req.unit_price_raw} → {path} "
+                    "(survives controller restart)"
+                )
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "cloud_set_price_persist_failed",
+                    unitPriceRaw=req.unit_price_raw,
+                    error=str(exc),
+                )
 
     def _refresh_arm_requests(self) -> None:
         """Load arm-<addr> files; arm persists until consumed on next lift AUTHORIZE."""

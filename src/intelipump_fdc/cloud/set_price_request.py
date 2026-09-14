@@ -17,6 +17,7 @@ import contextlib
 
 
 DEFAULT_REQUEST_NAME = "set-price-request.json"
+DEFAULT_STORED_PRICE_NAME = "unit-price.json"
 
 
 def request_dir() -> Path:
@@ -25,6 +26,10 @@ def request_dir() -> Path:
 
 def request_path() -> Path:
     return request_dir() / DEFAULT_REQUEST_NAME
+
+
+def stored_price_path() -> Path:
+    return request_dir() / DEFAULT_STORED_PRICE_NAME
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +52,14 @@ class SetPriceRequest:
             "requestedAt": self.requested_at or datetime.now(UTC).isoformat(),
             "pumpId": self.pump_id,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedUnitPrice:
+    unit_price_raw: int
+    prices_raw: tuple[int, ...]
+    source: str = "cloud"
+    updated_at: str | None = None
 
 
 def parse_prices_from_payload(payload: dict[str, Any]) -> tuple[int, tuple[int, ...]]:
@@ -81,6 +94,61 @@ def write_set_price_request(req: SetPriceRequest) -> Path:
     tmp.write_text(json.dumps(req.to_dict(), separators=(",", ":")), encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def write_persisted_unit_price(
+    unit_price_raw: int,
+    prices_raw: tuple[int, ...] | list[int] | None = None,
+    *,
+    source: str = "cloud",
+) -> Path:
+    """Persist last applied unit price so controller restart does not revert to --price."""
+    if isinstance(unit_price_raw, bool) or not isinstance(unit_price_raw, int) or unit_price_raw <= 0:
+        raise ValueError("unit_price_raw must be a positive integer")
+    prices = tuple(prices_raw) if prices_raw else (unit_price_raw,)
+    for p in prices:
+        if isinstance(p, bool) or not isinstance(p, int) or p <= 0:
+            raise ValueError("prices_raw entries must be positive integers")
+    path = stored_price_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "unitPriceRaw": unit_price_raw,
+        "pricesRaw": list(prices),
+        "source": source,
+        "updatedAt": datetime.now(UTC).isoformat(),
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def read_persisted_unit_price() -> PersistedUnitPrice | None:
+    """Load last applied unit price, if present."""
+    path = stored_price_path()
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        unit, prices = parse_prices_from_payload(
+            {
+                "unitPriceRaw": raw.get("unitPriceRaw"),
+                "pricesRaw": raw.get("pricesRaw"),
+            }
+        )
+    except ValueError:
+        return None
+    return PersistedUnitPrice(
+        unit_price_raw=unit,
+        prices_raw=prices,
+        source=str(raw.get("source") or "cloud"),
+        updated_at=str(raw["updatedAt"]) if raw.get("updatedAt") else None,
+    )
 
 
 def read_set_price_request() -> SetPriceRequest | None:

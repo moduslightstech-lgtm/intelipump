@@ -47,3 +47,22 @@ def test_write_read_consume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert got.correlation_id == "c1"
     assert not (tmp_path / "set-price-request.json").is_file()
     assert consume_set_price_request() is None
+
+
+def test_persisted_unit_price_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import (
+        read_persisted_unit_price,
+        write_persisted_unit_price,
+    )
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    assert read_persisted_unit_price() is None
+    write_persisted_unit_price(1450, (1450,), source="cloud")
+    got = read_persisted_unit_price()
+    assert got is not None
+    assert got.unit_price_raw == 1450
+    assert got.prices_raw == (1450,)
+    assert got.source == "cloud"
+    assert (tmp_path / "unit-price.json").is_file()

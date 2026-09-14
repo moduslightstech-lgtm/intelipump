@@ -326,6 +326,15 @@ def run(argv: list[str] | None = None) -> None:
             if getattr(args, "hold_display_until_lift", False)
             else float(getattr(args, "sale_display_hold_seconds", 8.0))
         )
+        startup_price = args.price if owned else None
+        price_source = "cli --price"
+        if owned:
+            from intelipump_fdc.cloud.set_price_request import read_persisted_unit_price
+
+            persisted = read_persisted_unit_price()
+            if persisted is not None:
+                startup_price = persisted.unit_price_raw
+                price_source = f"persisted ({persisted.source})"
         runtime = ControllerRuntime(
             transport=transport,
             safety=safety,
@@ -354,7 +363,7 @@ def run(argv: list[str] | None = None) -> None:
             liveness=liveness,
             notifier=notifier,
             status_interval_s=settings.watchdog.status_interval_s,
-            startup_unit_price=args.price if owned else None,
+            startup_unit_price=startup_price,
             logical_nozzle_count=args.logical_nozzle_count,
             sale_display_hold_seconds=hold_s,
         )
@@ -408,7 +417,8 @@ def run(argv: list[str] | None = None) -> None:
                 hold_desc = f"{hold_s:.0f}s then RESET while hung"
             print(
                 "[OWNED-LAB] dispense session ON: CD5 "
-                f"price={args.price} hold-display={hold_desc} "
+                f"price={startup_price} source={price_source} "
+                f"hold-display={hold_desc} "
                 "AUTHORIZE-on-lift=yes "
                 "(this process only; not persisted)"
             )
