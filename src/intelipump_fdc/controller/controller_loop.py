@@ -360,6 +360,7 @@ class ControllerLoop:
                     continue
                 if self._rx_task is None or self._rx_task.done():
                     self._start_rx_task()
+                await self._apply_pending_cloud_set_price()
                 for address in self.runtime.config.addresses:
                     if self._stop.is_set():
                         break
@@ -1372,6 +1373,71 @@ class ControllerLoop:
         return Path(
             os.environ.get("INTELIPUMP_AUTHORIZE_REQUEST_DIR", "/var/lib/intelipump")
         )
+
+    async def _apply_pending_cloud_set_price(self) -> None:
+        """Apply a cloud-queued SET_PRICE (CD5) written by intelipump-cloud-sync."""
+        if not self.runtime.safety.owned_lab_active_session:
+            return
+        from intelipump_fdc.cloud.set_price_request import (
+            consume_set_price_request,
+            read_set_price_request,
+        )
+
+        pending = read_set_price_request()
+        if pending is None:
+            return
+        # Skip while any hose is mid-dispense; leave the file for a later tick.
+        for session in self.sessions.values():
+            if session.state.observed_status in {
+                ObservedStatus.AUTHORIZED,
+                ObservedStatus.FILLING,
+                ObservedStatus.SUSPENDED,
+            }:
+                logger.info(
+                    "set_price_deferred_busy",
+                    correlationId=pending.correlation_id,
+                    unitPriceRaw=pending.unit_price_raw,
+                )
+                return
+
+        req = consume_set_price_request()
+        if req is None:
+            return
+
+        prices = list(req.prices_raw) or [req.unit_price_raw]
+        # Match startup CD5: one price per logical nozzle on each address.
+        nozzle_n = max(1, int(self.runtime.logical_nozzle_count or 1))
+        if len(prices) == 1 and nozzle_n > 1:
+            prices = prices * nozzle_n
+        self.runtime.startup_unit_price = req.unit_price_raw
+        self._price_programmed.clear()
+        self._startup_price_attempted.clear()
+        for addr, session in self.sessions.items():
+            payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
+            result = await self._run_owned_command(
+                session,
+                payload,
+                PumpCommand.SET_PRICE,
+                idempotency=IdempotencyClass.NON_IDEMPOTENT,
+                command_label="CD5_SET_PRICE_CLOUD",
+            )
+            print(
+                f"[CLOUD-PRICE addr={addr}] CD5 price {req.unit_price_raw} "
+                f"result={result.status.value} corr={req.correlation_id}"
+            )
+            logger.info(
+                "cloud_set_price_applied",
+                address=addr,
+                unitPriceRaw=req.unit_price_raw,
+                correlationId=req.correlation_id,
+                result=result.status.value,
+                requestedBy=req.requested_by,
+            )
+            if result.status in {
+                ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                ExchangeResultStatus.APPLICATION_CONFIRMED,
+            }:
+                self._price_programmed.add(addr)
 
     def _refresh_arm_requests(self) -> None:
         """Load arm-<addr> files; arm persists until consumed on next lift AUTHORIZE."""

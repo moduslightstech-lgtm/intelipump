@@ -47,7 +47,19 @@ def build_parser(settings: object | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--commands-enabled",
         action="store_true",
-        help="LAB only. Do not enable on the owned-lab Pi sidecar.",
+        help=(
+            "Subscribe to station command topic. With "
+            "--confirm-production-remote-set-price, SET_PRICE is queued for "
+            "the controller; other active commands stay evaluate-only."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-production-remote-set-price",
+        action="store_true",
+        help=(
+            "Allow MQTT SET_PRICE to write /var/lib/intelipump/set-price-request.json "
+            "for the sole pump controller to apply as CD5. Does not enable remote AUTHORIZE."
+        ),
     )
     parser.add_argument("--tls", action="store_true")
     parser.add_argument(
@@ -72,8 +84,22 @@ async def _async_main(args: argparse.Namespace) -> None:
     settings.mqtt.host = args.mqtt_host
     settings.mqtt.port = args.mqtt_port
     settings.mqtt.tls_enabled = bool(args.tls)
-    # Publish-only sidecar. Command subscription stays off unless explicitly requested.
-    settings.mqtt.command_subscription_enabled = bool(args.commands_enabled)
+    # Publish-only sidecar by default. Command subscription stays off unless
+    # explicitly requested. Production SET_PRICE needs both capabilities.
+    settings.mqtt.allow_production_remote_set_price = bool(
+        getattr(args, "confirm_production_remote_set_price", False)
+    ) or bool(settings.mqtt.allow_production_remote_set_price)
+    settings.mqtt.command_subscription_enabled = bool(args.commands_enabled) or bool(
+        settings.mqtt.command_subscription_enabled
+    )
+    if (
+        settings.mqtt.allow_production_remote_set_price
+        and not settings.mqtt.command_subscription_enabled
+    ):
+        raise SystemExit(
+            "--confirm-production-remote-set-price requires --commands-enabled "
+            "(or INTELIPUMP_MQTT__COMMAND_SUBSCRIPTION_ENABLED)"
+        )
     settings.safety.remote_authorization_enabled = False
     settings.controller.device_id = args.device_id
     settings.controller.station_id = args.station_id

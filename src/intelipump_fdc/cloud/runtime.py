@@ -228,6 +228,13 @@ class CloudRuntime:
                     self.settings.safety.allow_lab_simulator_commands
                 ),
                 controller_loop=self.controller_loop,
+                allow_production_remote_set_price=bool(
+                    getattr(
+                        self.settings.mqtt,
+                        "allow_production_remote_set_price",
+                        False,
+                    )
+                ),
             )
 
         try:

@@ -16,6 +16,11 @@ from intelipump_fdc.cloud.mqtt.base import MqttClient
 from intelipump_fdc.cloud.mqtt.models import MqttMessage
 from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.schemas import CloudCommandInbound
+from intelipump_fdc.cloud.set_price_request import (
+    SetPriceRequest,
+    parse_prices_from_payload,
+    write_set_price_request,
+)
 from intelipump_fdc.cloud.topics import TopicBuilder
 from intelipump_fdc.controller.controller_loop import ControllerLoop
 from intelipump_fdc.controller.outbound import OutboundQueueFullError, OutboundRejectedError
@@ -51,6 +56,7 @@ class CloudCommandIntake:
         simulated: bool,
         allow_lab_simulator_commands: bool,
         controller_loop: ControllerLoop | None = None,
+        allow_production_remote_set_price: bool = False,
     ) -> None:
         self._factory = session_factory
         self._mqtt = mqtt
@@ -61,6 +67,7 @@ class CloudCommandIntake:
         self._simulated = simulated
         self._allow_lab = allow_lab_simulator_commands
         self._loop = controller_loop
+        self._allow_production_set_price = bool(allow_production_remote_set_price)
         self._seen: set[str] = set()
         self.active = False
         self._seq = 0
@@ -176,11 +183,55 @@ class CloudCommandIntake:
                     eligible = result.eligible
                     current_state = result.current_state.value
                     warnings = list(result.warnings)
-                    if not result.eligible:
+                    # Remote SET_PRICE is applied by the controller process; do not
+                    # require this sidecar to hold physical-enable / active flags.
+                    if (
+                        command is PumpCommand.SET_PRICE
+                        and self._allow_production_set_price
+                    ):
+                        eligible = True
+                    elif not result.eligible:
                         reasons.extend(result.blocking_reasons)
 
-        # Phase 9: production active commands never execute.
-        if command is not None and command in NON_IDEMPOTENT_COMMANDS:
+        # Phase 9: production active commands never execute — except SET_PRICE
+        # when this sidecar is explicitly confirmed as a production sole-
+        # controller price bridge (writes a file the RS-485 controller applies).
+        if command is PumpCommand.SET_PRICE and self._allow_production_set_price:
+            if cmd.simulatorOnly:
+                reasons.append("production_set_price_rejects_simulator_only")
+                execution_status = "REJECTED"
+            elif reasons:
+                execution_status = "REJECTED"
+            else:
+                try:
+                    unit_price, prices = parse_prices_from_payload(cmd.payload)
+                    path = write_set_price_request(
+                        SetPriceRequest(
+                            correlation_id=cmd.correlationId,
+                            command_id=cmd.commandId,
+                            unit_price_raw=unit_price,
+                            prices_raw=prices,
+                            requested_by=cmd.requestedBy,
+                            pump_id=cmd.pumpId,
+                        )
+                    )
+                    executed = True
+                    execution_status = "QUEUED_FOR_CONTROLLER"
+                    resulting_state = current_state
+                    logger.info(
+                        "set_price_queued_for_controller",
+                        correlationId=cmd.correlationId,
+                        unitPriceRaw=unit_price,
+                        path=str(path),
+                        stationId=self._station_id,
+                    )
+                except ValueError as exc:
+                    reasons.append(f"invalid_set_price_payload:{exc}")
+                    execution_status = "REJECTED"
+                except OSError as exc:
+                    reasons.append(f"set_price_write_failed:{exc}")
+                    execution_status = "ENQUEUE_FAILED"
+        elif command is not None and command in NON_IDEMPOTENT_COMMANDS:
             if not (
                 self._environment == "LAB"
                 and cmd.simulatorOnly
@@ -251,7 +302,7 @@ class CloudCommandIntake:
 
         accepted = not reasons or (
             eligible
-            and execution_status in {"QUEUED", "EVALUATED_ONLY"}
+            and execution_status in {"QUEUED", "QUEUED_FOR_CONTROLLER", "EVALUATED_ONLY"}
             and "expired" not in reasons
             and "wrong_station" not in reasons
             and "duplicate_correlation_id" not in reasons

@@ -32,7 +32,18 @@ Topic: `intelipump/lab/stations/{stationId}/commands`
 3. Persist command request + audit.
 4. Evaluate via Phase 4 guards.
 5. Publish result to `.../commands/{correlationId}/result`.
-6. **Do not execute production active commands** (`executed=false`).
+6. **Do not execute production AUTHORIZE / RESET / STOP** (`executed=false`).
+
+### Production remote SET_PRICE (sole controller)
+
+Enabled on the SAO cloud-sync sidecar when both are set:
+
+- `--commands-enabled`
+- `--confirm-production-remote-set-price`
+
+Inbound `SET_PRICE` with `simulatorOnly=false` writes
+`/var/lib/intelipump/set-price-request.json`. The RS-485 controller applies CD5
+on the next idle poll. Remote AUTHORIZE stays off.
 
 ## Allowed execution
 
@@ -40,6 +51,7 @@ Topic: `intelipump/lab/stations/{stationId}/commands`
 - Phase 8 simulator restrictions pass
 - Memory / virtual transport only
 - Explicitly configured (`allow_lab_simulator_commands`)
+- **or** production SET_PRICE bridge (file → controller CD5) as above
 
 ## Result payload
 

@@ -87,6 +87,9 @@ class MqttSettings(BaseModel):
     default_qos: int = Field(default=1, ge=0, le=2)
     heartbeat_interval_seconds: float = Field(default=30.0, ge=5.0)
     command_subscription_enabled: bool = False
+    # When command subscription is on: allow SET_PRICE to be queued for the
+    # local RS-485 controller (production sole-controller stations only).
+    allow_production_remote_set_price: bool = False
     topic_environment: str | None = None  # defaults to settings.environment
     # Fill publish throttling
     fill_min_interval_seconds: float = Field(default=2.0, ge=0.0)
