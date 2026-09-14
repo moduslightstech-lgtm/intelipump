@@ -42,6 +42,7 @@ ExecStart=/home/intelipump/intelipump/intelipump-fdc/.venv/bin/intelipump-contro
   --mode BENCH_CONTROL \
   --response-timeout-ms 200 \
   --confirm-owned-lab-dispense-session \
+  --confirm-production-sole-controller-dispense \
   --enable-active-commands \
   --confirm-physical-control-enable \
   --price 1350 \

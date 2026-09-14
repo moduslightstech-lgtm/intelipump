@@ -108,9 +108,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-owned-lab-dispense-session",
         action="store_true",
         help=(
-            "OWNED LAB ONLY: enable CD5 price, RESET, and AUTHORIZE-on-lift. "
+            "Enable CD5 price, RESET, and AUTHORIZE-on-lift for this process. "
             "Requires --mode BENCH_CONTROL, --price, and the other confirm flags. "
+            "LAB by default; PRODUCTION also needs "
+            "--confirm-production-sole-controller-dispense. "
             "Default remains poll-and-observe / LISTEN_ONLY."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-production-sole-controller-dispense",
+        action="store_true",
+        help=(
+            "Allow authorize-on-lift when INTELIPUMP_ENVIRONMENT is PRODUCTION/PROD "
+            "(sole pump controller, no other FDC on the bus). "
+            "Requires --confirm-owned-lab-dispense-session and all other confirms. "
+            "Use prod MQTT topics via cloud-sync; do not set this for listen-only sites."
         ),
     )
     parser.add_argument(
@@ -175,18 +187,35 @@ def resolve_duration(duration: float | None) -> float | None:
 
 
 def _owned_lab_dispense_or_exit(args: argparse.Namespace, settings) -> None:
-    """Refuse incomplete owned-lab active sessions; keep LISTEN_ONLY default."""
+    """Refuse incomplete owned-lab / sole-controller active sessions; keep LISTEN_ONLY default."""
     if not args.confirm_owned_lab_dispense_session:
         if args.enable_active_commands or args.confirm_physical_control_enable:
             raise SystemExit(
                 "active-command flags require --confirm-owned-lab-dispense-session"
             )
+        if getattr(args, "confirm_production_sole_controller_dispense", False):
+            raise SystemExit(
+                "--confirm-production-sole-controller-dispense requires "
+                "--confirm-owned-lab-dispense-session"
+            )
         return
     missing: list[str] = []
     if ControllerMode(args.mode) is not ControllerMode.BENCH_CONTROL:
         missing.append("--mode BENCH_CONTROL")
-    if settings.environment.upper() != "LAB":
-        missing.append("INTELIPUMP_ENVIRONMENT=LAB")
+    env = settings.environment.upper()
+    if env == "LAB":
+        pass
+    elif env in {"PRODUCTION", "PROD"}:
+        if not getattr(args, "confirm_production_sole_controller_dispense", False):
+            missing.append(
+                "--confirm-production-sole-controller-dispense "
+                "(required when INTELIPUMP_ENVIRONMENT is PRODUCTION)"
+            )
+    else:
+        missing.append(
+            "INTELIPUMP_ENVIRONMENT=LAB or PRODUCTION "
+            "(with --confirm-production-sole-controller-dispense)"
+        )
     if not args.enable_active_commands:
         missing.append("--enable-active-commands")
     if not args.confirm_physical_control_enable:
