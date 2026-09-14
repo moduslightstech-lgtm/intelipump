@@ -15,12 +15,14 @@ class CloudCommandInbound(BaseModel):
     pumpId: str = Field(min_length=1, max_length=128)
     commandType: str = Field(min_length=1, max_length=64)
     payload: dict[str, Any] = Field(default_factory=dict)
-    simulatorOnly: bool = True
+    # Default False: production sole-controller SET_PRICE must not be treated as
+    # lab/simulator when the publisher omits the field. LAB tools set true explicitly.
+    simulatorOnly: bool = False
     createdAt: datetime
     expiresAt: datetime | None = None
     requestedBy: str | None = None
     schemaVersion: str = "1.0"
-    environment: str = "LAB"
+    environment: str = "PRODUCTION"
 
     @field_validator("payload")
     @classmethod

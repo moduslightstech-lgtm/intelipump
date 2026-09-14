@@ -43,6 +43,13 @@ _CD1_MAP: dict[PumpCommand, PumpControlCommand] = {
 }
 
 
+def _normalize_cloud_environment(value: str) -> str:
+    env = (value or "").strip().upper()
+    if env in {"PROD", "PRODUCTION"}:
+        return "PRODUCTION"
+    return env
+
+
 class CloudCommandIntake:
     def __init__(
         self,
@@ -98,11 +105,13 @@ class CloudCommandIntake:
         reasons: list[str] = []
         if cmd.stationId != self._station_id:
             reasons.append("wrong_station")
-        if cmd.environment.upper() != self._environment:
+        cmd_env = _normalize_cloud_environment(cmd.environment)
+        self_env = _normalize_cloud_environment(self._environment)
+        if cmd_env != self_env:
             reasons.append("wrong_environment")
         if cmd.schemaVersion != "1.0":
             reasons.append("unsupported_schema_version")
-        if self._environment != "LAB" and cmd.simulatorOnly:
+        if self_env != "LAB" and cmd.simulatorOnly:
             reasons.append("simulator_only_requires_LAB")
         now = datetime.now(UTC)
         expires = cmd.expiresAt
@@ -132,9 +141,15 @@ class CloudCommandIntake:
             reasons.append("unknown_command_type")
             command = None
 
+        # Production SET_PRICE is a file bridge to the RS-485 controller — do not
+        # require a local pump catalog row or Phase-4 physical-enable eligibility.
+        production_set_price = (
+            command is PumpCommand.SET_PRICE and self._allow_production_set_price
+        )
+
         pump_db_id: str | None = None
         ctx: PumpContext | None = None
-        if not reasons and command is not None:
+        if not reasons and command is not None and not production_set_price:
             async with unit_of_work(self._factory) as uow:
                 pumps = await uow.pumps.list_for_station(self._station_id)
                 pump = next(
@@ -183,20 +198,31 @@ class CloudCommandIntake:
                     eligible = result.eligible
                     current_state = result.current_state.value
                     warnings = list(result.warnings)
-                    # Remote SET_PRICE is applied by the controller process; do not
-                    # require this sidecar to hold physical-enable / active flags.
-                    if (
-                        command is PumpCommand.SET_PRICE
-                        and self._allow_production_set_price
-                    ):
-                        eligible = True
-                    elif not result.eligible:
+                    if not result.eligible:
                         reasons.extend(result.blocking_reasons)
+        elif production_set_price and not reasons:
+            eligible = True
+            current_state = "IDLE"
+            # Best-effort pump row for audit only.
+            async with unit_of_work(self._factory) as uow:
+                pumps = await uow.pumps.list_for_station(self._station_id)
+                pump = next(
+                    (
+                        p
+                        for p in pumps
+                        if p.logical_pump_id == cmd.pumpId
+                        or p.id == cmd.pumpId
+                        or str(p.dart_address) == cmd.pumpId
+                    ),
+                    pumps[0] if pumps else None,
+                )
+                if pump is not None:
+                    pump_db_id = pump.id
 
         # Phase 9: production active commands never execute — except SET_PRICE
         # when this sidecar is explicitly confirmed as a production sole-
         # controller price bridge (writes a file the RS-485 controller applies).
-        if command is PumpCommand.SET_PRICE and self._allow_production_set_price:
+        if production_set_price:
             if cmd.simulatorOnly:
                 reasons.append("production_set_price_rejects_simulator_only")
                 execution_status = "REJECTED"
@@ -233,7 +259,7 @@ class CloudCommandIntake:
                     execution_status = "ENQUEUE_FAILED"
         elif command is not None and command in NON_IDEMPOTENT_COMMANDS:
             if not (
-                self._environment == "LAB"
+                self_env == "LAB"
                 and cmd.simulatorOnly
                 and self._allow_lab
                 and self._loop is not None
@@ -266,7 +292,7 @@ class CloudCommandIntake:
                 execution_status = "EVALUATED_ONLY"
         elif command in {PumpCommand.READ_STATUS, PumpCommand.READ_TOTALS}:
             if (
-                self._environment == "LAB"
+                self_env == "LAB"
                 and cmd.simulatorOnly
                 and self._allow_lab
                 and self._loop is not None
