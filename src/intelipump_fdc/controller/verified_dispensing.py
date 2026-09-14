@@ -227,14 +227,15 @@ class VerifiedDispensingBook:
         )
         state.pump_authorized = True
         state.authorized_at = at or _now()
-        # Establish session baseline from the face after reset/authorize so a
-        # retained previous-sale DC2 value is not treated as new flow.
+        # New authorize attempt: baseline is the empty post-RESET face (0) unless
+        # the caller passes an explicit non-negative reading. Never keep a prior
+        # sale's volume as baseline — that blocks verified_dispensing forever.
         if baseline_volume_raw is not None:
-            state.baseline_volume_raw = int(baseline_volume_raw)
-            if state.current_volume_raw is None:
-                state.current_volume_raw = int(baseline_volume_raw)
-        elif state.baseline_volume_raw is None and state.current_volume_raw is not None:
-            state.baseline_volume_raw = state.current_volume_raw
+            state.baseline_volume_raw = max(0, int(baseline_volume_raw))
+        else:
+            state.baseline_volume_raw = 0
+        if state.current_volume_raw is None:
+            state.current_volume_raw = state.baseline_volume_raw
         if state.phase in {VerifiedPhase.IDLE, VerifiedPhase.NOZZLE_LIFTED}:
             state.phase = VerifiedPhase.AUTHORIZED
         self._refresh_phase(state)

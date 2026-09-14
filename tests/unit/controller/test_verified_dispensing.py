@@ -58,6 +58,26 @@ def test_lift_auth_filling_without_volume_not_dispensing() -> None:
     assert state.filling_started_at is not None
 
 
+def test_stale_prior_sale_baseline_does_not_block_new_fill() -> None:
+    """Regression: authorize must not keep prior-sale volume as baseline."""
+    book = _book()
+    book.note_nozzle_lifted(pump_id="pump-1", nozzle_id="nozzle-2", dart_address=2)
+    # Simulate leftover current from a previous sale face before reset.
+    state = book.get_or_create(pump_id="pump-1", nozzle_id="nozzle-2", dart_address=2)
+    state.current_volume_raw = 50
+    state.baseline_volume_raw = 50
+    book.note_authorized(pump_id="pump-1", nozzle_id="nozzle-2", dart_address=2)
+    book.note_dc1_state(
+        pump_id="pump-1", nozzle_id="nozzle-2", dc1_state="FILLING", dart_address=2
+    )
+    state = book.note_volume(
+        pump_id="pump-1", nozzle_id="nozzle-2", volume_raw=43, dart_address=2
+    )
+    assert state.baseline_volume_raw == 0
+    assert state.verified_dispensing is True
+    assert state.phase is VerifiedPhase.VERIFIED_DISPENSING
+
+
 def test_all_four_conditions_verified_dispensing() -> None:
     book = _book()
     book.note_nozzle_lifted(pump_id="pump-1", nozzle_id="nozzle-1")

@@ -565,14 +565,15 @@ class PersistenceBridge:
                         nozzle_id=can_nozzle,
                         dart_address=address,
                     )
-                baseline = detail_payload.get("dispensed_volume_raw")
-                if not isinstance(baseline, int):
-                    baseline = 0
+                # Always baseline at 0 after pre-auth RESET. Seeding from
+                # dispensed_volume_raw reuses the prior sale face (e.g. 0.50L)
+                # and then a new 0.43L fill never "increases" → CANCELLED_NO_SALE
+                # and the sale is never queued for cloud sync.
                 verified = self._verified.note_authorized(
                     pump_id=can_pump,
                     nozzle_id=can_nozzle,
                     dart_address=address,
-                    baseline_volume_raw=baseline,
+                    baseline_volume_raw=0,
                 )
                 self._verified.note_dc1_state(
                     pump_id=can_pump,
@@ -690,12 +691,39 @@ class PersistenceBridge:
                     dart_address=address,
                 )
                 logger.info("verified_dispensing_diagnostic", **returned.diagnostic())
-                if returned.phase is VerifiedPhase.CANCELLED_NO_SALE or (
+                verified_cancelled = returned.phase is VerifiedPhase.CANCELLED_NO_SALE or (
                     not returned.verified_dispensing
                     and returned.transaction_id is None
                     and not returned.possible_unintended_flow
-                ):
+                )
+                # Wayne face totals win: a positive FILLING_COMPLETED must sync
+                # even if the in-memory verified book missed volume↑ (stale
+                # baseline). Otherwise offline sales never reach the cloud.
+                authoritative_delivery = (
+                    may_publish is not False
+                    and (vol_raw > 0 or amt_raw > 0)
+                    and sale_lifecycle
+                    not in {
+                        "ABORTED_NO_DELIVERY",
+                        "CANCELLED_NO_SALE",
+                    }
+                )
+                if verified_cancelled and not authoritative_delivery:
                     suppress = True
+                elif verified_cancelled and authoritative_delivery:
+                    logger.warning(
+                        "verified_dispensing_late_accept_authoritative_sale",
+                        stationId=self._station_id,
+                        pumpId=can_pump,
+                        nozzleId=can_nozzle,
+                        volumeMinorUnits=vol_raw,
+                        amountMinorUnits=amt_raw,
+                        phase=returned.phase.value,
+                        detail=(
+                            "Verified book marked CANCELLED_NO_SALE but pump "
+                            "reported positive FILLING_COMPLETED — publishing"
+                        ),
+                    )
                 if suppress:
                     await uow.audit.append(
                         actor="controller",
