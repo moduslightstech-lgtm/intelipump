@@ -557,12 +557,22 @@ class PersistenceBridge:
 
             if new_state is PumpState.AUTHORIZED:
                 can_pump, can_nozzle, _ = self._channel_identity(address)
+                # Authorize-on-lift often skips a durable NOZZLE_UP state (RESET
+                # then AUTHORIZE). Treat nozzle_out on AUTHORIZE as the lift.
+                if detail_payload.get("nozzle_out") is True:
+                    self._verified.note_nozzle_lifted(
+                        pump_id=can_pump,
+                        nozzle_id=can_nozzle,
+                        dart_address=address,
+                    )
                 baseline = detail_payload.get("dispensed_volume_raw")
+                if not isinstance(baseline, int):
+                    baseline = 0
                 verified = self._verified.note_authorized(
                     pump_id=can_pump,
                     nozzle_id=can_nozzle,
                     dart_address=address,
-                    baseline_volume_raw=baseline if isinstance(baseline, int) else None,
+                    baseline_volume_raw=baseline,
                 )
                 self._verified.note_dc1_state(
                     pump_id=can_pump,
@@ -1069,13 +1079,21 @@ class PersistenceBridge:
                 )
                 return
             if open_mapped is None:
-                # Verified dispensing only: lift ∧ authorize ∧ DC1 FILLING ∧ volume↑.
-                # Positive DC2 before FILLING → POSSIBLE_UNINTENDED_FLOW (preserve,
-                # do not open a financial sale). AUTHORIZED/NOZZLE_UP without volume
-                # increase stays READY — never DISPENSING.
+                # Verified dispensing: lift ∧ authorize ∧ DC1 FILLING ∧ volume↑.
+                # DC2 may arrive before FILLING after AUTHORIZE — that is not
+                # quarantined. Unauthorize volume rise still is.
                 can_pump, can_nozzle, source_id = self._channel_identity(address)
                 snap = await uow.states.latest(pump_db)
                 state_s = (snap.normalized_state or "").upper() if snap else ""
+                # Prefer controller FILLING before volume so Wayne's DC2-before-
+                # FILLING race does not quarantine an authorized hose.
+                if state_s == "FILLING":
+                    verified = self._verified.note_dc1_state(
+                        pump_id=can_pump,
+                        nozzle_id=can_nozzle,
+                        dc1_state="FILLING",
+                        dart_address=address,
+                    )
                 verified = self._verified.note_volume(
                     pump_id=can_pump,
                     nozzle_id=can_nozzle,

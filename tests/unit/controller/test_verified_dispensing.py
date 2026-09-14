@@ -85,10 +85,32 @@ def test_all_four_conditions_verified_dispensing() -> None:
     }
 
 
-def test_volume_increase_before_filling_is_unintended_flow() -> None:
+def test_volume_increase_before_filling_after_authorize_is_not_unintended() -> None:
+    """Wayne often emits DC2 before DC1 FILLING once AUTHORIZE is confirmed."""
     book = _book()
     book.note_nozzle_lifted(pump_id="pump-1", nozzle_id="nozzle-1")
     book.note_authorized(pump_id="pump-1", nozzle_id="nozzle-1", baseline_volume_raw=0)
+    state = book.note_volume(
+        pump_id="pump-1",
+        nozzle_id="nozzle-1",
+        volume_raw=12,
+        amount_raw=1400,
+        raw_frame="AA BB",
+    )
+    assert state.verified_dispensing is False
+    assert state.possible_unintended_flow is False
+    assert state.phase is VerifiedPhase.AUTHORIZED
+    book.note_dc1_state(pump_id="pump-1", nozzle_id="nozzle-1", dc1_state="FILLING")
+    state = book.get("pump-1", "nozzle-1")
+    assert state is not None
+    assert state.verified_dispensing is True
+    assert state.possible_unintended_flow is False
+    assert state.phase is VerifiedPhase.VERIFIED_DISPENSING
+
+
+def test_volume_increase_without_authorize_is_unintended_flow() -> None:
+    book = _book()
+    book.note_nozzle_lifted(pump_id="pump-1", nozzle_id="nozzle-1")
     state = book.note_volume(
         pump_id="pump-1",
         nozzle_id="nozzle-1",

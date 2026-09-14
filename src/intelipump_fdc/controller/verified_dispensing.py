@@ -256,6 +256,9 @@ class VerifiedDispensingBook:
         state.dc1_state = normalized
         if normalized == "FILLING" and state.filling_started_at is None:
             state.filling_started_at = at or _now()
+        if normalized == "FILLING" and state.pump_authorized:
+            # Early DC2 under AUTHORIZE is expected; FILLING clears the quarantine.
+            state.possible_unintended_flow = False
         if normalized == "AUTHORIZED":
             state.pump_authorized = True
             if state.authorized_at is None:
@@ -280,10 +283,14 @@ class VerifiedDispensingBook:
         stamp = at or _now()
         prev = state.current_volume_raw
         state.current_volume_raw = int(volume_raw)
-        if state.baseline_volume_raw is None and state.pump_authorized:
-            # First reading after auth with no explicit baseline — lock it so
-            # retained face values do not count as an increase.
-            state.baseline_volume_raw = int(volume_raw)
+        if state.baseline_volume_raw is None:
+            if state.pump_authorized:
+                # After reset/authorize the face is empty. Do not adopt the first
+                # rising DC2 tick as baseline (that hid real flow as "no increase").
+                state.baseline_volume_raw = 0
+            elif state.nozzle_lifted and int(volume_raw) > 0:
+                # No authorize yet — still detect ghost flow vs empty face.
+                state.baseline_volume_raw = 0
         increased = volume_increased(
             baseline_raw=state.baseline_volume_raw,
             current_raw=state.current_volume_raw,
@@ -292,16 +299,21 @@ class VerifiedDispensingBook:
             if state.first_volume_increase_at is None:
                 state.first_volume_increase_at = stamp
             state.last_volume_increase_at = stamp
-            # Volume before DC1 FILLING → incident, not a normal sale.
+            # Volume rising before DC1 FILLING is normal on Wayne after AUTHORIZE
+            # (DC2 often beats the FILLING status). Quarantine only when fuel
+            # moves without an authorize in this session (true ghost flow).
             if state.dc1_state.upper() != "FILLING":
-                state.possible_unintended_flow = True
-                state.preserved_volume_raw = int(volume_raw)
-                if amount_raw is not None:
-                    state.preserved_amount_raw = int(amount_raw)
-                if raw_frame:
-                    state.preserved_raw_frames.append(raw_frame)
-                if state.phase is not VerifiedPhase.VERIFIED_DISPENSING:
-                    state.phase = VerifiedPhase.POSSIBLE_UNINTENDED_FLOW
+                if state.pump_authorized:
+                    pass
+                else:
+                    state.possible_unintended_flow = True
+                    state.preserved_volume_raw = int(volume_raw)
+                    if amount_raw is not None:
+                        state.preserved_amount_raw = int(amount_raw)
+                    if raw_frame:
+                        state.preserved_raw_frames.append(raw_frame)
+                    if state.phase is not VerifiedPhase.VERIFIED_DISPENSING:
+                        state.phase = VerifiedPhase.POSSIBLE_UNINTENDED_FLOW
         elif prev is not None and state.current_volume_raw != prev:
             # Flat or within tolerance — still track current face.
             pass
