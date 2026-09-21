@@ -34,6 +34,18 @@ Wayne pump  --RS-485-->  intelipump.service (controller, MQTT off)
 
 Do **not** put two Pis on the same RS-485 bus (two masters will fight).
 
+## Deploy pump N (on the Pi — preferred for remaining pumps)
+
+```bash
+cd ~/intelipump-fdc/intelipump   # adjust if your clone path differs
+git checkout v4-cloud-deploy && git pull
+
+./scripts/bootstrap_sao_rs1_pump_pi.sh --pump 3 --mqtt-password 'SECRET'
+```
+
+That one command: pulls the branch, installs controller + cloud-sync for pump N,
+writes the MQTT password, and starts both services.
+
 ## Deploy pump N (from Mac)
 
 ```bash
