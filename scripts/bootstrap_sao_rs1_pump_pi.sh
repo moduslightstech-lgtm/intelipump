@@ -177,6 +177,7 @@ INSTALL_ARGS=(
   --price "$PRICE"
   --addresses "$ADDRESSES"
 )
+# Install units/binaries first; we always set MQTT password before starting cloud-sync.
 if [[ "$DO_START" -eq 1 ]]; then
   INSTALL_ARGS+=(--start)
 fi
@@ -191,27 +192,54 @@ if [[ ! -f "$SYNC_ENV" ]]; then
   exit 1
 fi
 
-# Escape for sed replacement (basic)
-ESCAPED_PW="$(printf '%s' "$MQTT_PW" | sed -e 's/[\\/&]/g')"
-if sudo grep -qE '^INTELIPUMP_MQTT__PASSWORD=' "$SYNC_ENV"; then
-  sudo sed -i "s|^INTELIPUMP_MQTT__PASSWORD=.*|INTELIPUMP_MQTT__PASSWORD=${ESCAPED_PW}|" "$SYNC_ENV"
-else
-  echo "INTELIPUMP_MQTT__PASSWORD=${MQTT_PW}" | sudo tee -a "$SYNC_ENV" >/dev/null
-fi
+# Write password without printing it (handles special characters; verifies non-empty).
+MQTT_PASSWORD="$MQTT_PW" SYNC_ENV="$SYNC_ENV" sudo -E python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["SYNC_ENV"])
+password = os.environ["MQTT_PASSWORD"]
+if not password:
+    raise SystemExit("MQTT password is empty")
+text = path.read_text() if path.exists() else ""
+lines = []
+found = False
+for line in text.splitlines():
+    if line.startswith("INTELIPUMP_MQTT__PASSWORD="):
+        lines.append("INTELIPUMP_MQTT__PASSWORD=" + password)
+        found = True
+    else:
+        lines.append(line)
+if not found:
+    lines.append("INTELIPUMP_MQTT__PASSWORD=" + password)
+path.write_text("\n".join(lines) + "\n")
+path.chmod(0o640)
+written = next(
+    (ln.split("=", 1)[1] for ln in path.read_text().splitlines() if ln.startswith("INTELIPUMP_MQTT__PASSWORD=")),
+    "",
+)
+if not written:
+    raise SystemExit(f"Failed to persist MQTT password in {path}")
+print(f"OK: MQTT password set in {path} (length={len(written)})")
+PY
 
 if [[ "$DO_START" -eq 1 ]]; then
   echo "==> enable --now controller + cloud-sync"
-  sudo systemctl enable --now intelipump.service
-  sudo systemctl enable --now intelipump-cloud-sync.service
+  sudo systemctl enable intelipump.service intelipump-cloud-sync.service
+  sudo systemctl restart intelipump.service
   sudo systemctl restart intelipump-cloud-sync.service
-  sleep 1
+  sleep 2
   echo "==> Status"
   systemctl is-active intelipump.service intelipump-cloud-sync.service || true
+  if [[ "$(systemctl is-active intelipump-cloud-sync.service)" != "active" ]]; then
+    echo "ERROR: intelipump-cloud-sync failed to start. Last logs:" >&2
+    journalctl -u intelipump-cloud-sync -n 40 --no-pager || true
+    exit 1
+  fi
   journalctl -u intelipump -u intelipump-cloud-sync -n 25 --no-pager || true
 fi
 
 echo
 echo "Done. Pump ${PUMP_NUM} / ${DEVICE_ID}"
 echo "Next (cloud Twin catalog + tank pipe) from Mac/droplet:"
-echo "  ./scripts/provision_sao_rs1_pump.sh --pump ${PUMP_NUM}"
-echo "  ./scripts/provision_sao_rs1_hardware.sh --pump ${PUMP_NUM}"
+echo "  ./scripts/bootstrap_sao_rs1_pump_cloud.sh --pump ${PUMP_NUM}"

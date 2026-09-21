@@ -55,15 +55,27 @@ MQTT_PASSWORD='<same as pump 1>' \
   ./scripts/deploy_sao_rs1_pump_to_pi.sh --pump 2 intelipump@<pi-ip> --start
 ```
 
-Twin catalog (once per pump):
+Twin catalog (once per pump) — from Mac:
 
 ```bash
 cd DigitalTwin
-export TWIN_API_BASE=http://157.230.215.93
 export TWIN_ADMIN_EMAIL=...
 export TWIN_ADMIN_PASSWORD=...
-./scripts/provision_sao_rs1_pump.sh --pump 2
+./scripts/deploy_sao_rs1_pump_cloud_to_droplet.sh --pump 3
 ```
+
+Or on the droplet:
+
+```bash
+cd /opt/intelipump-cloud
+export TWIN_API_BASE=http://127.0.0.1
+export TWIN_ADMIN_EMAIL=...
+export TWIN_ADMIN_PASSWORD=...
+./scripts/bootstrap_sao_rs1_pump_cloud.sh --pump 3
+```
+
+That creates the device (`InteliPump-SAO-RS1-pi-00N`), pump-N nozzles, and
+PMS Tank 1 → pump-N connections (clears Unconnected).
 
 ## Verify sales stream
 
