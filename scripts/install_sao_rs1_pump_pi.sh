@@ -25,7 +25,8 @@ START=0
 INSTALL_SYNC=1
 PUMP_NUM=""
 PORT="${INTELIPUMP_SERIAL_PORT:-/dev/ttyUSB0}"
-PRICE="${INTELIPUMP_UNIT_PRICE:-1400}"
+PRICE="${INTELIPUMP_UNIT_PRICE:-}"
+PRODUCT="${INTELIPUMP_PRODUCT:-PMS}"
 ADDRESSES="${INTELIPUMP_ADDRESSES:-1,2}"
 REPO_USER="${INTELIPUMP_RUN_USER:-intelipump}"
 STATION_ID="SAO-Redeemed-Station-1"
@@ -42,7 +43,8 @@ Optional:
   --start           enable --now controller + cloud-sync after install
   --no-cloud-sync   skip cloud-sync unit/env install
   --port PATH       Serial device (default /dev/ttyUSB0)
-  --price N         Raw BCD unit price (default 1400)
+  --price N         Raw BCD unit price (default 1400 PMS / 1875 AGO)
+  --product CODE    PMS (default) or AGO
   --addresses LIST  DART addresses on this Pi's bus (default 1,2)
   --user NAME       Service user (default intelipump)
   -h, --help
@@ -68,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --price)
       PRICE="${2:?--price requires an integer}"
+      shift
+      ;;
+    --product)
+      PRODUCT="${2:?--product requires PMS or AGO}"
       shift
       ;;
     --addresses)
@@ -108,6 +114,19 @@ if ! [[ "$PUMP_NUM" =~ ^[1-9]$|^1[0-2]$ ]]; then
   exit 2
 fi
 
+PRODUCT="$(echo "$PRODUCT" | tr '[:lower:]' '[:upper:]')"
+if [[ "$PRODUCT" != "PMS" && "$PRODUCT" != "AGO" ]]; then
+  echo "Invalid --product ${PRODUCT}; expected PMS or AGO." >&2
+  exit 2
+fi
+if [[ -z "$PRICE" ]]; then
+  if [[ "$PRODUCT" == "AGO" ]]; then
+    PRICE=1875
+  else
+    PRICE=1400
+  fi
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPO_ROOT"
@@ -118,24 +137,24 @@ MAP_REL="config/channel_map.sao-rs1-pump${PUMP_NUM}.json"
 MAP_SRC="${REPO_ROOT}/${MAP_REL}"
 
 # Pump 1 keeps the historical day-1 map (source_identifier pump-1 / pump-2).
-if [[ "$PUMP_NUM" -eq 1 && -f "${REPO_ROOT}/config/channel_map.sao-rs1.json" ]]; then
+if [[ "$PUMP_NUM" -eq 1 && -f "${REPO_ROOT}/config/channel_map.sao-rs1.json" && "$PRODUCT" == "PMS" ]]; then
   MAP_REL="config/channel_map.sao-rs1.json"
   MAP_SRC="${REPO_ROOT}/${MAP_REL}"
 else
-  echo "==> Writing channel map ${MAP_REL}"
+  echo "==> Writing channel map ${MAP_REL} (product=${PRODUCT})"
   cat >"$MAP_SRC" <<EOF
 {
   "1": {
     "pump_id": "${PUMP_CODE}",
     "nozzle_id": "nozzle-1",
     "source_identifier": "${PUMP_CODE}-n1",
-    "product": "PMS"
+    "product": "${PRODUCT}"
   },
   "2": {
     "pump_id": "${PUMP_CODE}",
     "nozzle_id": "nozzle-2",
     "source_identifier": "${PUMP_CODE}-n2",
-    "product": "PMS"
+    "product": "${PRODUCT}"
   }
 }
 EOF
@@ -201,7 +220,8 @@ echo "==> SAO Redeemed Station 1 — physical ${PUMP_CODE} (one Pi per pump)"
 echo "==> Repo: ${REPO_ROOT}"
 echo "==> Station: ${STATION_ID}"
 echo "==> Device:  ${DEVICE_ID}"
-echo "==> Port: ${PORT}  addresses: ${ADDRESSES}  price: ${PRICE}  user: ${REPO_USER}"
+echo "==> Product: ${PRODUCT}  price: ${PRICE}"
+echo "==> Port: ${PORT}  addresses: ${ADDRESSES}  user: ${REPO_USER}"
 echo "==> Channel map: ${MAP_SRC}"
 echo "==> MQTT stream: intelipump-cloud-sync → 157.230.215.93 (prod topics)"
 echo "WARN: This Pi is the only RS-485 master on THIS bus. Do not share with another Pi."

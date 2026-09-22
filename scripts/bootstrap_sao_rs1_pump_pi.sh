@@ -25,7 +25,8 @@ PUMP_NUM=""
 MQTT_PW="${MQTT_PASSWORD:-}"
 BRANCH="${INTELIPUMP_GIT_BRANCH:-v4-cloud-deploy}"
 PORT="${INTELIPUMP_SERIAL_PORT:-}"
-PRICE="${INTELIPUMP_UNIT_PRICE:-1400}"
+PRICE="${INTELIPUMP_UNIT_PRICE:-}"
+PRODUCT="${INTELIPUMP_PRODUCT:-PMS}"
 DO_PULL=1
 DO_START=1
 ADDRESSES="${INTELIPUMP_ADDRESSES:-1,2}"
@@ -41,7 +42,8 @@ Required:
 Optional:
   --branch NAME            default v4-cloud-deploy
   --port PATH              serial device (auto-picks by-id / ttyUSB* if omitted)
-  --price N                default 1400
+  --price N                default 1400 PMS / 1875 AGO
+  --product CODE           PMS (default) or AGO
   --addresses LIST         default 1,2
   --no-pull                skip git fetch/checkout/pull
   --no-start               install only; do not enable/start services
@@ -71,6 +73,10 @@ while [[ $# -gt 0 ]]; do
       PRICE="${2:?}"
       shift
       ;;
+    --product)
+      PRODUCT="${2:?}"
+      shift
+      ;;
     --addresses)
       ADDRESSES="${2:?}"
       shift
@@ -98,6 +104,14 @@ fi
 if ! [[ "$PUMP_NUM" =~ ^[1-9]$|^1[0-2]$ ]]; then
   echo "Invalid --pump ${PUMP_NUM}; expected 1..12." >&2
   exit 2
+fi
+PRODUCT="$(echo "$PRODUCT" | tr '[:lower:]' '[:upper:]')"
+if [[ "$PRODUCT" != "PMS" && "$PRODUCT" != "AGO" ]]; then
+  echo "Invalid --product ${PRODUCT}; expected PMS or AGO." >&2
+  exit 2
+fi
+if [[ -z "$PRICE" ]]; then
+  if [[ "$PRODUCT" == "AGO" ]]; then PRICE=1875; else PRICE=1400; fi
 fi
 if [[ -z "$MQTT_PW" ]]; then
   echo "Refused: pass --mqtt-password SECRET or set MQTT_PASSWORD" >&2
@@ -142,8 +156,8 @@ echo "==> SAO pump bootstrap"
 echo "==> Repo:   ${REPO_ROOT}"
 echo "==> Branch: ${BRANCH}"
 echo "==> Pump:   ${PUMP_NUM}  device ${DEVICE_ID}"
+echo "==> Product: ${PRODUCT}  price: ${PRICE}"
 echo "==> Port:   ${PORT}"
-echo "==> Price:  ${PRICE}"
 
 if [[ "$DO_PULL" -eq 1 ]]; then
   if [[ ! -d .git ]]; then
@@ -175,6 +189,7 @@ INSTALL_ARGS=(
   --confirm-sao-authorize-install
   --port "$PORT"
   --price "$PRICE"
+  --product "$PRODUCT"
   --addresses "$ADDRESSES"
 )
 # Install units/binaries first; we always set MQTT password before starting cloud-sync.
