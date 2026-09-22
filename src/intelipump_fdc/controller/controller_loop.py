@@ -1541,29 +1541,50 @@ class ControllerLoop:
             consume_set_price_request,
             read_set_price_request,
             write_persisted_unit_price,
+            write_set_price_request,
         )
 
         pending = read_set_price_request()
         if pending is None:
             return
-        # Skip while any hose is mid-dispense or holding a completed-sale face;
-        # leave the file for a later tick (Wayne often ignores CD5 then).
+        # Only block while actively fueling. A retained sale face
+        # (FILLING_COMPLETED / display-hold) used to defer forever until restart
+        # because hold-until-lift never returns to idle RESET by itself — clear
+        # the face with RESET first, then CD5 (same as a fresh boot).
+        # Applies to every product (PMS and AGO) on this Pi.
         for addr, session in self.sessions.items():
             status = session.state.observed_status
             if status in {
                 ObservedStatus.AUTHORIZED,
                 ObservedStatus.FILLING,
                 ObservedStatus.SUSPENDED,
-                ObservedStatus.FILLING_COMPLETED,
-                ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
-            } or addr in self._sale_display_held:
+            }:
                 logger.info(
                     "set_price_deferred_busy",
                     correlationId=pending.correlation_id,
                     unitPriceRaw=pending.unit_price_raw,
                     address=addr,
                     observedStatus=getattr(status, "value", str(status)),
-                    saleDisplayHeld=addr in self._sale_display_held,
+                )
+                return
+            needs_clear = (
+                status
+                in {
+                    ObservedStatus.FILLING_COMPLETED,
+                    ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+                }
+                or addr in self._sale_display_held
+            )
+            # Wait for hang-up before consuming — CD5/RESET while nozzle OUT
+            # is ignored and would drop the queued price.
+            if needs_clear and session.state.nozzle_position is not NozzlePosition.IN:
+                logger.info(
+                    "set_price_deferred_await_hangup",
+                    correlationId=pending.correlation_id,
+                    unitPriceRaw=pending.unit_price_raw,
+                    address=addr,
+                    observedStatus=getattr(status, "value", str(status)),
+                    nozzlePosition=session.state.nozzle_position.value,
                 )
                 return
 
@@ -1581,6 +1602,44 @@ class ControllerLoop:
         self._startup_price_attempted.clear()
         any_ok = False
         for addr, session in self.sessions.items():
+            status = session.state.observed_status
+            needs_clear = (
+                status
+                in {
+                    ObservedStatus.FILLING_COMPLETED,
+                    ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+                }
+                or addr in self._sale_display_held
+            )
+            if needs_clear and session.state.nozzle_position is NozzlePosition.IN:
+                reset = await self._run_owned_command(
+                    session,
+                    encode_cd1_command(PumpControlCommand.RESET),
+                    PumpCommand.RESET,
+                    expect_status=ObservedStatus.RESET,
+                    idempotency=IdempotencyClass.NON_IDEMPOTENT,
+                    command_label="CD1_RESET_BEFORE_CLOUD_PRICE",
+                )
+                print(
+                    f"[CLOUD-PRICE addr={addr}] clear retained face before CD5 "
+                    f"result={reset.status.value}"
+                )
+                self._sale_display_held.discard(addr)
+                self._sale_display_hold_since.pop(addr, None)
+                self._last_dc2.pop(addr, None)
+                session.state.filled_volume_raw = 0
+                session.state.filled_amount_raw = 0
+                if reset.status not in {
+                    ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                    ExchangeResultStatus.APPLICATION_CONFIRMED,
+                }:
+                    logger.warning(
+                        "set_price_reset_before_cd5_failed",
+                        address=addr,
+                        correlationId=req.correlation_id,
+                        result=reset.status.value,
+                    )
+                    continue
             payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
             result = await self._run_owned_command(
                 session,
@@ -1622,6 +1681,25 @@ class ControllerLoop:
                 logger.warning(
                     "cloud_set_price_persist_failed",
                     unitPriceRaw=req.unit_price_raw,
+                    error=str(exc),
+                )
+        else:
+            # Keep retrying on the next idle tick instead of requiring a restart.
+            try:
+                write_set_price_request(req)
+                logger.warning(
+                    "set_price_requeued_after_apply_failure",
+                    correlationId=req.correlation_id,
+                    unitPriceRaw=req.unit_price_raw,
+                )
+                print(
+                    f"[CLOUD-PRICE] requeued {req.unit_price_raw} "
+                    f"corr={req.correlation_id} (no successful CD5)"
+                )
+            except OSError as exc:
+                logger.warning(
+                    "set_price_requeue_failed",
+                    correlationId=req.correlation_id,
                     error=str(exc),
                 )
 
