@@ -829,6 +829,28 @@ class ControllerLoop:
                     detail="confirmed_by_observed_status",
                     write_start_mono=not_before,
                 )
+            # One forced poll before the confirm budget — soft-stale RESET/AUTH
+            # frames often land in the demux right as ACK wait ends.
+            write_start, _complete = await self._write_frame(
+                session.build_poll(),
+                address=session.address,
+                note="POLL_CONFIRM",
+            )
+            await self._read_poll_session(session, not_before_mono=write_start)
+            await self._drain_pending_data(session)
+            if session.state.observed_status.value == expected:
+                print(
+                    f"[OWNED-LAB addr={session.address}] "
+                    f"{item.command_type.value} confirmed by poll DC1"
+                )
+                return ExchangeResult(
+                    status=ExchangeResultStatus.APPLICATION_CONFIRMED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    detail="confirmed_by_observed_status",
+                    write_start_mono=not_before,
+                )
             confirmed = await self._confirm_application(
                 session,
                 expected=ObservedStatus(expected),
@@ -1181,16 +1203,26 @@ class ControllerLoop:
         expected: ObservedStatus,
         not_before_mono: float,
     ) -> bool:
-        """Poll until expected DC1 is observed strictly after command TX time."""
+        """Poll until expected DC1 is observed strictly after command TX time.
+
+        Also accept a matching ``observed_status`` without the freshness floor:
+        after display-hold RESET/AUTHORIZE, Wayne often replies with a frame
+        whose last-byte time slightly precedes write_complete (soft-stale). The
+        status is already correct — waiting out max_polls (~2s) only adds lag.
+        """
         max_polls = self.runtime.config.application_confirm_max_polls
         for _ in range(max_polls):
             if session.status_observed_after(expected, not_before_mono=not_before_mono):
+                return True
+            if session.state.observed_status is expected:
                 return True
             _write_start, _write_complete = await self._write_frame(
                 session.build_poll(), address=session.address, note="POLL_CONFIRM"
             )
             await self._read_poll_session(session, not_before_mono=_write_start)
             if session.status_observed_after(expected, not_before_mono=not_before_mono):
+                return True
+            if session.state.observed_status is expected:
                 return True
         return False
 
