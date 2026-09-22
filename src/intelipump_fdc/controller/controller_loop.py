@@ -1359,6 +1359,7 @@ class ControllerLoop:
             session.state.filled_volume_raw = 0
             session.state.filled_amount_raw = 0
             session.state.sale_evidence.reset_attempt()
+            await self._apply_pending_cloud_set_price()
 
     async def _owned_lab_tick(self, session: PumpSession) -> None:
         flags = self.runtime.feature_flags
@@ -1534,7 +1535,13 @@ class ControllerLoop:
         )
 
     async def _apply_pending_cloud_set_price(self) -> None:
-        """Apply a cloud-queued SET_PRICE (CD5) written by intelipump-cloud-sync."""
+        """Apply a cloud-queued SET_PRICE (CD5) written by intelipump-cloud-sync.
+
+        Never RESET a retained last-sale face just to program price — SAO holds
+        totals until the next lift (``--hold-display-until-lift``). While the
+        face is held, leave the request file pending; CD5 runs on the next idle
+        tick or immediately after the pre-auth RESET on lift.
+        """
         if not self.runtime.safety.owned_lab_active_session:
             return
         from intelipump_fdc.cloud.set_price_request import (
@@ -1547,11 +1554,6 @@ class ControllerLoop:
         pending = read_set_price_request()
         if pending is None:
             return
-        # Only block while actively fueling. A retained sale face
-        # (FILLING_COMPLETED / display-hold) used to defer forever until restart
-        # because hold-until-lift never returns to idle RESET by itself — clear
-        # the face with RESET first, then CD5 (same as a fresh boot).
-        # Applies to every product (PMS and AGO) on this Pi.
         for addr, session in self.sessions.items():
             status = session.state.observed_status
             if status in {
@@ -1567,24 +1569,22 @@ class ControllerLoop:
                     observedStatus=getattr(status, "value", str(status)),
                 )
                 return
-            needs_clear = (
+            # Keep last sale on the pump LCD; apply price after next lift RESET.
+            if (
                 status
                 in {
                     ObservedStatus.FILLING_COMPLETED,
                     ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
                 }
                 or addr in self._sale_display_held
-            )
-            # Wait for hang-up before consuming — CD5/RESET while nozzle OUT
-            # is ignored and would drop the queued price.
-            if needs_clear and session.state.nozzle_position is not NozzlePosition.IN:
+            ):
                 logger.info(
-                    "set_price_deferred_await_hangup",
+                    "set_price_deferred_display_hold",
                     correlationId=pending.correlation_id,
                     unitPriceRaw=pending.unit_price_raw,
                     address=addr,
                     observedStatus=getattr(status, "value", str(status)),
-                    nozzlePosition=session.state.nozzle_position.value,
+                    saleDisplayHeld=addr in self._sale_display_held,
                 )
                 return
 
@@ -1602,44 +1602,6 @@ class ControllerLoop:
         self._startup_price_attempted.clear()
         any_ok = False
         for addr, session in self.sessions.items():
-            status = session.state.observed_status
-            needs_clear = (
-                status
-                in {
-                    ObservedStatus.FILLING_COMPLETED,
-                    ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
-                }
-                or addr in self._sale_display_held
-            )
-            if needs_clear and session.state.nozzle_position is NozzlePosition.IN:
-                reset = await self._run_owned_command(
-                    session,
-                    encode_cd1_command(PumpControlCommand.RESET),
-                    PumpCommand.RESET,
-                    expect_status=ObservedStatus.RESET,
-                    idempotency=IdempotencyClass.NON_IDEMPOTENT,
-                    command_label="CD1_RESET_BEFORE_CLOUD_PRICE",
-                )
-                print(
-                    f"[CLOUD-PRICE addr={addr}] clear retained face before CD5 "
-                    f"result={reset.status.value}"
-                )
-                self._sale_display_held.discard(addr)
-                self._sale_display_hold_since.pop(addr, None)
-                self._last_dc2.pop(addr, None)
-                session.state.filled_volume_raw = 0
-                session.state.filled_amount_raw = 0
-                if reset.status not in {
-                    ExchangeResultStatus.LINK_ACKNOWLEDGED,
-                    ExchangeResultStatus.APPLICATION_CONFIRMED,
-                }:
-                    logger.warning(
-                        "set_price_reset_before_cd5_failed",
-                        address=addr,
-                        correlationId=req.correlation_id,
-                        result=reset.status.value,
-                    )
-                    continue
             payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
             result = await self._run_owned_command(
                 session,
@@ -1797,9 +1759,15 @@ class ControllerLoop:
             # after RESET without immediately emitting a zero DC2; stale cache
             # must not permanently block AUTHORIZE.
             self._last_dc2.pop(addr, None)
+            self._sale_display_held.discard(addr)
+            self._sale_display_hold_since.pop(addr, None)
             session.state.filled_volume_raw = 0
             session.state.filled_amount_raw = 0
             session.state.sale_evidence.reset_attempt()
+            # Face is cleared by this lift's RESET — apply any deferred cloud
+            # price now so SET_PRICE does not need a service restart and does
+            # not wipe last-sale totals while the hose is still hung.
+            await self._apply_pending_cloud_set_price()
         # Require that any *fresh* DC2 after RESET is zero. Missing DC2 after
         # RESET is normal (hold-display) and must not withhold AUTHORIZE.
         if not await self._verify_zero_meter_before_auth(session):
