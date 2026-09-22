@@ -176,6 +176,9 @@ class ControllerLoop:
         self._auth_deferred_logged: set[int] = set()
         self._armed_for_lift: set[int] = set()
         self._rs_poll_counter: dict[int, int] = {}
+        # correlationId -> dart addresses that already got this cloud CD5
+        self._cloud_set_price_applied: dict[str, set[int]] = {}
+        self._set_price_defer_log_at: dict[str, float] = {}
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
         self.runtime.liveness.notify_socket_present = (
@@ -1534,13 +1537,64 @@ class ControllerLoop:
             os.environ.get("INTELIPUMP_AUTHORIZE_REQUEST_DIR", "/var/lib/intelipump")
         )
 
+    def _set_price_defer_reason(self, addr: int, session: PumpSession) -> str | None:
+        """Why this dart address must wait before CD5 (None = eligible now)."""
+        status = session.state.observed_status
+        if status in {
+            ObservedStatus.AUTHORIZED,
+            ObservedStatus.FILLING,
+            ObservedStatus.SUSPENDED,
+        }:
+            return "busy"
+        # Keep last sale on the pump LCD; apply after next lift's pre-auth RESET
+        # (or post-hold RESET while hung). Sibling addresses must not block.
+        if (
+            status
+            in {
+                ObservedStatus.FILLING_COMPLETED,
+                ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+            }
+            or addr in self._sale_display_held
+        ):
+            return "display_hold"
+        return None
+
+    def _log_set_price_deferred(
+        self,
+        reason: str,
+        *,
+        correlation_id: str,
+        unit_price_raw: int,
+        address: int,
+        status: ObservedStatus,
+    ) -> None:
+        """Throttle defer logs — multi-addr PIs used to spam every poll tick."""
+        key = f"{correlation_id}:{address}:{reason}"
+        now = time.monotonic()
+        last = self._set_price_defer_log_at.get(key)
+        if last is not None and (now - last) < 5.0:
+            return
+        self._set_price_defer_log_at[key] = now
+        logger.info(
+            f"set_price_deferred_{reason}",
+            correlationId=correlation_id,
+            unitPriceRaw=unit_price_raw,
+            address=address,
+            observedStatus=getattr(status, "value", str(status)),
+            saleDisplayHeld=address in self._sale_display_held,
+        )
+
     async def _apply_pending_cloud_set_price(self) -> None:
         """Apply a cloud-queued SET_PRICE (CD5) written by intelipump-cloud-sync.
 
         Never RESET a retained last-sale face just to program price — SAO holds
-        totals until the next lift (``--hold-display-until-lift``). While the
-        face is held, leave the request file pending; CD5 runs on the next idle
-        tick or immediately after the pre-auth RESET on lift.
+        totals until the next lift (``--hold-display-until-lift``). While *that*
+        address is held, leave it pending; CD5 runs on the next idle tick or
+        immediately after that address's pre-auth RESET on lift.
+
+        Multi-address controllers (e.g. dart 1+2 on one Pi) apply per eligible
+        address. A held sale on addr=1 must not block CD5 on addr=2 after RESET,
+        and must not require a service restart.
         """
         if not self.runtime.safety.owned_lab_active_session:
             return
@@ -1548,60 +1602,48 @@ class ControllerLoop:
             consume_set_price_request,
             read_set_price_request,
             write_persisted_unit_price,
-            write_set_price_request,
         )
 
         pending = read_set_price_request()
         if pending is None:
             return
-        for addr, session in self.sessions.items():
-            status = session.state.observed_status
-            if status in {
-                ObservedStatus.AUTHORIZED,
-                ObservedStatus.FILLING,
-                ObservedStatus.SUSPENDED,
-            }:
-                logger.info(
-                    "set_price_deferred_busy",
-                    correlationId=pending.correlation_id,
-                    unitPriceRaw=pending.unit_price_raw,
-                    address=addr,
-                    observedStatus=getattr(status, "value", str(status)),
-                )
-                return
-            # Keep last sale on the pump LCD; apply price after next lift RESET.
-            if (
-                status
-                in {
-                    ObservedStatus.FILLING_COMPLETED,
-                    ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
-                }
-                or addr in self._sale_display_held
-            ):
-                logger.info(
-                    "set_price_deferred_display_hold",
-                    correlationId=pending.correlation_id,
-                    unitPriceRaw=pending.unit_price_raw,
-                    address=addr,
-                    observedStatus=getattr(status, "value", str(status)),
-                    saleDisplayHeld=addr in self._sale_display_held,
-                )
-                return
 
-        req = consume_set_price_request()
-        if req is None:
+        corr = pending.correlation_id
+        for old in list(self._cloud_set_price_applied):
+            if old != corr:
+                self._cloud_set_price_applied.pop(old, None)
+        applied = self._cloud_set_price_applied.setdefault(corr, set())
+
+        eligible: list[tuple[int, PumpSession]] = []
+        for addr, session in self.sessions.items():
+            if addr in applied:
+                continue
+            reason = self._set_price_defer_reason(addr, session)
+            if reason is not None:
+                self._log_set_price_deferred(
+                    reason,
+                    correlation_id=corr,
+                    unit_price_raw=pending.unit_price_raw,
+                    address=addr,
+                    status=session.state.observed_status,
+                )
+                continue
+            eligible.append((addr, session))
+
+        if not eligible:
             return
 
-        prices = list(req.prices_raw) or [req.unit_price_raw]
+        prices = list(pending.prices_raw) or [pending.unit_price_raw]
         # Match startup CD5: one price per logical nozzle on each address.
         nozzle_n = max(1, int(self.runtime.logical_nozzle_count or 1))
         if len(prices) == 1 and nozzle_n > 1:
             prices = prices * nozzle_n
-        self.runtime.startup_unit_price = req.unit_price_raw
-        self._price_programmed.clear()
-        self._startup_price_attempted.clear()
+        self.runtime.startup_unit_price = pending.unit_price_raw
+
         any_ok = False
-        for addr, session in self.sessions.items():
+        for addr, session in eligible:
+            self._price_programmed.discard(addr)
+            self._startup_price_attempted.discard(addr)
             payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
             result = await self._run_owned_command(
                 session,
@@ -1611,59 +1653,74 @@ class ControllerLoop:
                 command_label="CD5_SET_PRICE_CLOUD",
             )
             print(
-                f"[CLOUD-PRICE addr={addr}] CD5 price {req.unit_price_raw} "
-                f"result={result.status.value} corr={req.correlation_id}"
+                f"[CLOUD-PRICE addr={addr}] CD5 price {pending.unit_price_raw} "
+                f"result={result.status.value} corr={corr}"
             )
             logger.info(
                 "cloud_set_price_applied",
                 address=addr,
-                unitPriceRaw=req.unit_price_raw,
-                correlationId=req.correlation_id,
+                unitPriceRaw=pending.unit_price_raw,
+                correlationId=corr,
                 result=result.status.value,
-                requestedBy=req.requested_by,
+                requestedBy=pending.requested_by,
             )
             if result.status in {
                 ExchangeResultStatus.LINK_ACKNOWLEDGED,
                 ExchangeResultStatus.APPLICATION_CONFIRMED,
             }:
                 self._price_programmed.add(addr)
+                applied.add(addr)
                 any_ok = True
+
+        all_done = bool(self.sessions) and all(
+            a in applied for a in self.sessions
+        )
         if any_ok:
             try:
                 path = write_persisted_unit_price(
-                    req.unit_price_raw,
+                    pending.unit_price_raw,
                     tuple(prices[:nozzle_n]),
                     source="cloud",
                 )
                 print(
-                    f"[CLOUD-PRICE] persisted {req.unit_price_raw} → {path} "
+                    f"[CLOUD-PRICE] persisted {pending.unit_price_raw} → {path} "
                     "(survives controller restart)"
                 )
             except (OSError, ValueError) as exc:
                 logger.warning(
                     "cloud_set_price_persist_failed",
-                    unitPriceRaw=req.unit_price_raw,
+                    unitPriceRaw=pending.unit_price_raw,
                     error=str(exc),
                 )
-        else:
-            # Keep retrying on the next idle tick instead of requiring a restart.
-            try:
-                write_set_price_request(req)
+
+        if all_done:
+            consumed = consume_set_price_request()
+            self._cloud_set_price_applied.pop(corr, None)
+            if consumed is None:
                 logger.warning(
-                    "set_price_requeued_after_apply_failure",
-                    correlationId=req.correlation_id,
-                    unitPriceRaw=req.unit_price_raw,
+                    "set_price_consume_missing_after_apply",
+                    correlationId=corr,
+                    unitPriceRaw=pending.unit_price_raw,
                 )
-                print(
-                    f"[CLOUD-PRICE] requeued {req.unit_price_raw} "
-                    f"corr={req.correlation_id} (no successful CD5)"
+            else:
+                logger.info(
+                    "cloud_set_price_complete",
+                    correlationId=corr,
+                    unitPriceRaw=pending.unit_price_raw,
+                    addresses=sorted(applied),
                 )
-            except OSError as exc:
-                logger.warning(
-                    "set_price_requeue_failed",
-                    correlationId=req.correlation_id,
-                    error=str(exc),
-                )
+        elif not any_ok and eligible:
+            # Eligible but every CD5 failed — leave file for the next idle tick.
+            logger.warning(
+                "set_price_apply_failed_will_retry",
+                correlationId=corr,
+                unitPriceRaw=pending.unit_price_raw,
+                addresses=[a for a, _ in eligible],
+            )
+            print(
+                f"[CLOUD-PRICE] retry pending {pending.unit_price_raw} "
+                f"corr={corr} (CD5 not acknowledged)"
+            )
 
     def _refresh_arm_requests(self) -> None:
         """Load arm-<addr> files; arm persists until consumed on next lift AUTHORIZE."""
