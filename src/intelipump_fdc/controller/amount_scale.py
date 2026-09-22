@@ -1,12 +1,14 @@
 """Normalize Wayne DC2 money totals to the 2-decimal ledger scale.
 
 US Lab pumps report amount with 2 money decimals (₦500.00 → raw 50000).
-Some field pumps (e.g. SAO RS1) report with 1 money decimal (₦500.0 → raw 5000)
-while volume stays at 2 decimals (0.37 L → raw 37).
+Some field pumps (e.g. SAO RS1 PMS) report with 1 money decimal
+(₦500.0 → raw 5000) while volume stays at 2 decimals (0.37 L → raw 37).
+The SAO AGO/diesel dispenser reports whole naira on the wire
+(₦1000 → raw 1000) for the same 2-dp volume convention.
 
-When unit price is known, volume × price predicts the 2-dp amount. If the wire
-amount is one decade short of that prediction, scale it up once so SQLite,
-MQTT, and the dashboard stay on the same convention as US Lab.
+When unit price is known, volume × price predicts the 2-dp amount. If the
+wire amount is one or two decades short of that prediction, scale it up so
+SQLite, MQTT, and the dashboard stay on the same convention as US Lab.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ def coerce_amount_raw_to_2dp(
     amount_raw: int,
     unit_price_raw: int | None,
 ) -> int:
-    """Return amount_raw, scaled ×10 when volume×price proves 1-dp money."""
+    """Return amount_raw, scaled ×10 or ×100 when volume×price proves short money."""
     if (
         not isinstance(volume_raw, int)
         or not isinstance(amount_raw, int)
@@ -35,7 +37,9 @@ def coerce_amount_raw_to_2dp(
     if abs(amount_raw - expected) <= tol:
         return amount_raw
 
-    scaled = amount_raw * 10
-    if abs(scaled - expected) <= tol:
-        return scaled
+    # Prefer the smallest decade that matches (1-dp money first, then whole naira).
+    for factor in (10, 100):
+        scaled = amount_raw * factor
+        if abs(scaled - expected) <= tol:
+            return scaled
     return amount_raw
