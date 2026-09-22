@@ -47,24 +47,41 @@ _CD1_MAP: dict[PumpCommand, PumpControlCommand] = {
 
 
 def _local_set_price_pump_ids(*, device_id: str, pumps: list[Any]) -> set[str]:
-    """Pump ids this Pi is allowed to price (SQLite + device-id + channel map)."""
+    """Pump ids this Pi is allowed to price.
+
+    One-Pi-per-pump (``…-pi-00N``): only ``pump-N`` — never every station pump
+    that happens to sit in local SQLite (that caused PMS All-price to CD5 AGO).
+    Lab / multi-pump devices (no ``pi-N`` suffix): keep SQLite + channel map.
+    """
     ids: set[str] = set()
+    owned_logicals: set[str] | None = None
+    m = re.search(r"pi-0*(\d+)\s*$", device_id or "", flags=re.IGNORECASE)
+    if m:
+        n = int(m.group(1))
+        owned_logicals = {f"pump-{n}", f"pump-{n:03d}"}
+        ids |= set(owned_logicals)
+
+    def _is_owned_logical(logical: str) -> bool:
+        if owned_logicals is None:
+            return True
+        return logical in owned_logicals
+
     for p in pumps:
-        logical = getattr(p, "logical_pump_id", None)
+        logical = str(getattr(p, "logical_pump_id", None) or "").strip()
+        if owned_logicals is not None:
+            if not logical or not _is_owned_logical(logical):
+                continue
+        elif logical and not _is_owned_logical(logical):
+            continue
         if logical:
-            ids.add(str(logical).strip())
+            ids.add(logical)
         pid = getattr(p, "id", None)
         if pid:
             ids.add(str(pid).strip())
         addr = getattr(p, "dart_address", None)
         if addr is not None:
             ids.add(str(addr).strip())
-    # InteliPump-SAO-RS1-pi-008 → pump-8
-    m = re.search(r"pi-0*(\d+)\s*$", device_id or "", flags=re.IGNORECASE)
-    if m:
-        n = int(m.group(1))
-        ids.add(f"pump-{n}")
-        ids.add(f"pump-{n:03d}")
+
     map_path = (
         os.environ.get("INTELIPUMP_CHANNEL_MAP_PATH")
         or os.environ.get("INTELIPUMP_CHANNEL_MAP")
@@ -74,7 +91,6 @@ def _local_set_price_pump_ids(*, device_id: str, pumps: list[Any]) -> set[str]:
     if map_path:
         try:
             from pathlib import Path as _P
-            import json
 
             raw = json.loads(_P(map_path).read_text(encoding="utf-8"))
             if isinstance(raw, dict):
@@ -82,9 +98,12 @@ def _local_set_price_pump_ids(*, device_id: str, pumps: list[Any]) -> set[str]:
                     if not isinstance(spec, dict):
                         continue
                     for key in ("pump_id", "pumpId"):
-                        val = spec.get(key)
-                        if val:
-                            ids.add(str(val).strip())
+                        val = str(spec.get(key) or "").strip()
+                        if not val:
+                            continue
+                        if not _is_owned_logical(val):
+                            continue
+                        ids.add(val)
         except (OSError, ValueError, TypeError):
             pass
     return {i for i in ids if i}
@@ -258,17 +277,10 @@ class CloudCommandIntake:
                     device_id=self._device_id,
                     pumps=pumps,
                 )
-                pump = next(
-                    (
-                        p
-                        for p in pumps
-                        if p.logical_pump_id == cmd.pumpId
-                        or p.id == cmd.pumpId
-                        or str(p.dart_address) == cmd.pumpId
-                    ),
-                    None,
-                )
-                if cmd.pumpId not in local_ids and pump is None:
+                # Require pumpId in the device-owned set. Do not accept merely
+                # because a station-wide SQLite row exists for that logical id
+                # (PMS All-price was CD5'd on AGO when SQLite listed every pump).
+                if cmd.pumpId not in local_ids:
                     reasons.append("set_price_not_for_this_device")
                     eligible = False
                     logger.info(
@@ -281,6 +293,19 @@ class CloudCommandIntake:
                     )
                 else:
                     eligible = True
+                    pump = next(
+                        (
+                            p
+                            for p in pumps
+                            if p.logical_pump_id == cmd.pumpId
+                            or p.id == cmd.pumpId
+                            or (
+                                str(p.dart_address) == cmd.pumpId
+                                and p.logical_pump_id in local_ids
+                            )
+                        ),
+                        None,
+                    )
                     if pump is not None:
                         pump_db_id = pump.id
 
