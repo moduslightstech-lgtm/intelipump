@@ -1620,6 +1620,37 @@ class ControllerLoop:
         if pending is None:
             return
 
+        # Defense in depth: cloned AGO Pi must not apply a PMS pumpId left in
+        # the request file by a mis-filtered cloud-sync.
+        if pending.pump_id:
+            from intelipump_fdc.cloud.set_price_ownership import (
+                owned_logical_pump_ids,
+                pump_id_allowed_for_device,
+            )
+
+            device_id = (
+                os.environ.get("INTELIPUMP_CONTROLLER__DEVICE_ID") or ""
+            ).strip()
+            if not pump_id_allowed_for_device(
+                pump_id=pending.pump_id, device_id=device_id
+            ):
+                owned = owned_logical_pump_ids(device_id=device_id)
+                logger.warning(
+                    "cloud_set_price_rejected_wrong_pump",
+                    pumpId=pending.pump_id,
+                    unitPriceRaw=pending.unit_price_raw,
+                    correlationId=pending.correlation_id,
+                    deviceId=device_id or None,
+                    ownedPumpIds=sorted(owned) if owned else None,
+                )
+                print(
+                    f"[CLOUD-PRICE] discarding SET_PRICE for {pending.pump_id} "
+                    f"(this Pi owns {sorted(owned) if owned else 'unscoped'}); "
+                    f"corr={pending.correlation_id}"
+                )
+                consume_set_price_request()
+                return
+
         corr = pending.correlation_id
         now = time.monotonic()
         for old in list(self._cloud_set_price_applied):

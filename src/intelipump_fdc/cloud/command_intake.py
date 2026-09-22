@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -18,6 +17,7 @@ from intelipump_fdc.cloud.mqtt.base import MqttClient
 from intelipump_fdc.cloud.mqtt.models import MqttMessage
 from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.schemas import CloudCommandInbound
+from intelipump_fdc.cloud.set_price_ownership import local_set_price_pump_ids
 from intelipump_fdc.cloud.set_price_request import (
     SetPriceRequest,
     parse_prices_from_payload,
@@ -45,68 +45,9 @@ _CD1_MAP: dict[PumpCommand, PumpControlCommand] = {
 }
 
 
-
+# Back-compat for tests that import the old private name.
 def _local_set_price_pump_ids(*, device_id: str, pumps: list[Any]) -> set[str]:
-    """Pump ids this Pi is allowed to price.
-
-    One-Pi-per-pump (``…-pi-00N``): only ``pump-N`` — never every station pump
-    that happens to sit in local SQLite (that caused PMS All-price to CD5 AGO).
-    Lab / multi-pump devices (no ``pi-N`` suffix): keep SQLite + channel map.
-    """
-    ids: set[str] = set()
-    owned_logicals: set[str] | None = None
-    m = re.search(r"pi-0*(\d+)\s*$", device_id or "", flags=re.IGNORECASE)
-    if m:
-        n = int(m.group(1))
-        owned_logicals = {f"pump-{n}", f"pump-{n:03d}"}
-        ids |= set(owned_logicals)
-
-    def _is_owned_logical(logical: str) -> bool:
-        if owned_logicals is None:
-            return True
-        return logical in owned_logicals
-
-    for p in pumps:
-        logical = str(getattr(p, "logical_pump_id", None) or "").strip()
-        if owned_logicals is not None:
-            if not logical or not _is_owned_logical(logical):
-                continue
-        elif logical and not _is_owned_logical(logical):
-            continue
-        if logical:
-            ids.add(logical)
-        pid = getattr(p, "id", None)
-        if pid:
-            ids.add(str(pid).strip())
-        addr = getattr(p, "dart_address", None)
-        if addr is not None:
-            ids.add(str(addr).strip())
-
-    map_path = (
-        os.environ.get("INTELIPUMP_CHANNEL_MAP_PATH")
-        or os.environ.get("INTELIPUMP_CHANNEL_MAP")
-        or os.environ.get("CHANNEL_MAP_PATH")
-        or ""
-    ).strip()
-    if map_path:
-        try:
-            from pathlib import Path as _P
-
-            raw = json.loads(_P(map_path).read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                for spec in raw.values():
-                    if not isinstance(spec, dict):
-                        continue
-                    for key in ("pump_id", "pumpId"):
-                        val = str(spec.get(key) or "").strip()
-                        if not val:
-                            continue
-                        if not _is_owned_logical(val):
-                            continue
-                        ids.add(val)
-        except (OSError, ValueError, TypeError):
-            pass
-    return {i for i in ids if i}
+    return local_set_price_pump_ids(device_id=device_id, pumps=pumps)
 
 
 def _normalize_cloud_environment(value: str) -> str:
@@ -273,7 +214,7 @@ class CloudCommandIntake:
             # so an AGO SET_PRICE (pump-8) was applied on every PMS Pi too.
             async with unit_of_work(self._factory) as uow:
                 pumps = await uow.pumps.list_for_station(self._station_id)
-                local_ids = _local_set_price_pump_ids(
+                local_ids = local_set_price_pump_ids(
                     device_id=self._device_id,
                     pumps=pumps,
                 )
@@ -289,10 +230,20 @@ class CloudCommandIntake:
                         deviceId=self._device_id,
                         commandPumpId=cmd.pumpId,
                         localPumpIds=sorted(local_ids),
+                        unitPriceRaw=(cmd.payload or {}).get("unitPriceRaw"),
                         correlationId=cmd.correlationId,
                     )
                 else:
                     eligible = True
+                    logger.info(
+                        "set_price_accepted_for_device",
+                        stationId=self._station_id,
+                        deviceId=self._device_id,
+                        commandPumpId=cmd.pumpId,
+                        localPumpIds=sorted(local_ids),
+                        unitPriceRaw=(cmd.payload or {}).get("unitPriceRaw"),
+                        correlationId=cmd.correlationId,
+                    )
                     pump = next(
                         (
                             p
