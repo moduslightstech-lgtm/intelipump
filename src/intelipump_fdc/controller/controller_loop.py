@@ -178,7 +178,11 @@ class ControllerLoop:
         self._rs_poll_counter: dict[int, int] = {}
         # correlationId -> dart addresses that already got this cloud CD5
         self._cloud_set_price_applied: dict[str, set[int]] = {}
+        self._cloud_set_price_gave_up: dict[str, set[int]] = {}
+        self._cloud_set_price_fail_count: dict[str, int] = {}
+        self._cloud_set_price_next_try: dict[str, float] = {}
         self._set_price_defer_log_at: dict[str, float] = {}
+        self._cloud_set_price_retry_log_at: float = 0.0
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
         self.runtime.liveness.notify_socket_present = (
@@ -1439,26 +1443,31 @@ class ControllerLoop:
             and addr not in self._startup_price_attempted
             and self.runtime.startup_unit_price is not None
         ):
-            self._startup_price_attempted.add(addr)
-            payload = encode_cd5_price_update(
-                prices_raw=[self.runtime.startup_unit_price]
-                * self.runtime.logical_nozzle_count
-            )
-            result = await self._run_owned_command(
-                session,
-                payload,
-                PumpCommand.SET_PRICE,
-                idempotency=IdempotencyClass.NON_IDEMPOTENT,
-            )
-            print(
-                f"[OWNED-LAB addr={addr}] CD5 price "
-                f"{self.runtime.startup_unit_price} result={result.status.value}"
-            )
-            if result.status in {
-                ExchangeResultStatus.LINK_ACKNOWLEDGED,
-                ExchangeResultStatus.APPLICATION_CONFIRMED,
-            }:
-                self._price_programmed.add(addr)
+            # Cloud SET_PRICE owns CD5 while a request file is pending — do not
+            # also fire startup CD5 on the same tick (bus contention / timeout spam).
+            from intelipump_fdc.cloud.set_price_request import read_set_price_request
+
+            if read_set_price_request() is None:
+                self._startup_price_attempted.add(addr)
+                payload = encode_cd5_price_update(
+                    prices_raw=[self.runtime.startup_unit_price]
+                    * self.runtime.logical_nozzle_count
+                )
+                result = await self._run_owned_command(
+                    session,
+                    payload,
+                    PumpCommand.SET_PRICE,
+                    idempotency=IdempotencyClass.NON_IDEMPOTENT,
+                )
+                print(
+                    f"[OWNED-LAB addr={addr}] CD5 price "
+                    f"{self.runtime.startup_unit_price} result={result.status.value}"
+                )
+                if result.status in {
+                    ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                    ExchangeResultStatus.APPLICATION_CONFIRMED,
+                }:
+                    self._price_programmed.add(addr)
 
         if flags.automatic_reset and addr not in self._startup_reset_done:
             if session.should_skip_reset():
@@ -1595,6 +1604,9 @@ class ControllerLoop:
         Multi-address controllers (e.g. dart 1+2 on one Pi) apply per eligible
         address. A held sale on addr=1 must not block CD5 on addr=2 after RESET,
         and must not require a service restart.
+
+        TIMED_OUT / failed CD5 uses backoff so a silent dart address cannot
+        hammer the bus every poll tick (and must not re-open startup CD5).
         """
         if not self.runtime.safety.owned_lab_active_session:
             return
@@ -1609,14 +1621,17 @@ class ControllerLoop:
             return
 
         corr = pending.correlation_id
+        now = time.monotonic()
         for old in list(self._cloud_set_price_applied):
             if old != corr:
                 self._cloud_set_price_applied.pop(old, None)
+                self._cloud_set_price_gave_up.pop(old, None)
         applied = self._cloud_set_price_applied.setdefault(corr, set())
+        gave_up = self._cloud_set_price_gave_up.setdefault(corr, set())
 
         eligible: list[tuple[int, PumpSession]] = []
         for addr, session in self.sessions.items():
-            if addr in applied:
+            if addr in applied or addr in gave_up:
                 continue
             reason = self._set_price_defer_reason(addr, session)
             if reason is not None:
@@ -1627,6 +1642,10 @@ class ControllerLoop:
                     address=addr,
                     status=session.state.observed_status,
                 )
+                continue
+            retry_key = f"{corr}:{addr}"
+            next_try = self._cloud_set_price_next_try.get(retry_key)
+            if next_try is not None and now < next_try:
                 continue
             eligible.append((addr, session))
 
@@ -1642,8 +1661,10 @@ class ControllerLoop:
 
         any_ok = False
         for addr, session in eligible:
-            self._price_programmed.discard(addr)
-            self._startup_price_attempted.discard(addr)
+            # Suppress parallel startup CD5 while cloud is driving this address.
+            # Do not clear _startup_price_attempted — that re-opens OWNED-LAB CD5
+            # spam on every TIMED_OUT cloud attempt.
+            self._startup_price_attempted.add(addr)
             payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
             result = await self._run_owned_command(
                 session,
@@ -1664,16 +1685,40 @@ class ControllerLoop:
                 result=result.status.value,
                 requestedBy=pending.requested_by,
             )
+            retry_key = f"{corr}:{addr}"
             if result.status in {
                 ExchangeResultStatus.LINK_ACKNOWLEDGED,
                 ExchangeResultStatus.APPLICATION_CONFIRMED,
             }:
                 self._price_programmed.add(addr)
                 applied.add(addr)
+                self._cloud_set_price_fail_count.pop(retry_key, None)
+                self._cloud_set_price_next_try.pop(retry_key, None)
                 any_ok = True
+            else:
+                fails = self._cloud_set_price_fail_count.get(retry_key, 0) + 1
+                self._cloud_set_price_fail_count[retry_key] = fails
+                # Back off: 15s, 30s, 60s… so a silent dart cannot own the bus.
+                delay = min(120.0, 15.0 * (2 ** min(fails - 1, 3)))
+                self._cloud_set_price_next_try[retry_key] = now + delay
+                if fails >= 5:
+                    gave_up.add(addr)
+                    logger.warning(
+                        "set_price_gave_up_address",
+                        correlationId=corr,
+                        address=addr,
+                        unitPriceRaw=pending.unit_price_raw,
+                        failures=fails,
+                        lastResult=result.status.value,
+                    )
+                    print(
+                        f"[CLOUD-PRICE addr={addr}] giving up after {fails} "
+                        f"failed CD5 ({result.status.value}); "
+                        "other nozzles / next lift can still apply"
+                    )
 
-        all_done = bool(self.sessions) and all(
-            a in applied for a in self.sessions
+        settled = bool(self.sessions) and all(
+            a in applied or a in gave_up for a in self.sessions
         )
         if any_ok:
             try:
@@ -1693,9 +1738,17 @@ class ControllerLoop:
                     error=str(exc),
                 )
 
-        if all_done:
+        if settled:
+            # Finish when every address succeeded or gave up — stops retry storm.
+            # If nothing succeeded, still consume so the bus recovers; operator
+            # can re-send SET_PRICE.
             consumed = consume_set_price_request()
             self._cloud_set_price_applied.pop(corr, None)
+            self._cloud_set_price_gave_up.pop(corr, None)
+            for key in list(self._cloud_set_price_fail_count):
+                if key.startswith(f"{corr}:"):
+                    self._cloud_set_price_fail_count.pop(key, None)
+                    self._cloud_set_price_next_try.pop(key, None)
             if consumed is None:
                 logger.warning(
                     "set_price_consume_missing_after_apply",
@@ -1707,20 +1760,28 @@ class ControllerLoop:
                     "cloud_set_price_complete",
                     correlationId=corr,
                     unitPriceRaw=pending.unit_price_raw,
-                    addresses=sorted(applied),
+                    applied=sorted(applied),
+                    gaveUp=sorted(gave_up),
                 )
+                if not applied:
+                    print(
+                        f"[CLOUD-PRICE] cleared pending {pending.unit_price_raw} "
+                        f"corr={corr} with no ACK (gave up on "
+                        f"{sorted(gave_up)}); re-send from admin if needed"
+                    )
         elif not any_ok and eligible:
-            # Eligible but every CD5 failed — leave file for the next idle tick.
-            logger.warning(
-                "set_price_apply_failed_will_retry",
-                correlationId=corr,
-                unitPriceRaw=pending.unit_price_raw,
-                addresses=[a for a, _ in eligible],
-            )
-            print(
-                f"[CLOUD-PRICE] retry pending {pending.unit_price_raw} "
-                f"corr={corr} (CD5 not acknowledged)"
-            )
+            if (now - self._cloud_set_price_retry_log_at) >= 5.0:
+                self._cloud_set_price_retry_log_at = now
+                logger.warning(
+                    "set_price_apply_failed_will_retry",
+                    correlationId=corr,
+                    unitPriceRaw=pending.unit_price_raw,
+                    addresses=[a for a, _ in eligible],
+                )
+                print(
+                    f"[CLOUD-PRICE] retry pending {pending.unit_price_raw} "
+                    f"corr={corr} (CD5 not acknowledged; backing off)"
+                )
 
     def _refresh_arm_requests(self) -> None:
         """Load arm-<addr> files; arm persists until consumed on next lift AUTHORIZE."""

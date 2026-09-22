@@ -108,3 +108,39 @@ async def test_set_price_applies_to_idle_sibling_while_other_holds_sale(
     assert ok.await_count == 2
     assert read_set_price_request() is None
     assert "corr-partial" not in loop._cloud_set_price_applied
+
+
+@pytest.mark.asyncio
+async def test_set_price_backs_off_after_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    loop = _dual_addr_loop()
+    loop.sessions[1].state.observed_status = ObservedStatus.RESET
+    loop.sessions[2].state.observed_status = ObservedStatus.RESET
+
+    write_set_price_request(
+        SetPriceRequest(
+            correlation_id="corr-timeout",
+            command_id="cmd-timeout",
+            unit_price_raw=1875,
+            prices_raw=(1875,),
+        )
+    )
+
+    timed_out = AsyncMock(
+        return_value=type(
+            "R",
+            (),
+            {"status": ExchangeResultStatus.TIMED_OUT},
+        )()
+    )
+    loop._run_owned_command = timed_out  # type: ignore[method-assign]
+
+    await loop._apply_pending_cloud_set_price()
+    first_calls = timed_out.await_count
+    assert first_calls >= 1
+    # Immediate re-entry must not hammer again (backoff).
+    await loop._apply_pending_cloud_set_price()
+    assert timed_out.await_count == first_calls
+    assert read_set_price_request() is not None
