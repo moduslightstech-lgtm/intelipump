@@ -812,6 +812,23 @@ class ControllerLoop:
         await self._drain_pending_data(session)
         expected = item.expect_status_after_tx
         if expected is not None:
+            # After display-hold RESET/AUTHORIZE, Wayne often skips link ACK but
+            # already shows the expected DC1 in the demux (sometimes stamped
+            # just before write_complete). Accept that immediately — do not burn
+            # application_confirm_max_polls (~2s) failing a freshness check first.
+            if session.state.observed_status.value == expected:
+                print(
+                    f"[OWNED-LAB addr={session.address}] "
+                    f"{item.command_type.value} confirmed by poll DC1"
+                )
+                return ExchangeResult(
+                    status=ExchangeResultStatus.APPLICATION_CONFIRMED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    detail="confirmed_by_observed_status",
+                    write_start_mono=not_before,
+                )
             confirmed = await self._confirm_application(
                 session,
                 expected=ObservedStatus(expected),
@@ -830,37 +847,47 @@ class ControllerLoop:
                     detail="confirmed_by_poll",
                     write_start_mono=not_before,
                 )
-        else:
-            for _ in range(self.runtime.config.application_confirm_max_polls):
-                if self._observation_satisfies_command(session, item):
-                    print(
-                        f"[OWNED-LAB addr={session.address}] "
-                        f"{item.command_type.value} confirmed by poll DATA"
-                    )
-                    return ExchangeResult(
-                        status=ExchangeResultStatus.APPLICATION_CONFIRMED,
-                        address=session.address,
-                        sequence=seq,
-                        correlation_id=item.correlation_id,
-                        detail="confirmed_by_poll",
-                        write_start_mono=not_before,
-                    )
-                if self._command_ack_seen(session, seq, not_before=not_before):
-                    print(f"RX ACK addr={session.address} seq={seq} (late)")
-                    return ExchangeResult(
-                        status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
-                        address=session.address,
-                        sequence=seq,
-                        correlation_id=item.correlation_id,
-                        detail="ack_on_poll",
-                        write_start_mono=not_before,
-                    )
-                write_start, _complete = await self._write_frame(
-                    session.build_poll(),
+            return None
+
+        # CD2: this head often skips ACK. One quiet poll is enough — do not
+        # spend application_confirm_max_polls before assuming success.
+        if self._is_cd2_payload(item.application_payload):
+            if self._command_ack_seen(session, seq, not_before=not_before):
+                print(f"RX ACK addr={session.address} seq={seq} (late)")
+                return ExchangeResult(
+                    status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
                     address=session.address,
-                    note="POLL_CONFIRM",
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    detail="ack_on_poll",
+                    write_start_mono=not_before,
                 )
-                await self._read_poll_session(session, not_before_mono=write_start)
+            write_start, _complete = await self._write_frame(
+                session.build_poll(),
+                address=session.address,
+                note="POLL_CONFIRM",
+            )
+            await self._read_poll_session(session, not_before_mono=write_start)
+            if self._command_ack_seen(session, seq, not_before=not_before):
+                print(f"RX ACK addr={session.address} seq={seq} (late)")
+                return ExchangeResult(
+                    status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                    address=session.address,
+                    sequence=seq,
+                    correlation_id=item.correlation_id,
+                    detail="ack_on_poll",
+                    write_start_mono=not_before,
+                )
+            return ExchangeResult(
+                status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                address=session.address,
+                sequence=seq,
+                correlation_id=item.correlation_id,
+                detail="cd2_assumed_after_poll",
+                write_start_mono=not_before,
+            )
+
+        for _ in range(self.runtime.config.application_confirm_max_polls):
             if self._observation_satisfies_command(session, item):
                 print(
                     f"[OWNED-LAB addr={session.address}] "
@@ -884,16 +911,35 @@ class ControllerLoop:
                     detail="ack_on_poll",
                     write_start_mono=not_before,
                 )
-            if self._is_cd2_payload(item.application_payload):
-                # This head often skips CD2 ACK; a quiet poll after TX is enough.
-                return ExchangeResult(
-                    status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
-                    address=session.address,
-                    sequence=seq,
-                    correlation_id=item.correlation_id,
-                    detail="cd2_assumed_after_poll",
-                    write_start_mono=not_before,
-                )
+            write_start, _complete = await self._write_frame(
+                session.build_poll(),
+                address=session.address,
+                note="POLL_CONFIRM",
+            )
+            await self._read_poll_session(session, not_before_mono=write_start)
+        if self._observation_satisfies_command(session, item):
+            print(
+                f"[OWNED-LAB addr={session.address}] "
+                f"{item.command_type.value} confirmed by poll DATA"
+            )
+            return ExchangeResult(
+                status=ExchangeResultStatus.APPLICATION_CONFIRMED,
+                address=session.address,
+                sequence=seq,
+                correlation_id=item.correlation_id,
+                detail="confirmed_by_poll",
+                write_start_mono=not_before,
+            )
+        if self._command_ack_seen(session, seq, not_before=not_before):
+            print(f"RX ACK addr={session.address} seq={seq} (late)")
+            return ExchangeResult(
+                status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                address=session.address,
+                sequence=seq,
+                correlation_id=item.correlation_id,
+                detail="ack_on_poll",
+                write_start_mono=not_before,
+            )
         return None
 
     async def _send_outbound_once(
@@ -1081,26 +1127,40 @@ class ControllerLoop:
     ) -> ExchangeResult | None:
         if not self._observation_satisfies_command(session, item):
             return None
-        # Status-expecting commands must see DC1 observed after this TX.
-        # Stale DATA must not APPLICATION_CONFIRM AUTHORIZE/RESET.
+        # Status-expecting commands must see DC1 observed after this TX started.
+        # Prefer write_start over write_complete: Wayne often overlaps the reply
+        # with our TX (last_byte < write_complete) — that is still a fresh reply
+        # to this command, not a pre-command stale face.
         if item.expect_status_after_tx is not None:
-            floor = command_tx_mono if command_tx_mono is not None else write_start_mono
+            floor = (
+                write_start_mono
+                if write_start_mono is not None
+                else command_tx_mono
+            )
             if floor is None or not session.status_observed_after(
                 ObservedStatus(item.expect_status_after_tx),
                 not_before_mono=floor,
             ):
-                logger.info(
-                    "stale_response_rejected",
-                    address=session.address,
-                    command=item.command_type.value,
-                    expected=item.expect_status_after_tx,
-                    observed=session.state.observed_status.value,
-                    frame_is_stale=frame_is_stale,
-                    last_status_time=session.state.last_status_time,
-                    command_tx_mono=command_tx_mono,
-                    reason="status_not_fresh_after_command",
-                )
-                return None
+                # Soft-stale but already showing expected status: accept when the
+                # demux status matches (display-hold RESET/AUTHORIZE path).
+                if not (
+                    frame_is_stale
+                    and session.state.observed_status.value
+                    == item.expect_status_after_tx
+                ):
+                    logger.info(
+                        "stale_response_rejected",
+                        address=session.address,
+                        command=item.command_type.value,
+                        expected=item.expect_status_after_tx,
+                        observed=session.state.observed_status.value,
+                        frame_is_stale=frame_is_stale,
+                        last_status_time=session.state.last_status_time,
+                        command_tx_mono=command_tx_mono,
+                        write_start_mono=write_start_mono,
+                        reason="status_not_fresh_after_command",
+                    )
+                    return None
         session.note_link_ack(ack_mono=time.monotonic(), sequence=sequence)
         return ExchangeResult(
             status=ExchangeResultStatus.APPLICATION_CONFIRMED,
@@ -1204,6 +1264,8 @@ class ControllerLoop:
 
         Default (negative ``sale_display_hold_seconds``): hold until the next
         lift; RESET runs as part of AUTHORIZE-on-lift (face stays until lift).
+        The lift path confirms RESET/AUTHORIZE from observed DC1 immediately
+        when Wayne skips link ACK, so the motor still comes up quickly.
 
         Non-negative: timed hold, then RESET while hung for a faster next lift
         (face clears before lift). Do not hold after zero-delivery hang-up.
@@ -1585,7 +1647,18 @@ class ControllerLoop:
         before_status = session.state.observed_status.value
         before_noz = session.state.nozzle_position.value
         await self._drain_pending_data(session)
-        if self._bus_delays_enabled():
+        # Keep display-hold until this lift; clear face with RESET then AUTH fast.
+        # Skip the inter-command bus sleep when clearing a retained sale face —
+        # every 80ms stacks on the already-required RESET → CD2 → AUTHORIZE.
+        clearing_retained_face = (
+            addr in self._sale_display_held
+            or session.state.observed_status
+            in {
+                ObservedStatus.FILLING_COMPLETED,
+                ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+            }
+        )
+        if self._bus_delays_enabled() and not clearing_retained_face:
             await asyncio.sleep(0.08)
         latest = self._last_dc2.get(addr)
         face_nonzero = bool(latest and (latest[0] > 0 or latest[1] > 0))
@@ -1601,7 +1674,7 @@ class ControllerLoop:
             print(
                 f"[OWNED-LAB addr={addr}] pre-auth RESET "
                 f"result={reset.status.value}"
-                f"{' (clear retained face)' if face_nonzero else ''}"
+                f"{' (clear retained face)' if face_nonzero or clearing_retained_face else ''}"
             )
             if reset.status not in {
                 ExchangeResultStatus.LINK_ACKNOWLEDGED,

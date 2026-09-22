@@ -926,3 +926,35 @@ async def test_recover_return_status_when_dc1_known() -> None:
     assert result is not None
     assert result.status is ExchangeResultStatus.APPLICATION_CONFIRMED
     await ctrl.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_cd2_assumes_after_one_poll() -> None:
+    """Display-hold lift path: do not burn 8 polls waiting for a CD2 ACK."""
+    ctrl, _pump = create_memory_transport_pair()
+    await ctrl.open()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,), response_timeout_ms=50),
+    )
+    loop = ControllerLoop(runtime)
+    session = loop.sessions[1]
+    item = OutboundDataItem.create(
+        address=1,
+        application_payload=bytes((0x02, 0x01, 0x01)),
+        command_type=PumpCommand.AUTHORIZE,
+        simulator_only=True,
+        idempotency=IdempotencyClass.NON_IDEMPOTENT,
+        max_retries=0,
+    )
+    t0 = time.monotonic()
+    result = await loop._recover_command_after_timeout(
+        session, item, seq=0, not_before=time.monotonic() - 1.0
+    )
+    elapsed = time.monotonic() - t0
+    assert result is not None
+    assert result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED
+    assert result.detail == "cd2_assumed_after_poll"
+    assert elapsed < 0.5
+    await ctrl.close()
