@@ -1452,17 +1452,24 @@ class ControllerLoop:
         pending = read_set_price_request()
         if pending is None:
             return
-        # Skip while any hose is mid-dispense; leave the file for a later tick.
-        for session in self.sessions.values():
-            if session.state.observed_status in {
+        # Skip while any hose is mid-dispense or holding a completed-sale face;
+        # leave the file for a later tick (Wayne often ignores CD5 then).
+        for addr, session in self.sessions.items():
+            status = session.state.observed_status
+            if status in {
                 ObservedStatus.AUTHORIZED,
                 ObservedStatus.FILLING,
                 ObservedStatus.SUSPENDED,
-            }:
+                ObservedStatus.FILLING_COMPLETED,
+                ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+            } or addr in self._sale_display_held:
                 logger.info(
                     "set_price_deferred_busy",
                     correlationId=pending.correlation_id,
                     unitPriceRaw=pending.unit_price_raw,
+                    address=addr,
+                    observedStatus=getattr(status, "value", str(status)),
+                    saleDisplayHeld=addr in self._sale_display_held,
                 )
                 return
 

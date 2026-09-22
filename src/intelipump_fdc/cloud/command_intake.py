@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import re
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -41,6 +43,51 @@ _CD1_MAP: dict[PumpCommand, PumpControlCommand] = {
     PumpCommand.AUTHORIZE: PumpControlCommand.AUTHORIZE,
     PumpCommand.STOP: PumpControlCommand.STOP,
 }
+
+
+
+def _local_set_price_pump_ids(*, device_id: str, pumps: list[Any]) -> set[str]:
+    """Pump ids this Pi is allowed to price (SQLite + device-id + channel map)."""
+    ids: set[str] = set()
+    for p in pumps:
+        logical = getattr(p, "logical_pump_id", None)
+        if logical:
+            ids.add(str(logical).strip())
+        pid = getattr(p, "id", None)
+        if pid:
+            ids.add(str(pid).strip())
+        addr = getattr(p, "dart_address", None)
+        if addr is not None:
+            ids.add(str(addr).strip())
+    # InteliPump-SAO-RS1-pi-008 → pump-8
+    m = re.search(r"pi-0*(\d+)\s*$", device_id or "", flags=re.IGNORECASE)
+    if m:
+        n = int(m.group(1))
+        ids.add(f"pump-{n}")
+        ids.add(f"pump-{n:03d}")
+    map_path = (
+        os.environ.get("INTELIPUMP_CHANNEL_MAP_PATH")
+        or os.environ.get("INTELIPUMP_CHANNEL_MAP")
+        or os.environ.get("CHANNEL_MAP_PATH")
+        or ""
+    ).strip()
+    if map_path:
+        try:
+            from pathlib import Path as _P
+            import json
+
+            raw = json.loads(_P(map_path).read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for spec in raw.values():
+                    if not isinstance(spec, dict):
+                        continue
+                    for key in ("pump_id", "pumpId"):
+                        val = spec.get(key)
+                        if val:
+                            ids.add(str(val).strip())
+        except (OSError, ValueError, TypeError):
+            pass
+    return {i for i in ids if i}
 
 
 def _normalize_cloud_environment(value: str) -> str:
@@ -201,11 +248,16 @@ class CloudCommandIntake:
                     if not result.eligible:
                         reasons.extend(result.blocking_reasons)
         elif production_set_price and not reasons:
-            eligible = True
             current_state = "IDLE"
-            # Best-effort pump row for audit only.
+            # One Pi per physical pump: only queue CD5 when pumpId is ours.
+            # Previously we fell back to pumps[0] and still wrote the request,
+            # so an AGO SET_PRICE (pump-8) was applied on every PMS Pi too.
             async with unit_of_work(self._factory) as uow:
                 pumps = await uow.pumps.list_for_station(self._station_id)
+                local_ids = _local_set_price_pump_ids(
+                    device_id=self._device_id,
+                    pumps=pumps,
+                )
                 pump = next(
                     (
                         p
@@ -214,10 +266,23 @@ class CloudCommandIntake:
                         or p.id == cmd.pumpId
                         or str(p.dart_address) == cmd.pumpId
                     ),
-                    pumps[0] if pumps else None,
+                    None,
                 )
-                if pump is not None:
-                    pump_db_id = pump.id
+                if cmd.pumpId not in local_ids and pump is None:
+                    reasons.append("set_price_not_for_this_device")
+                    eligible = False
+                    logger.info(
+                        "set_price_ignored_other_pump",
+                        stationId=self._station_id,
+                        deviceId=self._device_id,
+                        commandPumpId=cmd.pumpId,
+                        localPumpIds=sorted(local_ids),
+                        correlationId=cmd.correlationId,
+                    )
+                else:
+                    eligible = True
+                    if pump is not None:
+                        pump_db_id = pump.id
 
         # Phase 9: production active commands never execute — except SET_PRICE
         # when this sidecar is explicitly confirmed as a production sole-
