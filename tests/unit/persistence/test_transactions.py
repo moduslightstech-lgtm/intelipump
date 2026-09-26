@@ -231,3 +231,37 @@ async def test_update_filling_does_not_mutate_completed(engine_factory: tuple) -
         assert frozen is not None
         assert frozen.status == "COMPLETED"
         assert frozen.raw_amount == 800000
+
+
+@pytest.mark.asyncio
+async def test_transaction_started_queue_includes_pump_id(engine_factory: tuple) -> None:
+    _engine, factory = engine_factory
+    pump_id = await _pump(factory)
+    async with unit_of_work(factory) as uow:
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id=STATION,
+                pump_db_id=pump_id,
+                transaction_uuid="tx-started-pump",
+                nozzle_id=1,
+                raw_price=1175,
+                price_decimals=2,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="PROD",
+                canonical_pump_id="pump-1",
+                canonical_nozzle_id="1",
+                source_identifier="pump-1",
+            )
+        )
+        batch = await uow.sync_queue.claim_batch(limit=10)
+    started = [row for row in batch if row.event_type == "TRANSACTION_STARTED"]
+    assert started
+    payload = started[0].payload
+    assert payload.get("pumpId") == "pump-1"
+    assert payload.get("pump_id") == "pump-1"
+    assert payload.get("raw_volume") == 0
+    assert payload.get("raw_amount") == 0
+

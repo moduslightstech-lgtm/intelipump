@@ -48,13 +48,34 @@ class TransactionService:
             source_frame_ref=None,
             observed_at=req.started_at,
         )
+        pump = await self._uow.pumps.get_by_id(tx.pump_id)
+        source = tx.source_identifier or (pump.logical_pump_id if pump else tx.pump_id)
+        mqtt_pump = tx.canonical_pump_id or source
+        mqtt_nozzle = tx.canonical_nozzle_id
+        vol_dec = tx.volume_decimals if tx.volume_decimals is not None else 2
+        amt_dec = tx.amount_decimals if tx.amount_decimals is not None else 2
         await self._uow.sync_queue.enqueue_checked(
             entity_type="transaction",
             entity_id=tx.transaction_uuid,
             event_type="TRANSACTION_STARTED",
             payload={
                 "transaction_uuid": tx.transaction_uuid,
+                "transactionId": tx.transaction_uuid,
                 "station_id": tx.station_id,
+                "stationId": tx.station_id,
+                "pump_id": mqtt_pump,
+                "pumpId": mqtt_pump,
+                "nozzle_id": mqtt_nozzle if mqtt_nozzle is not None else tx.nozzle_id,
+                "nozzleId": mqtt_nozzle,
+                "sourceIdentifier": source,
+                "raw_volume": 0,
+                "volume_decimals": vol_dec,
+                "raw_amount": 0,
+                "amount_decimals": amt_dec,
+                "raw_unit_price": tx.raw_price,
+                "price_decimals": tx.price_decimals if tx.price_decimals is not None else 2,
+                "final_status": "DISPENSING",
+                "status": "DISPENSING",
                 "environment": tx.environment,
                 "simulated": tx.simulated,
             },
