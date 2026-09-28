@@ -24,6 +24,8 @@ from intelipump_fdc.persistence.database import (
 )
 from intelipump_fdc.persistence.migrations import init_schema
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
+from intelipump_fdc.services.lab_persistence import _persist_recovery_path
+from intelipump_fdc.services.persist_recovery import PersistRecoveryStore
 from intelipump_fdc.services.persistence_worker import PersistenceWorker
 from intelipump_fdc.services.recovery_service import RecoveryService
 
@@ -42,7 +44,12 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_ws_subscribers=settings.api.max_ws_subscribers,
         queue_size=settings.api.event_queue_size,
     )
-    worker = PersistenceWorker(maxsize=256)
+    worker = PersistenceWorker(
+        maxsize=256,
+        recovery_store=PersistRecoveryStore(
+            _persist_recovery_path(settings.database.url)
+        ),
+    )
     worker.start()
 
     addresses = tuple(

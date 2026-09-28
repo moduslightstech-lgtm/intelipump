@@ -54,7 +54,7 @@ ExecStart=/home/intelipump/intelipump/intelipump-fdc/.venv/bin/intelipump-contro
   --database-url sqlite+aiosqlite:////var/lib/intelipump/intelipump.db
 
 WatchdogSec=30s
-Restart=on-failure
+Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
 KillSignal=SIGTERM

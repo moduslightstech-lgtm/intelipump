@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -535,3 +536,91 @@ async def test_healthy_polling_cadence_unchanged() -> None:
     assert max(gaps) < 0.2
     assert runtime.safety.mode.value == "LISTEN_ONLY"
     assert len(runtime.outbound) == 0
+
+
+@pytest.mark.asyncio
+async def test_wedged_open_serial_forces_reopen() -> None:
+    """Port reports open + all pumps DISCONNECTED → force close for reconnect."""
+    transport = FlakySerialTransport(fail_opens=0, path="/dev/ttyUSB-wedge")
+    await transport.open()
+    transitions = HealthTransitionLog()
+    runtime = ControllerRuntime(
+        transport=transport,
+        safety=default_lab_safety(),
+        config=PollSchedulerConfig(
+            addresses=(1, 2),
+            response_timeout_ms=20,
+            inter_poll_delay_ms=1,
+            idle_sleep_ms=1,
+            max_retries=0,
+        ),
+        notifier=NullNotifier(),
+        health_transitions=transitions,
+        status_interval_s=60.0,
+    )
+    loop = ControllerLoop(runtime)
+    loop.serial_health.observe_open_success(is_reconnect=False)
+    loop._mark_all_pumps_disconnected()
+    # Simulate a previously healthy bus that went silent while is_open stayed true.
+    loop.runtime.liveness.last_successful_poll_mono = time.monotonic() - 25.0
+    loop._cloud_set_price_gave_up["corr-x"] = {1, 2}
+    loop._cloud_set_price_fail_count["corr-x:1"] = 5
+
+    assert loop._should_force_serial_reopen() is True
+    closed = await loop._maybe_force_serial_reopen()
+    assert closed is True
+    assert transport.is_open is False
+    assert loop._cloud_set_price_gave_up == {}
+    assert loop._cloud_set_price_fail_count == {}
+    # Cooldown prevents thrashing.
+    assert loop._should_force_serial_reopen() is False
+
+
+@pytest.mark.asyncio
+async def test_watchdog_gated_when_polls_stale() -> None:
+    transport = FlakySerialTransport(fail_opens=0, path="/dev/ttyUSB-wd")
+    notifier = RecordingNotifier()
+    runtime = ControllerRuntime(
+        transport=transport,
+        safety=default_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,)),
+        notifier=notifier,
+        status_interval_s=60.0,
+    )
+    loop = ControllerLoop(runtime)
+    # Port closed / reconnecting: still feed watchdog.
+    assert loop._should_feed_watchdog() is True
+
+    await transport.open()
+    loop.serial_health.observe_open_success(is_reconnect=False)
+    # No successful poll yet, but within startup grace → feed.
+    assert loop._should_feed_watchdog() is True
+    # Stale successful poll while port still "open" → stop feeding (systemd restart).
+    loop.runtime.liveness.last_successful_poll_mono = time.monotonic() - 30.0
+    assert loop._should_feed_watchdog() is False
+    loop._on_loop_progress()
+    assert notifier.watchdog_count == 0
+    # Fresh poll → feed again.
+    loop.runtime.liveness.mark_successful_poll()
+    assert loop._should_feed_watchdog() is True
+    loop._on_loop_progress()
+    assert notifier.watchdog_count >= 1
+
+
+def test_set_price_deferred_while_disconnected() -> None:
+    a, _b = create_memory_transport_pair()
+    runtime = ControllerRuntime(
+        transport=a,
+        safety=default_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,)),
+        notifier=NullNotifier(),
+    )
+    loop = ControllerLoop(runtime)
+    session = loop.sessions[1]
+    session.mark_serial_lost()
+    assert loop._set_price_defer_reason(1, session) == "offline"
+    loop._cloud_set_price_gave_up["c1"] = {1}
+    loop._cloud_set_price_fail_count["c1:1"] = 5
+    loop._revive_cloud_set_price_for_address(1)
+    assert 1 not in loop._cloud_set_price_gave_up["c1"]
+    assert "c1:1" not in loop._cloud_set_price_fail_count

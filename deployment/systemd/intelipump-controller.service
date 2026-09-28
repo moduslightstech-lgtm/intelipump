@@ -25,7 +25,7 @@ ExecStart=/opt/intelipump-fdc/.venv/bin/intelipump-controller \
   --baud 9600 \
   --no-persistence
 WatchdogSec=30s
-Restart=on-failure
+Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
 KillSignal=SIGTERM

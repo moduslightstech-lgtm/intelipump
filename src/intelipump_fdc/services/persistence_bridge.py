@@ -103,6 +103,11 @@ class PersistenceBridge:
         return None
 
     def attach(self) -> None:
+        self._worker.register_handler("state_changed", self._handle_state_changed)
+        self._worker.register_handler("app_decoded", self._handle_app_decoded)
+        self._worker.register_handler("comm", self._handle_comm)
+        self._worker.register_handler("protocol_error", self._handle_protocol_error)
+        self._worker.register_handler("rejected_command", self._handle_rejected_command)
         self._events.add_subscriber(self.on_event)
 
     def detach(self) -> None:
@@ -283,15 +288,23 @@ class PersistenceBridge:
     def on_event(self, event: ControllerEvent) -> None:
         self._publish_live(event)
         if event.type is ControllerEventType.STATE_CHANGED:
+            inner = dict(event.payload) if event.payload else {}
+            normalized = str(inner.get("normalized_state") or "")
+            # Sale finalize must not be droppable NORMAL work.
+            is_completion = normalized in {"FILLING_COMPLETE", "LIMIT_REACHED"}
             self._worker.submit(
                 kind="state_changed",
                 payload={
                     "address": event.address,
                     "detail": event.detail,
-                    "payload": dict(event.payload),
+                    "payload": inner,
                 },
                 handler=self._handle_state_changed,
-                priority=PersistPriority.NORMAL,
+                priority=(
+                    PersistPriority.CRITICAL
+                    if is_completion
+                    else PersistPriority.NORMAL
+                ),
             )
         elif event.type is ControllerEventType.APPLICATION_TRANSACTION_DECODED:
             detail = event.detail or ""
