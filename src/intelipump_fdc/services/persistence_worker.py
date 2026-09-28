@@ -193,8 +193,10 @@ class PersistenceWorker:
             if write_ahead is not None
             else (priority is PersistPriority.CRITICAL and key is not None and attempt == 0)
         )
-        if do_write_ahead and key is not None and self._recovery_store is not None:
-            self._recovery_store.upsert(
+        # Never fsync on the caller (serial/poll) thread: EventBus → on_event →
+        # submit runs inside the controller loop. Schedule durability off-loop.
+        if do_write_ahead and key is not None:
+            self._schedule_durable_upsert(
                 identity_key=key,
                 kind=kind,
                 payload=payload,
@@ -207,6 +209,7 @@ class PersistenceWorker:
         except asyncio.QueueFull as exc:
             if priority is PersistPriority.CRITICAL:
                 if key is not None and self._recovery_store is not None:
+                    # Must land on disk before return — rare path; sync fsync OK.
                     self._recovery_store.upsert(
                         identity_key=key,
                         kind=kind,
@@ -227,6 +230,40 @@ class PersistenceWorker:
                     "critical persistence queue full; refusing to drop"
                 ) from exc
             self._dropped_normal += 1
+
+    def _schedule_durable_upsert(
+        self,
+        *,
+        identity_key: str,
+        kind: str,
+        payload: dict[str, Any],
+        attempt: int,
+        last_error: str | None = None,
+    ) -> None:
+        """Persist recovery row without blocking the serial control loop.
+
+        Uses ``asyncio.to_thread`` when a loop is running; falls back to sync
+        upsert only when called outside an event loop (unit tests).
+        """
+        store = self._recovery_store
+        if store is None:
+            return
+
+        def _write() -> None:
+            store.upsert(
+                identity_key=identity_key,
+                kind=kind,
+                payload=payload,
+                attempt=attempt,
+                last_error=last_error,
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _write()
+            return
+        loop.create_task(asyncio.to_thread(_write), name="persist-recovery-upsert")
 
     def recover_pending(self) -> int:
         """Re-queue PENDING durable jobs (restart or in-process queue-full)."""
@@ -319,6 +356,25 @@ class PersistenceWorker:
                 self._spill_failed(job, "missing_handler")
             self._release_inflight(job.identity_key)
             return
+        # Ensure write-ahead landed before handler work (worker task, not poll loop).
+        if (
+            job.priority == int(PersistPriority.CRITICAL)
+            and job.identity_key
+            and self._recovery_store is not None
+        ):
+            store = self._recovery_store
+            key = job.identity_key
+            kind = job.kind
+            payload = job.payload
+            attempt = job.attempt
+            await asyncio.to_thread(
+                lambda: store.upsert(
+                    identity_key=key,
+                    kind=kind,
+                    payload=payload,
+                    attempt=attempt,
+                )
+            )
         try:
             await handler(job.payload)
             self._processed += 1
