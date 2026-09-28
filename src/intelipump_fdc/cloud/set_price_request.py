@@ -319,18 +319,56 @@ def _migrate_legacy_outcome_file() -> None:
         write_set_price_outcome(outcome)
 
 
+def _fsync_dir(path: Path) -> None:
+    """Fsync the parent directory so the rename is power-loss durable."""
+    dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
+    """Write JSON with: temp → fsync file → atomic replace → fsync directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    body = json.dumps(payload, separators=(",", ":"))
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            if tmp.is_file():
+                tmp.unlink()
+        raise
+    return path
+
+
 def write_set_price_outcome(outcome: SetPriceOutcome) -> Path:
     """Persist a final outcome until cloud-sync MQTT delivery is acknowledged.
 
     One file per correlationId so concurrent / sequential SET_PRICE results
-    never overwrite each other.
+    never overwrite each other. Power-loss durable before return so the
+    controller may safely clear the pending request afterward.
     """
-    path = _outcome_file_path(outcome.correlation_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(outcome.to_dict(), separators=(",", ":")), encoding="utf-8")
-    tmp.replace(path)
-    return path
+    return _atomic_write_json(_outcome_file_path(outcome.correlation_id), outcome.to_dict())
+
+
+def pending_request_blocks_outcome_ack(correlation_id: str) -> bool:
+    """True when the pending request still pairs with this outcome correlation.
+
+    Cloud-sync must not delete the outcome while that request can survive a
+    crash — otherwise the only completion marker is gone and the request can
+    be re-applied after restart.
+    """
+    pending = read_set_price_request()
+    if pending is None:
+        return False
+    return pending.correlation_id.strip() == (correlation_id or "").strip()
 
 
 def has_set_price_outcome(correlation_id: str) -> bool:

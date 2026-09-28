@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -222,3 +223,133 @@ async def test_publish_ordering_stops_on_first_failure_keeps_rest(
     left = list_set_price_outcomes()
     assert len(left) == 1
     assert left[0].correlation_id == "b-second"
+
+
+@pytest.mark.asyncio
+async def test_publish_ack_between_outcome_write_and_request_removal_keeps_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cloud-sync must not remove the outcome while the request can still crash-survive."""
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    from intelipump_fdc.cloud.command_intake import CloudCommandIntake
+    from intelipump_fdc.cloud.mqtt.models import MqttPublishResult
+    from intelipump_fdc.cloud.topics import TopicBuilder
+    from intelipump_fdc.cloud.set_price_request import (
+        consume_set_price_request,
+        pending_request_blocks_outcome_ack,
+    )
+
+    # Finalize window: durable outcome written, request not yet cleared.
+    write_set_price_request(
+        SetPriceRequest(
+            correlation_id="corr-race",
+            command_id="cmd-race",
+            unit_price_raw=1400,
+            prices_raw=(1400,),
+            pump_id="pump-1",
+        )
+    )
+    write_set_price_outcome(_outcome("corr-race", "pump-1"))
+    assert pending_request_blocks_outcome_ack("corr-race") is True
+
+    mqtt = MagicMock()
+    mqtt.is_connected = True
+    mqtt.publish = AsyncMock(
+        return_value=MqttPublishResult(topic="t", acknowledged=True, mid=1)
+    )
+    intake = CloudCommandIntake(
+        session_factory=MagicMock(),
+        mqtt=mqtt,
+        topics=TopicBuilder(environment="PRODUCTION"),
+        station_id="SAO-1",
+        device_id="pi-001",
+        environment="PRODUCTION",
+        simulated=False,
+        allow_lab_simulator_commands=False,
+    )
+
+    published = await intake.publish_pending_set_price_outcomes()
+    assert published == 0
+    mqtt.publish.assert_not_called()
+    assert {o.correlation_id for o in list_set_price_outcomes()} == {"corr-race"}
+    assert read_set_price_request() is not None
+
+    # Controller finishes: request cleared after durable outcome.
+    assert consume_set_price_request() is not None
+    assert pending_request_blocks_outcome_ack("corr-race") is False
+
+    published = await intake.publish_pending_set_price_outcomes()
+    assert published == 1
+    mqtt.publish.assert_called_once()
+    assert list_set_price_outcomes() == []
+
+
+@pytest.mark.asyncio
+async def test_publish_ack_after_mqtt_still_defers_if_request_reappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the request is still present at ACK time, keep the outcome on disk."""
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    from intelipump_fdc.cloud.command_intake import CloudCommandIntake
+    from intelipump_fdc.cloud.mqtt.models import MqttPublishResult
+    from intelipump_fdc.cloud.topics import TopicBuilder
+
+    write_set_price_outcome(_outcome("corr-late", "pump-2"))
+
+    mqtt = MagicMock()
+    mqtt.is_connected = True
+
+    async def _publish_then_recreate_request(*_a, **_k):
+        # Simulate the race: between publish start and ACK-delete, the
+        # controller has written outcome but not yet cleared the request —
+        # or a concurrent reader still sees it. Recreate request mid-publish.
+        write_set_price_request(
+            SetPriceRequest(
+                correlation_id="corr-late",
+                command_id="cmd-late",
+                unit_price_raw=1400,
+                prices_raw=(1400,),
+                pump_id="pump-2",
+            )
+        )
+        return MqttPublishResult(topic="t", acknowledged=True, mid=7)
+
+    mqtt.publish = AsyncMock(side_effect=_publish_then_recreate_request)
+    intake = CloudCommandIntake(
+        session_factory=MagicMock(),
+        mqtt=mqtt,
+        topics=TopicBuilder(environment="PRODUCTION"),
+        station_id="SAO-1",
+        device_id="pi-001",
+        environment="PRODUCTION",
+        simulated=False,
+        allow_lab_simulator_commands=False,
+    )
+    published = await intake.publish_pending_set_price_outcomes()
+    assert published == 0
+    assert {o.correlation_id for o in list_set_price_outcomes()} == {"corr-late"}
+
+
+def test_outcome_write_sync_failure_raises_and_leaves_no_corrupt_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    import intelipump_fdc.cloud.set_price_request as spr
+
+    real_fsync = os.fsync
+    calls = {"n": 0}
+
+    def _fsync_fail(fd: int) -> None:
+        calls["n"] += 1
+        # Fail the file fsync (first call); dir fsync would be second.
+        if calls["n"] == 1:
+            raise OSError("simulated fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(spr.os, "fsync", _fsync_fail)
+    with pytest.raises(OSError, match="simulated fsync failure"):
+        write_set_price_outcome(_outcome("corr-sync-fail", "pump-1"))
+    assert list_set_price_outcomes() == []
+    outcomes = tmp_path / "set-price-outcomes"
+    if outcomes.is_dir():
+        assert list(outcomes.glob("*.json")) == []

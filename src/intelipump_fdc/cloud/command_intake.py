@@ -24,6 +24,7 @@ from intelipump_fdc.cloud.set_price_request import (
     ack_set_price_outcome,
     list_set_price_outcomes,
     parse_prices_from_payload,
+    pending_request_blocks_outcome_ack,
     write_set_price_request,
 )
 from intelipump_fdc.cloud.topics import TopicBuilder
@@ -123,11 +124,23 @@ class CloudCommandIntake:
 
         Multiple correlations stay on disk concurrently — a publish failure
         leaves that outcome (and later ones) for the next loop tick.
+
+        While the matching set-price *request* still exists, do not publish or
+        ACK-delete the outcome: that file is the only completion marker that
+        lets a crash after outcome-write clear the leftover request without
+        re-applying CD5.
         """
         published = 0
         for outcome in list_set_price_outcomes():
             if not self._mqtt.is_connected:
                 break
+            if pending_request_blocks_outcome_ack(outcome.correlation_id):
+                logger.info(
+                    "set_price_outcome_ack_deferred_request_still_present",
+                    correlationId=outcome.correlation_id,
+                    pumpId=outcome.pump_id,
+                )
+                continue
             pump_id = outcome.pump_id
             station_id = outcome.station_id or self._station_id
             result_payload = {
@@ -189,6 +202,15 @@ class CloudCommandIntake:
                     stationId=station_id,
                 )
                 break
+            # Re-check after PUBACK: controller may still hold the request.
+            if pending_request_blocks_outcome_ack(outcome.correlation_id):
+                logger.info(
+                    "set_price_outcome_ack_deferred_request_still_present",
+                    correlationId=outcome.correlation_id,
+                    pumpId=pump_id,
+                    note="after_mqtt_ack",
+                )
+                continue
             ack_set_price_outcome(outcome.correlation_id)
             published += 1
             logger.info(
