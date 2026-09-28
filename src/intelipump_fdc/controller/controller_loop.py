@@ -1676,14 +1676,16 @@ class ControllerLoop:
         accepted: bool,
         detail: str,
     ) -> bool:
-        """Write durable outcome first; only then remove the pending request.
+        """Write durable outcome first; only then durably remove the request.
 
-        Returns False when the outcome could not be persisted — request is kept
-        so the next tick (or process restart) can finalize again.
+        Returns False when the outcome could not be persisted or the request
+        unlink/dir-sync failed — request is kept (or restored) and the outcome
+        is retained so the next tick can finalize again. Cloud-sync must not
+        ACK-delete the outcome until request removal is durable.
         """
         from intelipump_fdc.cloud.set_price_request import (
             SetPriceOutcome,
-            consume_set_price_request,
+            consume_set_price_request_durable,
             has_set_price_outcome,
             write_set_price_outcome,
         )
@@ -1714,7 +1716,16 @@ class ControllerLoop:
                     error=str(exc),
                 )
                 return False
-        consumed = consume_set_price_request()
+        try:
+            consumed = consume_set_price_request_durable()
+        except OSError as exc:
+            logger.warning(
+                "cloud_set_price_request_unlink_sync_failed_outcome_retained",
+                correlationId=corr,
+                unitPriceRaw=pending.unit_price_raw,
+                error=str(exc),
+            )
+            return False
         if consumed is None:
             logger.warning(
                 "set_price_consume_missing_after_outcome",
@@ -1756,7 +1767,7 @@ class ControllerLoop:
         if not self.runtime.safety.owned_lab_active_session:
             return
         from intelipump_fdc.cloud.set_price_request import (
-            consume_set_price_request,
+            consume_set_price_request_durable,
             has_set_price_outcome,
             read_set_price_request,
             write_persisted_unit_price,
@@ -1766,9 +1777,18 @@ class ControllerLoop:
         if pending is None:
             return
 
-        # Crash recovery: outcome already durable → just clear leftover request.
+        # Crash recovery: outcome already durable → durably clear leftover request.
         if has_set_price_outcome(pending.correlation_id):
-            consume_set_price_request()
+            try:
+                consume_set_price_request_durable()
+            except OSError as exc:
+                logger.warning(
+                    "set_price_request_clear_sync_failed_outcome_retained",
+                    correlationId=pending.correlation_id,
+                    unitPriceRaw=pending.unit_price_raw,
+                    error=str(exc),
+                )
+                return
             self._clear_cloud_set_price_tracking(pending.correlation_id)
             logger.info(
                 "set_price_request_cleared_outcome_already_durable",

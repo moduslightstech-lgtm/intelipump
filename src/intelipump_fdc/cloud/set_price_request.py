@@ -187,7 +187,11 @@ def read_set_price_request() -> SetPriceRequest | None:
 
 
 def consume_set_price_request() -> SetPriceRequest | None:
-    """Read and remove a pending request. Returns None if absent or invalid."""
+    """Read and remove a pending request. Returns None if absent or invalid.
+
+    Prefer ``consume_set_price_request_durable`` at finalization so the unlink
+    is power-loss durable before cloud-sync may ACK-delete the outcome.
+    """
     path = request_path()
     req = read_set_price_request()
     if req is None:
@@ -199,6 +203,33 @@ def consume_set_price_request() -> SetPriceRequest | None:
         path.unlink()
     except OSError:
         return None
+    return req
+
+
+def consume_set_price_request_durable() -> SetPriceRequest | None:
+    """Unlink the pending request, then fsync its directory.
+
+    On directory sync failure the request is rewritten so cloud-sync cannot
+    ACK-delete the paired outcome while the unlink is not yet durable.
+    Raises OSError when durability cannot be guaranteed (after restore).
+    """
+    path = request_path()
+    req = read_set_price_request()
+    if req is None:
+        if path.is_file():
+            try:
+                path.unlink()
+                _fsync_dir(path)
+            except OSError:
+                pass
+        return None
+    path.unlink()
+    try:
+        _fsync_dir(path)
+    except OSError:
+        # Unlink may not be durable — put the request back and keep the outcome.
+        write_set_price_request(req)
+        raise
     return req
 
 
@@ -329,21 +360,33 @@ def _fsync_dir(path: Path) -> None:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
-    """Write JSON with: temp → fsync file → atomic replace → fsync directory."""
+    """Write JSON with: temp → fsync file → atomic replace → fsync directory.
+
+    If the post-replace directory sync fails, the final path is removed so
+    callers (``has_set_price_outcome``) never treat a non-durable write as done.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     body = json.dumps(payload, separators=(",", ":"))
+    replaced = False
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(body)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        replaced = True
         _fsync_dir(path)
     except OSError:
         with contextlib.suppress(OSError):
             if tmp.is_file():
                 tmp.unlink()
+        if replaced:
+            with contextlib.suppress(OSError):
+                if path.is_file():
+                    path.unlink()
+            with contextlib.suppress(OSError):
+                _fsync_dir(path)
         raise
     return path
 
@@ -353,7 +396,9 @@ def write_set_price_outcome(outcome: SetPriceOutcome) -> Path:
 
     One file per correlationId so concurrent / sequential SET_PRICE results
     never overwrite each other. Power-loss durable before return so the
-    controller may safely clear the pending request afterward.
+    controller may safely clear the pending request afterward. A failed
+    directory sync after replace removes the file so it is not treated as
+    durable on the next tick.
     """
     return _atomic_write_json(_outcome_file_path(outcome.correlation_id), outcome.to_dict())
 
