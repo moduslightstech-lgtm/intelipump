@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -300,3 +301,196 @@ def test_tmp_path_rejected_without_opt_in(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("INTELIPUMP_PERSIST_RECOVERY_ALLOW_TMP", raising=False)
     with pytest.raises(PersistRecoveryIOError):
         PersistRecoveryStore(Path("/tmp/intelipump_forbid.jsonl"))
+
+
+@pytest.mark.asyncio
+async def test_delayed_write_ahead_completes_before_handler(tmp_path: Path) -> None:
+    """One tracked write per sale; handler must not run until that write finishes."""
+    store = PersistRecoveryStore(tmp_path / "delay.jsonl")
+    worker = PersistenceWorker(maxsize=8, recovery_store=store)
+    release_write = threading.Event()
+    handler_started = asyncio.Event()
+    upsert_calls = {"n": 0}
+    real_upsert = store.upsert
+
+    def gated_upsert(**kwargs):
+        upsert_calls["n"] += 1
+        if not release_write.wait(timeout=2.0):
+            raise TimeoutError("write gate not released")
+        return real_upsert(**kwargs)
+
+    store.upsert = gated_upsert  # type: ignore[method-assign]
+    worker.start()
+    order: list[str] = []
+
+    async def handler(_payload: dict) -> None:
+        order.append("handler")
+        handler_started.set()
+
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-delay"),
+        handler=handler,
+        priority=PersistPriority.CRITICAL,
+    )
+    for _ in range(100):
+        if upsert_calls["n"] >= 1:
+            break
+        await asyncio.sleep(0.02)
+    assert upsert_calls["n"] == 1
+    assert worker.pending_durable_writes >= 1
+    assert not handler_started.is_set()
+    assert "handler" not in order
+
+    release_write.set()
+    for _ in range(40):
+        if worker.processed >= 1:
+            break
+        await asyncio.sleep(0.05)
+    await worker.stop(flush=True, timeout_s=2.0)
+    assert order == ["handler"]
+    assert upsert_calls["n"] == 1  # one tracked write, not a second execute upsert
+    assert store.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_write_ahead_failure_retries_without_killing_worker(
+    tmp_path: Path,
+) -> None:
+    """Write-ahead I/O failure must not kill the worker or drop the sale."""
+    store = PersistRecoveryStore(tmp_path / "fail.jsonl")
+    worker = PersistenceWorker(
+        maxsize=8,
+        critical_max_attempts=4,
+        recovery_store=store,
+    )
+    real_upsert = store.upsert
+    fails_left = {"n": 2}
+
+    def flaky_upsert(**kwargs):
+        if fails_left["n"] > 0:
+            fails_left["n"] -= 1
+            raise PersistRecoveryIOError("simulated disk failure")
+        return real_upsert(**kwargs)
+
+    store.upsert = flaky_upsert  # type: ignore[method-assign]
+    worker.start()
+    handled: list[str] = []
+
+    async def handler(payload: dict) -> None:
+        handled.append(str(payload["payload"]["active_transaction_id"]))
+
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-write-fail"),
+        handler=handler,
+        priority=PersistPriority.CRITICAL,
+    )
+    for _ in range(80):
+        if worker.processed >= 1:
+            break
+        await asyncio.sleep(0.05)
+    # Worker still alive and accepted further work.
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-write-ok"),
+        handler=handler,
+        priority=PersistPriority.CRITICAL,
+    )
+    for _ in range(40):
+        if worker.processed >= 2:
+            break
+        await asyncio.sleep(0.05)
+    await worker.stop(flush=True, timeout_s=2.0)
+    assert "tx-write-fail" in handled
+    assert "tx-write-ok" in handled
+    assert worker.critical_retries >= 1
+    assert store.pending_count() == 0
+    assert worker._task is None  # clean stop, not a crashed loop
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_pending_durable_write(tmp_path: Path) -> None:
+    """stop(flush=True) must account for in-flight write-ahead before returning."""
+    store = PersistRecoveryStore(tmp_path / "shutdown.jsonl")
+    worker = PersistenceWorker(maxsize=8, recovery_store=store)
+    release_write = threading.Event()
+    real_upsert = store.upsert
+    write_finished = {"done": False}
+
+    def gated_upsert(**kwargs):
+        if not release_write.wait(timeout=2.0):
+            raise TimeoutError("write gate not released")
+        result = real_upsert(**kwargs)
+        write_finished["done"] = True
+        return result
+
+    store.upsert = gated_upsert  # type: ignore[method-assign]
+    worker.start()
+
+    async def handler(_payload: dict) -> None:
+        return None
+
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-shutdown"),
+        handler=handler,
+        priority=PersistPriority.CRITICAL,
+    )
+    for _ in range(50):
+        if worker.pending_durable_writes >= 1:
+            break
+        await asyncio.sleep(0.02)
+    assert worker.pending_durable_writes >= 1
+
+    async def release_soon() -> None:
+        await asyncio.sleep(0.15)
+        release_write.set()
+
+    releaser = asyncio.create_task(release_soon())
+    await worker.stop(flush=True, timeout_s=2.0)
+    await releaser
+    assert write_finished["done"] is True
+    assert store.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_late_write_does_not_recreate_after_mark_done(tmp_path: Path) -> None:
+    """A stalled write thread must not resurrect a record after mark_done."""
+    store = PersistRecoveryStore(tmp_path / "late.jsonl")
+    worker = PersistenceWorker(maxsize=8, recovery_store=store)
+    enter_write = threading.Event()
+    release_write = threading.Event()
+    real_upsert = store.upsert
+
+    def stalled_upsert(**kwargs):
+        enter_write.set()
+        if not release_write.wait(timeout=2.0):
+            raise TimeoutError("late write not released")
+        return real_upsert(**kwargs)
+
+    store.upsert = stalled_upsert  # type: ignore[method-assign]
+    worker.start()
+    key = "state_changed:1:tx-late:FILLING_COMPLETE"
+    worker._schedule_durable_upsert(
+        identity_key=key,
+        kind="state_changed",
+        payload=_completion_payload("tx-late"),
+        attempt=0,
+    )
+    entered = await asyncio.to_thread(enter_write.wait, 2.0)
+    assert entered, "durable write task never entered upsert"
+    # Completion path: bump epoch then remove the row while the write is stalled.
+    worker._invalidate_durable_write(key)
+    # Row may not exist yet (stalled before upsert); mark_done is still safe.
+    PersistRecoveryStore.mark_done(store, key)
+    assert store.pending_count() == 0
+    release_write.set()
+    for _ in range(40):
+        if worker.pending_durable_writes == 0:
+            break
+        await asyncio.sleep(0.05)
+    # Allow the late-write undo mark_done to settle.
+    await asyncio.sleep(0.05)
+    await worker.stop(flush=True, timeout_s=2.0)
+    assert store.pending_count() == 0
