@@ -11,6 +11,10 @@ memory queue, exactly one tracked durable write task is scheduled via
 ``asyncio.to_thread``. The worker awaits that same task before running the
 sale handler, so durability lands before side effects.
 
+Completed write tasks (success or failure) stay in ``_pending_writes`` until
+``_await_durable_write`` consumes them, so a fast failure cannot be mistaken
+for "no write scheduled / success".
+
 Crash window (explicit)
 -----------------------
 From successful ``put_nowait`` until the tracked write task completes, a hard
@@ -19,6 +23,10 @@ in-memory queue). The window closes when the write finishes — before the
 handler runs. Queue-full CRITICAL spills fsync synchronously on the submit
 path and have no such window. Late writes after ``mark_done`` are suppressed
 via a per-identity epoch so a stalled thread cannot recreate a done record.
+
+If the final durable spill fails after attempts are exhausted, the sale is
+retained in-memory (degraded health) for retry when storage returns — never
+released as completed.
 """
 
 from __future__ import annotations
@@ -64,6 +72,18 @@ class PersistJob:
     identity_key: str | None = field(compare=False, default=None)
 
 
+@dataclass
+class _RetainedSale:
+    """CRITICAL sale held after final spill failure (storage unavailable)."""
+
+    kind: str
+    payload: dict[str, Any]
+    identity_key: str
+    handler: Callable[[dict[str, Any]], Awaitable[None]]
+    last_error: str
+    attempt: int
+
+
 class PersistenceWorker:
     """Background worker with priority queue, CRITICAL retries, and durable spill."""
 
@@ -93,10 +113,12 @@ class PersistenceWorker:
         self._degraded_reason: str | None = None
         self._inflight_identities: set[str] = set()
         self._requeue_task: asyncio.Task[None] | None = None
-        # One tracked durable write task per sale identity (submit → await in worker).
+        # Tracked durable write per sale — kept until worker consumes the result.
         self._pending_writes: dict[str, asyncio.Task[None]] = {}
         # Bumped on mark_done / invalidate so a late to_thread upsert cannot recreate.
         self._write_epoch: dict[str, int] = {}
+        # Sales that could not be spilled after final failure (retry when disk returns).
+        self._retained_sales: dict[str, _RetainedSale] = {}
 
     @property
     def depth(self) -> int:
@@ -123,12 +145,18 @@ class PersistenceWorker:
         return self._critical_durable_spills
 
     @property
+    def retained_sale_count(self) -> int:
+        return len(self._retained_sales)
+
+    @property
     def pending_durable_writes(self) -> int:
         return sum(1 for t in self._pending_writes.values() if not t.done())
 
     @property
     def is_degraded(self) -> bool:
         if self._degraded:
+            return True
+        if self._retained_sales:
             return True
         if self._recovery_store is not None and self._recovery_store.pending_count() > 0:
             return True
@@ -138,6 +166,8 @@ class PersistenceWorker:
     def degraded_reason(self) -> str | None:
         if self._degraded_reason:
             return self._degraded_reason
+        if self._retained_sales:
+            return f"critical_undurable_retained={len(self._retained_sales)}"
         if self._recovery_store is not None:
             n = self._recovery_store.pending_count()
             if n > 0:
@@ -198,10 +228,11 @@ class PersistenceWorker:
             )
 
     async def _requeue_while_busy(self) -> None:
-        """Pull durable spills into the memory queue while work is in flight."""
+        """Pull durable spills / retained sales into the memory queue."""
         while not self._stop.is_set():
             try:
                 await asyncio.sleep(_REQUEUE_IDLE_INTERVAL_S)
+                await self._retry_retained_sales()
                 if self._recovery_store is None:
                     continue
                 if self.depth >= self._maxsize:
@@ -290,15 +321,16 @@ class PersistenceWorker:
     ) -> asyncio.Task[None] | None:
         """Start or reuse the single tracked durable write for this sale identity.
 
-        Disk I/O runs in a worker thread. Returns the task when a loop is running;
-        performs a synchronous upsert when called outside an event loop.
+        Disk I/O runs in a worker thread. A completed task is left in place until
+        the persistence worker consumes it (success or failure).
         """
         store = self._recovery_store
         if store is None:
             return None
 
         existing = self._pending_writes.get(identity_key)
-        if existing is not None and not existing.done():
+        # Reuse in-flight *or* completed-but-unconsumed result.
+        if existing is not None:
             return existing
 
         epoch = self._write_epoch.get(identity_key, 0)
@@ -337,12 +369,7 @@ class PersistenceWorker:
 
         task = loop.create_task(_run(), name=f"persist-recovery-upsert:{identity_key}")
         self._pending_writes[identity_key] = task
-
-        def _cleanup(done: asyncio.Task[None]) -> None:
-            if self._pending_writes.get(identity_key) is done:
-                self._pending_writes.pop(identity_key, None)
-
-        task.add_done_callback(_cleanup)
+        # No done-callback removal — worker consumes via _await_durable_write.
         return task
 
     def _invalidate_durable_write(self, identity_key: str) -> None:
@@ -350,14 +377,19 @@ class PersistenceWorker:
         self._write_epoch[identity_key] = self._write_epoch.get(identity_key, 0) + 1
 
     async def _await_durable_write(self, job: PersistJob) -> None:
-        """Block the worker (not the serial loop) until write-ahead has settled."""
+        """Block the worker (not the serial loop) until write-ahead has settled.
+
+        Consumes the tracked task (including a already-finished failure) so a
+        fast write error cannot look like "no write / success".
+        """
         if (
             job.priority != int(PersistPriority.CRITICAL)
             or job.identity_key is None
             or self._recovery_store is None
         ):
             return
-        task = self._pending_writes.get(job.identity_key)
+        key = job.identity_key
+        task = self._pending_writes.get(key)
         if task is None:
             return
         try:
@@ -366,8 +398,41 @@ class PersistenceWorker:
             raise
         except Exception as exc:
             raise PersistRecoveryIOError(
-                f"write-ahead failed for {job.identity_key}: {exc}"
+                f"write-ahead failed for {key}: {exc}"
             ) from exc
+        finally:
+            # Consume only after the worker has observed the result.
+            if self._pending_writes.get(key) is task:
+                self._pending_writes.pop(key, None)
+
+    async def _store_upsert(
+        self,
+        *,
+        identity_key: str,
+        kind: str,
+        payload: dict[str, Any],
+        attempt: int,
+        last_error: str | None = None,
+    ) -> None:
+        """Durable upsert off the controller/worker event-loop thread."""
+        store = self._recovery_store
+        if store is None:
+            raise PersistRecoveryIOError("no recovery store configured")
+        await asyncio.to_thread(
+            lambda: store.upsert(
+                identity_key=identity_key,
+                kind=kind,
+                payload=payload,
+                attempt=attempt,
+                last_error=last_error,
+            )
+        )
+
+    async def _store_mark_done(self, identity_key: str) -> None:
+        store = self._recovery_store
+        if store is None:
+            return
+        await asyncio.to_thread(store.mark_done, identity_key)
 
     def recover_pending(self) -> int:
         """Re-queue PENDING durable jobs (restart or in-process queue-full)."""
@@ -384,6 +449,8 @@ class PersistenceWorker:
             if self.depth >= self._maxsize:
                 break
             if job.identity_key in self._inflight_identities:
+                continue
+            if job.identity_key in self._retained_sales:
                 continue
             handler = self._handlers.get(job.kind)
             if handler is None:
@@ -417,16 +484,66 @@ class PersistenceWorker:
             )
         return restored
 
+    async def _retry_retained_sales(self) -> int:
+        """When storage returns, spill retained sales and re-queue for handler work."""
+        if not self._retained_sales or self._recovery_store is None:
+            return 0
+        restored = 0
+        for key, retained in list(self._retained_sales.items()):
+            if self.depth >= self._maxsize:
+                break
+            try:
+                await self._store_upsert(
+                    identity_key=retained.identity_key,
+                    kind=retained.kind,
+                    payload=retained.payload,
+                    attempt=0,
+                    last_error=retained.last_error,
+                )
+            except PersistRecoveryError:
+                # Storage still unavailable — keep retained + degraded.
+                continue
+            self._retained_sales.pop(key, None)
+            self._critical_durable_spills += 1
+            # Fresh attempts once durable again.
+            try:
+                self.submit(
+                    kind=retained.kind,
+                    payload=retained.payload,
+                    handler=retained.handler,
+                    priority=PersistPriority.CRITICAL,
+                    attempt=0,
+                    identity_key=retained.identity_key,
+                    write_ahead=False,
+                )
+            except PersistenceQueueFullError:
+                # Already on disk — recover_pending will pick it up.
+                self._release_inflight(retained.identity_key)
+                restored += 1
+                continue
+            restored += 1
+            logger.warning(
+                "retained CRITICAL sale spilled after storage recovery identity=%s",
+                key,
+            )
+        if restored and not self._retained_sales:
+            self.clear_degraded_if_idle()
+        return restored
+
     def _mark_degraded(self, reason: str) -> None:
         self._degraded = True
         self._degraded_reason = reason
 
     def clear_degraded_if_idle(self) -> None:
+        if self._retained_sales:
+            return
         if self._recovery_store is not None and self._recovery_store.pending_count() > 0:
             return
         if self.depth > 0:
             return
         if self.pending_durable_writes > 0:
+            return
+        if self._pending_writes:
             return
         self._degraded = False
         self._degraded_reason = None
@@ -438,6 +555,7 @@ class PersistenceWorker:
                     self._queue.get(), timeout=_REQUEUE_IDLE_INTERVAL_S
                 )
             except TimeoutError:
+                await self._retry_retained_sales()
                 # In-process recovery: queue-full spills must not wait for restart.
                 if self._recovery_store is not None and self.depth < self._maxsize:
                     with contextlib.suppress(PersistRecoveryError):
@@ -459,8 +577,9 @@ class PersistenceWorker:
             self._errors += 1
             logger.error("persistence job has no handler kind=%s", job.kind)
             if job.priority == int(PersistPriority.CRITICAL):
-                self._spill_failed(job, "missing_handler")
-            self._release_inflight(job.identity_key)
+                await self._spill_failed(job, "missing_handler")
+            else:
+                self._release_inflight(job.identity_key)
             return
         # Await the single tracked write-ahead (worker task — not poll loop).
         try:
@@ -473,7 +592,7 @@ class PersistenceWorker:
             self._processed += 1
             if job.identity_key and self._recovery_store is not None:
                 self._invalidate_durable_write(job.identity_key)
-                self._recovery_store.mark_done(job.identity_key)
+                await self._store_mark_done(job.identity_key)
             self._release_inflight(job.identity_key)
             self.clear_degraded_if_idle()
         except Exception as exc:
@@ -500,11 +619,11 @@ class PersistenceWorker:
         if next_attempt < self._critical_max_attempts:
             self._critical_retries += 1
             self._mark_degraded(f"critical_retry kind={job.kind}")
-            # Ensure durable record exists before requeue (sync OK on worker path).
+            # Ensure durable record exists before requeue (off event-loop thread).
             spilled = False
             if job.identity_key and self._recovery_store is not None:
                 try:
-                    self._recovery_store.upsert(
+                    await self._store_upsert(
                         identity_key=job.identity_key,
                         kind=job.kind,
                         payload=job.payload,
@@ -522,7 +641,7 @@ class PersistenceWorker:
             await asyncio.sleep(_CRITICAL_RETRY_DELAY_S * next_attempt)
             # Keep identity in-flight across retry so the background requeue
             # task cannot submit a duplicate while this retry is pending.
-            # If sync spill failed, schedule another tracked write-ahead.
+            # If spill failed, schedule another tracked write-ahead.
             try:
                 self.submit(
                     kind=job.kind,
@@ -534,46 +653,86 @@ class PersistenceWorker:
                     write_ahead=not spilled,
                 )
             except PersistenceQueueFullError:
-                self._spill_failed(job, err)
-                self._release_inflight(job.identity_key)
+                await self._spill_failed(job, err)
             return
-        self._spill_failed(job, err)
-        self._release_inflight(job.identity_key)
+        await self._spill_failed(job, err)
 
-    def _spill_failed(self, job: PersistJob, error: str) -> None:
-        self._critical_durable_spills += 1
-        self._mark_degraded(f"critical_persist_failed kind={job.kind}")
+    def _retain_undurable_sale(
+        self,
+        job: PersistJob,
+        handler: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        error: str,
+    ) -> None:
         key = job.identity_key or f"{job.kind}:{job.seq}"
-        if self._recovery_store is not None:
-            try:
-                self._recovery_store.upsert(
-                    identity_key=key,
-                    kind=job.kind,
-                    payload=job.payload,
-                    attempt=job.attempt,
-                    last_error=error,
-                )
-            except PersistRecoveryError:
-                logger.exception(
-                    "CRITICAL persistence could not spill to durable store "
-                    "identity=%s kind=%s — sale retained via degraded signal only",
-                    key,
-                    job.kind,
-                )
-                return
+        resolved = handler or job.handler or self._handlers.get(job.kind)
+        if resolved is None:
+            self._mark_degraded(f"critical_undurable_no_handler kind={job.kind}")
             logger.error(
-                "CRITICAL persistence spilled to durable store identity=%s "
-                "kind=%s attempts=%s error=%s",
+                "CRITICAL sale undurable and no handler to retain identity=%s",
                 key,
-                job.kind,
-                job.attempt,
-                error,
             )
             return
+        self._retained_sales[key] = _RetainedSale(
+            kind=job.kind,
+            payload=job.payload,
+            identity_key=key,
+            handler=resolved,
+            last_error=error,
+            attempt=job.attempt,
+        )
+        # Keep identity reserved so we do not treat the sale as completed.
+        self._inflight_identities.add(key)
+        self._mark_degraded("critical_undurable_retained")
         logger.error(
-            "CRITICAL persistence failed with no recovery store; "
-            "job retained only in degraded signal identity=%s kind=%s error=%s",
+            "CRITICAL sale retained for retry after durable spill failure "
+            "identity=%s kind=%s error=%s",
             key,
             job.kind,
             error,
         )
+
+    async def _spill_failed(self, job: PersistJob, error: str) -> bool:
+        """Final durable spill. Returns True if landed on disk; else retains sale."""
+        self._mark_degraded(f"critical_persist_failed kind={job.kind}")
+        key = job.identity_key or f"{job.kind}:{job.seq}"
+        handler = job.handler or self._handlers.get(job.kind)
+        if self._recovery_store is None:
+            if handler is not None and job.identity_key:
+                self._retain_undurable_sale(job, handler, error)
+            else:
+                logger.error(
+                    "CRITICAL persistence failed with no recovery store; "
+                    "job retained only in degraded signal identity=%s kind=%s error=%s",
+                    key,
+                    job.kind,
+                    error,
+                )
+            return False
+        try:
+            await self._store_upsert(
+                identity_key=key,
+                kind=job.kind,
+                payload=job.payload,
+                attempt=job.attempt,
+                last_error=error,
+            )
+        except PersistRecoveryError:
+            logger.exception(
+                "CRITICAL persistence could not spill to durable store "
+                "identity=%s kind=%s — retaining sale for retry",
+                key,
+                job.kind,
+            )
+            self._retain_undurable_sale(job, handler, error)
+            return False
+        self._critical_durable_spills += 1
+        self._release_inflight(job.identity_key)
+        logger.error(
+            "CRITICAL persistence spilled to durable store identity=%s "
+            "kind=%s attempts=%s error=%s",
+            key,
+            job.kind,
+            job.attempt,
+            error,
+        )
+        return True

@@ -17,6 +17,7 @@ from intelipump_fdc.services.persist_recovery import (
     sale_persist_identity,
 )
 from intelipump_fdc.services.persistence_worker import (
+    PersistJob,
     PersistenceWorker,
     PersistPriority,
 )
@@ -494,3 +495,135 @@ async def test_late_write_does_not_recreate_after_mark_done(tmp_path: Path) -> N
     await asyncio.sleep(0.05)
     await worker.stop(flush=True, timeout_s=2.0)
     assert store.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_fast_write_failure_result_retained_until_consumed(
+    tmp_path: Path,
+) -> None:
+    """A write that finishes before the worker awaits must still surface failure.
+
+    Regression: done-callback removal made ``_await_durable_write`` see no task
+    and treat a fast failure as success.
+    """
+    store = PersistRecoveryStore(tmp_path / "fastfail.jsonl")
+    worker = PersistenceWorker(
+        maxsize=8,
+        critical_max_attempts=3,
+        recovery_store=store,
+    )
+    real_upsert = store.upsert
+    fails_left = {"n": 1}
+    observed: dict[str, object] = {}
+
+    def flaky_upsert(**kwargs):
+        if fails_left["n"] > 0:
+            fails_left["n"] -= 1
+            raise PersistRecoveryIOError("fast disk failure")
+        return real_upsert(**kwargs)
+
+    store.upsert = flaky_upsert  # type: ignore[method-assign]
+
+    real_execute = worker._execute
+
+    async def delay_until_write_done(job: PersistJob) -> None:
+        key = job.identity_key
+        assert key is not None
+        # Observe only the first execute — retries must not overwrite the race check.
+        if "present_before_await" not in observed:
+            for _ in range(100):
+                task = worker._pending_writes.get(key)
+                if task is not None and task.done():
+                    observed["present_before_await"] = True
+                    observed["task_done"] = True
+                    observed["had_exception"] = task.exception() is not None
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                observed["present_before_await"] = key in worker._pending_writes
+                observed["task_done"] = False
+                observed["had_exception"] = False
+        await real_execute(job)
+
+    worker._execute = delay_until_write_done  # type: ignore[method-assign]
+    worker.start()
+    handled: list[str] = []
+
+    async def handler(payload: dict) -> None:
+        handled.append(str(payload["payload"]["active_transaction_id"]))
+
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-fast-fail"),
+        handler=handler,
+        priority=PersistPriority.CRITICAL,
+    )
+    for _ in range(80):
+        if worker.processed >= 1:
+            break
+        await asyncio.sleep(0.05)
+    await worker.stop(flush=True, timeout_s=2.0)
+
+    assert observed.get("present_before_await") is True
+    assert observed.get("task_done") is True
+    assert observed.get("had_exception") is True
+    assert handled == ["tx-fast-fail"]
+    assert worker.critical_retries >= 1
+    assert store.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_persistent_disk_failure_retains_sale_until_storage_returns(
+    tmp_path: Path,
+) -> None:
+    """Final spill failure keeps the sale (degraded); recovers when disk works."""
+    store = PersistRecoveryStore(tmp_path / "persistfail.jsonl")
+    worker = PersistenceWorker(
+        maxsize=8,
+        critical_max_attempts=2,
+        recovery_store=store,
+    )
+    real_upsert = store.upsert
+    disk_up = {"ok": False}
+
+    def gated_disk(**kwargs):
+        if not disk_up["ok"]:
+            raise PersistRecoveryIOError("persistent disk failure")
+        return real_upsert(**kwargs)
+
+    store.upsert = gated_disk  # type: ignore[method-assign]
+    worker.start()
+    handled: list[str] = []
+
+    async def handler(payload: dict) -> None:
+        handled.append(str(payload["payload"]["active_transaction_id"]))
+
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-retained"),
+        handler=handler,
+        priority=PersistPriority.CRITICAL,
+    )
+    for _ in range(80):
+        if worker.retained_sale_count >= 1:
+            break
+        await asyncio.sleep(0.05)
+
+    assert worker.retained_sale_count >= 1
+    assert worker.is_degraded is True
+    assert worker.processed == 0
+    assert handled == []
+    assert store.pending_count() == 0
+
+    # Storage returns — retained sale must spill and complete.
+    disk_up["ok"] = True
+    for _ in range(80):
+        if worker.processed >= 1 and worker.retained_sale_count == 0:
+            break
+        await asyncio.sleep(0.05)
+    await worker.stop(flush=True, timeout_s=2.0)
+
+    assert handled == ["tx-retained"]
+    assert worker.retained_sale_count == 0
+    assert store.pending_count() == 0
+    assert worker.processed >= 1
