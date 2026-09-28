@@ -43,3 +43,26 @@ This is **tamper-evident**, not cryptographic tamper prevention:
 - Does not block the ~25 ms poll loop
 - Flush on clean shutdown
 - No unbounded task-per-event creation
+
+### Sale write-ahead and shutdown (CRITICAL completions)
+
+Completed-sale write-ahead is asynchronous (`asyncio.to_thread`) so the serial
+poll loop never blocks on fsync. **Hard process crash after queue accept and
+before the tracked durable write completes can lose that sale** (memory-only
+window). Queue-full CRITICAL spills still fsync synchronously on submit.
+
+If recovery storage is unavailable after retries, the sale is held in
+`_retained_sales` (degraded). Graceful `stop(flush=True)` awaits queue join, pending write-ahead, and **one**
+final retained spill — each bounded by the **remaining** flush deadline —
+snapshots undurable CRITICAL state **before** cancelling tasks, then raises
+`PersistFlushIncompleteError` (`SALE_DURABILITY_NOT_SAFE`) on queue-join
+timeout, pending-write timeout, retained-spill timeout, or remaining
+retained/inflight work.
+Controllers exit non-zero; API lifespan logs
+`api_shutdown_sale_durability_incomplete` and must **not** log
+`api_shutdown_complete`. An exception already raised by the app body is
+preserved (flush incomplete is logged, not substituted). Raising/logging the
+flush error is **not** durability success.
+
+**Unavoidable hard-crash window (unchanged):** after queue accept and before
+the tracked durable write completes, a hard process crash can lose that sale.

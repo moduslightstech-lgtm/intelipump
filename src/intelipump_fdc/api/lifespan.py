@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -24,7 +25,12 @@ from intelipump_fdc.persistence.database import (
 )
 from intelipump_fdc.persistence.migrations import init_schema
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
-from intelipump_fdc.services.persistence_worker import PersistenceWorker
+from intelipump_fdc.services.lab_persistence import _persist_recovery_path
+from intelipump_fdc.services.persist_recovery import PersistRecoveryStore
+from intelipump_fdc.services.persistence_worker import (
+    PersistFlushIncompleteError,
+    PersistenceWorker,
+)
 from intelipump_fdc.services.recovery_service import RecoveryService
 
 logger = structlog.get_logger(__name__)
@@ -42,7 +48,12 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_ws_subscribers=settings.api.max_ws_subscribers,
         queue_size=settings.api.event_queue_size,
     )
-    worker = PersistenceWorker(maxsize=256)
+    worker = PersistenceWorker(
+        maxsize=256,
+        recovery_store=PersistRecoveryStore(
+            _persist_recovery_path(settings.database.url)
+        ),
+    )
     worker.start()
 
     addresses = tuple(
@@ -156,8 +167,12 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Always finish cleanup. Never return early from finally.
+        # If the body already failed, do not replace that exception with a flush
+        # error (log flush incomplete alongside; preserve propagation).
         state.shutting_down = True
         state.metrics.accepting_commands = False
+        flush_incomplete: PersistFlushIncompleteError | None = None
         if state.cloud is not None:
             await state.cloud.stop()
         if state.controller_loop is not None:
@@ -167,7 +182,23 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
             with contextlib.suppress(asyncio.CancelledError):
                 await state.controller_task
         if state.worker is not None:
-            await state.worker.stop(flush=True, timeout_s=5.0)
+            try:
+                await state.worker.stop(flush=True, timeout_s=5.0)
+            except PersistFlushIncompleteError as exc:
+                flush_incomplete = exc
+                logger.error(
+                    "api_shutdown_sale_durability_incomplete",
+                    message=exc.operator_message(),
+                    retained_count=exc.retained_count,
+                    identity_keys=list(exc.identity_keys),
+                    reasons=list(exc.reasons),
+                )
         await broker.close_all()
         await dispose_engine(engine)
-        logger.info("api_shutdown_complete")
+        if flush_incomplete is not None:
+            # Body already raising → keep that exception; only raise flush when
+            # shutdown would otherwise look successful.
+            if sys.exception() is None:
+                raise flush_incomplete
+        else:
+            logger.info("api_shutdown_complete")

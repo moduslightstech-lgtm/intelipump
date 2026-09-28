@@ -91,6 +91,10 @@ async def controller_health(
         status = "OFFLINE"
     elif database_status != "OK" or (disconnected and not healthy):
         status = "DEGRADED"
+    elif state.worker is not None and state.worker.is_degraded:
+        status = "DEGRADED"
+        reason = state.worker.degraded_reason or "persistence_degraded"
+        warnings.append(f"persistence_degraded:{reason}")
     if state.recovery_report and state.recovery_report.warnings:
         warnings.extend(state.recovery_report.warnings[:5])
 
