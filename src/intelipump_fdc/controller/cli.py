@@ -31,6 +31,7 @@ from intelipump_fdc.services.lab_persistence import (
     apply_recovered_contexts,
     start_persistence,
 )
+from intelipump_fdc.services.persistence_worker import PersistFlushIncompleteError
 from intelipump_fdc.services.recovery_service import format_recovery_report
 
 
@@ -435,8 +436,13 @@ def run(argv: list[str] | None = None) -> None:
         finally:
             notifier.stopping()
             # Graceful shutdown: flush persistence; transport closed by run().
+            # Undurable retained sales are NOT safe — exit non-zero (do not claim success).
             if persistence is not None:
-                await persistence.shutdown()
+                try:
+                    await persistence.shutdown()
+                except PersistFlushIncompleteError as exc:
+                    print(exc.operator_message(), flush=True)
+                    raise SystemExit(1) from exc
 
         summary = loop_ctrl.summary()
         if persistence is not None:

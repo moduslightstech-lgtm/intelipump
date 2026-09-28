@@ -727,6 +727,7 @@ async def test_stop_flush_fails_when_retained_sales_undurable(
         await worker.stop(flush=True, timeout_s=1.0)
     assert exc_info.value.retained_count >= 1
     assert any("tx-flush-fail" in k for k in exc_info.value.identity_keys)
+    assert "SALE_DURABILITY_NOT_SAFE" in exc_info.value.operator_message()
     # Sale still retained — not silently discarded as flushed/safe.
     assert worker.retained_sale_count >= 1
     assert worker.is_degraded is True

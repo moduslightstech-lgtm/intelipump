@@ -180,7 +180,16 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
             try:
                 await state.worker.stop(flush=True, timeout_s=5.0)
             except PersistFlushIncompleteError as exc:
-                logger.error("persistence_worker_flush_incomplete: %s", exc)
+                # Sales in _retained_sales are memory-only — not durable/safe.
+                logger.error(
+                    "api_shutdown_sale_durability_incomplete",
+                    message=exc.operator_message(),
+                    retained_count=exc.retained_count,
+                    identity_keys=list(exc.identity_keys),
+                )
+                await broker.close_all()
+                await dispose_engine(engine)
+                return
         await broker.close_all()
         await dispose_engine(engine)
         logger.info("api_shutdown_complete")

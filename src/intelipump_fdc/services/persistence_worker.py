@@ -55,7 +55,13 @@ _REQUEUE_IDLE_INTERVAL_S = 0.1
 
 
 class PersistFlushIncompleteError(Exception):
-    """Raised when ``stop(flush=True)`` cannot make all CRITICAL sales durable."""
+    """Raised when ``stop(flush=True)`` cannot make all CRITICAL sales durable.
+
+    Sales listed in ``identity_keys`` were held only in process memory
+    (``_retained_sales``) when flush finished. They are **not** on the recovery
+    store and **will be lost** when the process exits. Raising this error must
+    never be treated as a successful / safe durability shutdown.
+    """
 
     def __init__(
         self,
@@ -71,6 +77,28 @@ class PersistFlushIncompleteError(Exception):
             f"persist flush incomplete: {retained_count} undurable retained sale(s)"
             f"{extra}"
         )
+
+    def operator_message(self) -> str:
+        """Explicit operator-facing text: memory-only sales are not safe."""
+        return (
+            "SALE_DURABILITY_NOT_SAFE: storage unavailable at shutdown; "
+            f"{self.retained_count} completed sale(s) remain only in process "
+            f"memory (_retained_sales) and will be LOST when this process exits. "
+            f"identities={list(self.identity_keys)}. "
+            "Do not treat shutdown as durable success; restore writable recovery "
+            "storage and retry, or reconcile sales manually."
+        )
+
+
+# Bounded shutdown policy when recovery storage is unavailable:
+# 1) stop(flush=True) attempts one final retained-sale spill within the flush timeout.
+# 2) If any sale remains in _retained_sales, raise PersistFlushIncompleteError.
+# 3) Callers must dispose resources, log operator_message() at ERROR, and must not
+#    claim shutdown/flush success. Controller CLI exits non-zero. API lifespan logs
+#    api_shutdown_sale_durability_incomplete (never api_shutdown_complete).
+# 4) No unbounded retry loop at shutdown.
+# Hard crash caveat: async write-ahead means a process crash after queue accept and
+# before the tracked durable write completes can also lose a sale (memory-only window).
 
 
 class PersistPriority(IntEnum):
@@ -251,15 +279,12 @@ class PersistenceWorker:
             self._mark_degraded(
                 f"flush_incomplete_retained={incomplete_retained}"
             )
-            logger.error(
-                "persist flush incomplete: %s undurable retained sale(s) remain %s",
-                incomplete_retained,
-                list(retained_keys),
-            )
-            raise PersistFlushIncompleteError(
+            err = PersistFlushIncompleteError(
                 retained_count=incomplete_retained,
                 identity_keys=retained_keys,
             )
+            logger.error("%s", err.operator_message())
+            raise err
 
     async def _flush_pending_writes(self, *, timeout_s: float) -> None:
         pending = [t for t in self._pending_writes.values() if not t.done()]

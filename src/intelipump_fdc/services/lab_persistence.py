@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote
@@ -22,9 +23,14 @@ from intelipump_fdc.persistence.database import (
 from intelipump_fdc.persistence.migrations import init_schema
 from intelipump_fdc.services.persist_recovery import PersistRecoveryStore
 from intelipump_fdc.services.persistence_bridge import PersistenceBridge
-from intelipump_fdc.services.persistence_worker import PersistenceWorker
+from intelipump_fdc.services.persistence_worker import (
+    PersistFlushIncompleteError,
+    PersistenceWorker,
+)
 from intelipump_fdc.services.recovery_service import RecoveryReport, RecoveryService
 from intelipump_fdc.state_machine.models import PumpContext
+
+logger = logging.getLogger(__name__)
 
 
 def _persist_recovery_path(database_url: str) -> Path:
@@ -52,10 +58,26 @@ class PersistenceRuntime:
     recovery: RecoveryReport
     pump_id_by_address: dict[int, str]
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, *, flush_timeout_s: float = 5.0) -> None:
+        """Detach bridge, flush CRITICAL sales, dispose engine.
+
+        Bounded failure policy (storage unavailable at shutdown):
+        - Always dispose the engine (no resource leak).
+        - If flush leaves sales only in ``_retained_sales``, log
+          ``SALE_DURABILITY_NOT_SAFE`` and re-raise ``PersistFlushIncompleteError``.
+        - Callers must not treat a raised error as a durable/safe shutdown.
+        """
         self.bridge.detach()
-        await self.worker.stop(flush=True, timeout_s=5.0)
-        await dispose_engine(self.engine)
+        flush_error: PersistFlushIncompleteError | None = None
+        try:
+            await self.worker.stop(flush=True, timeout_s=flush_timeout_s)
+        except PersistFlushIncompleteError as exc:
+            flush_error = exc
+            logger.error("%s", exc.operator_message())
+        finally:
+            await dispose_engine(self.engine)
+        if flush_error is not None:
+            raise flush_error
 
 
 async def start_persistence(
