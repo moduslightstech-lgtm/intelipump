@@ -1,8 +1,8 @@
 """Bounded async persistence worker (non-blocking for protocol loop).
 
 CRITICAL jobs (sale completion, audit) are never silently discarded:
-bounded in-memory retries, write-ahead durable spill, and an explicit
-degraded health signal when recovery backlog or failures remain.
+bounded in-memory retries, write-ahead durable spill, in-process requeue
+when the memory queue was full, and an explicit degraded health signal.
 """
 
 from __future__ import annotations
@@ -17,15 +17,16 @@ from typing import Any
 
 from intelipump_fdc.persistence.errors import PersistenceQueueFullError
 from intelipump_fdc.services.persist_recovery import (
+    PersistRecoveryError,
     PersistRecoveryStore,
     sale_persist_identity,
 )
 
 logger = logging.getLogger(__name__)
 
-# Bounded retries for CRITICAL handler failures (temporary SQLite lock, etc.).
 DEFAULT_CRITICAL_MAX_ATTEMPTS = 5
 _CRITICAL_RETRY_DELAY_S = 0.05
+_REQUEUE_IDLE_INTERVAL_S = 0.1
 
 
 class PersistPriority(IntEnum):
@@ -73,6 +74,7 @@ class PersistenceWorker:
         self._handlers: dict[str, Callable[[dict[str, Any]], Awaitable[None]]] = {}
         self._degraded = False
         self._degraded_reason: str | None = None
+        self._inflight_identities: set[str] = set()
 
     @property
     def depth(self) -> int:
@@ -121,7 +123,6 @@ class PersistenceWorker:
         kind: str,
         handler: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        """Bind kind → handler for durable recovery replay after restart."""
         self._handlers[kind] = handler
 
     def start(self) -> None:
@@ -149,6 +150,7 @@ class PersistenceWorker:
         priority: PersistPriority = PersistPriority.NORMAL,
         attempt: int = 0,
         identity_key: str | None = None,
+        write_ahead: bool | None = None,
     ) -> None:
         self._handlers.setdefault(kind, handler)
         self._seq += 1
@@ -164,13 +166,12 @@ class PersistenceWorker:
             attempt=attempt,
             identity_key=key,
         )
-        if (
-            priority is PersistPriority.CRITICAL
-            and key is not None
-            and self._recovery_store is not None
-            and attempt == 0
-        ):
-            # Write-ahead: survive crash before/during first handler attempt.
+        do_write_ahead = (
+            write_ahead
+            if write_ahead is not None
+            else (priority is PersistPriority.CRITICAL and key is not None and attempt == 0)
+        )
+        if do_write_ahead and key is not None and self._recovery_store is not None:
             self._recovery_store.upsert(
                 identity_key=key,
                 kind=kind,
@@ -179,6 +180,8 @@ class PersistenceWorker:
             )
         try:
             self._queue.put_nowait(job)
+            if key is not None:
+                self._inflight_identities.add(key)
         except asyncio.QueueFull as exc:
             if priority is PersistPriority.CRITICAL:
                 if key is not None and self._recovery_store is not None:
@@ -193,7 +196,7 @@ class PersistenceWorker:
                     self._mark_degraded("critical_queue_full_spilled_to_durable")
                     logger.error(
                         "critical persistence queue full; spilled to durable store "
-                        "identity=%s kind=%s",
+                        "identity=%s kind=%s (will requeue in-process)",
                         key,
                         kind,
                     )
@@ -204,12 +207,21 @@ class PersistenceWorker:
             self._dropped_normal += 1
 
     def recover_pending(self) -> int:
-        """Re-queue PENDING durable jobs after process restart. Returns count."""
+        """Re-queue PENDING durable jobs (restart or in-process queue-full)."""
         if self._recovery_store is None:
             return 0
-        pending = self._recovery_store.list_pending()
+        try:
+            pending = self._recovery_store.list_pending()
+        except PersistRecoveryError:
+            self._mark_degraded("persist_recovery_store_error")
+            logger.exception("persist recovery store unreadable")
+            raise
         restored = 0
         for job in pending:
+            if self.depth >= self._maxsize:
+                break
+            if job.identity_key in self._inflight_identities:
+                continue
             handler = self._handlers.get(job.kind)
             if handler is None:
                 logger.error(
@@ -219,23 +231,26 @@ class PersistenceWorker:
                 )
                 self._mark_degraded(f"missing_handler:{job.kind}")
                 continue
-            try:
-                self.submit(
-                    kind=job.kind,
-                    payload=job.payload,
-                    handler=handler,
-                    priority=PersistPriority.CRITICAL,
-                    attempt=0,  # fresh retry budget after process restart
-                    identity_key=job.identity_key,
-                )
-                restored += 1
-            except PersistenceQueueFullError:
-                self._mark_degraded("recovery_queue_full")
+            # Already durable — do not rewrite; attempt>0 skips default write-ahead.
+            self.submit(
+                kind=job.kind,
+                payload=job.payload,
+                handler=handler,
+                priority=PersistPriority.CRITICAL,
+                attempt=max(1, job.attempt),
+                identity_key=job.identity_key,
+                write_ahead=False,
+            )
+            # If still full, submit spilled again; stop this pass.
+            if job.identity_key not in self._inflight_identities and self.depth >= self._maxsize:
                 break
+            if job.identity_key in self._inflight_identities:
+                restored += 1
         if restored:
-            self._mark_degraded(f"recovered_pending={restored}")
+            self._mark_degraded(f"requeued_pending={restored}")
             logger.warning(
-                "persist recovery re-queued %s durable CRITICAL job(s)", restored
+                "persist recovery re-queued %s durable CRITICAL job(s) in-process",
+                restored,
             )
         return restored
 
@@ -244,7 +259,6 @@ class PersistenceWorker:
         self._degraded_reason = reason
 
     def clear_degraded_if_idle(self) -> None:
-        """Clear degraded once durable backlog is empty and queue is drained."""
         if self._recovery_store is not None and self._recovery_store.pending_count() > 0:
             return
         if self.depth > 0:
@@ -255,13 +269,21 @@ class PersistenceWorker:
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                job = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+                job = await asyncio.wait_for(
+                    self._queue.get(), timeout=_REQUEUE_IDLE_INTERVAL_S
+                )
             except TimeoutError:
+                # In-process recovery: queue-full spills must not wait for restart.
+                if self._recovery_store is not None and self.depth < self._maxsize:
+                    with contextlib.suppress(PersistRecoveryError):
+                        self.recover_pending()
                 self.clear_degraded_if_idle()
                 continue
             try:
                 await self._execute(job)
             finally:
+                if job.identity_key:
+                    self._inflight_identities.discard(job.identity_key)
                 self._queue.task_done()
 
     async def _execute(self, job: PersistJob) -> None:
@@ -289,7 +311,6 @@ class PersistenceWorker:
             )
             if job.priority != int(PersistPriority.CRITICAL):
                 return
-            # CRITICAL: never silently remove — retry or durable spill.
             next_attempt = job.attempt + 1
             if next_attempt < self._critical_max_attempts:
                 self._critical_retries += 1
@@ -311,6 +332,7 @@ class PersistenceWorker:
                         priority=PersistPriority.CRITICAL,
                         attempt=next_attempt,
                         identity_key=job.identity_key,
+                        write_ahead=False,
                     )
                 except PersistenceQueueFullError:
                     self._spill_failed(job, err)
@@ -318,7 +340,6 @@ class PersistenceWorker:
             self._spill_failed(job, err)
 
     def _spill_failed(self, job: PersistJob, error: str) -> None:
-        """Keep failed CRITICAL work durable; never discard without a trace."""
         self._critical_durable_spills += 1
         self._mark_degraded(f"critical_persist_failed kind={job.kind}")
         key = job.identity_key or f"{job.kind}:{job.seq}"
