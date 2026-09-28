@@ -54,6 +54,25 @@ _CRITICAL_RETRY_DELAY_S = 0.05
 _REQUEUE_IDLE_INTERVAL_S = 0.1
 
 
+class PersistFlushIncompleteError(Exception):
+    """Raised when ``stop(flush=True)`` cannot make all CRITICAL sales durable."""
+
+    def __init__(
+        self,
+        *,
+        retained_count: int,
+        identity_keys: tuple[str, ...] = (),
+    ) -> None:
+        self.retained_count = retained_count
+        self.identity_keys = identity_keys
+        keys = ", ".join(identity_keys[:5])
+        extra = f" identities={keys}" if keys else ""
+        super().__init__(
+            f"persist flush incomplete: {retained_count} undurable retained sale(s)"
+            f"{extra}"
+        )
+
+
 class PersistPriority(IntEnum):
     CRITICAL = 0  # transaction complete, audit, alarms
     NORMAL = 1  # filling updates, routine state
@@ -119,6 +138,9 @@ class PersistenceWorker:
         self._write_epoch: dict[str, int] = {}
         # Sales that could not be spilled after final failure (retry when disk returns).
         self._retained_sales: dict[str, _RetainedSale] = {}
+        # Serializes retained-sale spill/submit across _run and _requeue_while_busy.
+        # Created in start() / first retry so it binds to the running event loop.
+        self._retained_lock: asyncio.Lock | None = None
 
     @property
     def depth(self) -> int:
@@ -184,6 +206,8 @@ class PersistenceWorker:
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop.clear()
+            if self._retained_lock is None:
+                self._retained_lock = asyncio.Lock()
             self._task = asyncio.create_task(self._run(), name="persistence-worker")
             # Requeue spilled CRITICAL jobs even while a handler is still running
             # (must not wait for an empty queue or process restart).
@@ -192,12 +216,19 @@ class PersistenceWorker:
             )
 
     async def stop(self, *, flush: bool = True, timeout_s: float = 5.0) -> None:
+        incomplete_retained = 0
+        retained_keys: tuple[str, ...] = ()
         if flush:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._queue.join(), timeout=timeout_s)
             # Handlers await their tracked write, but drain any stragglers
             # (e.g. write scheduled then job not yet joined under timing races).
             await self._flush_pending_writes(timeout_s=timeout_s)
+            # Last attempt to spill undurable retained sales before declaring flush done.
+            with contextlib.suppress(PersistRecoveryError):
+                await self._retry_retained_sales()
+            incomplete_retained = len(self._retained_sales)
+            retained_keys = tuple(self._retained_sales.keys())
         self._stop.set()
         for task in (self._requeue_task, self._task):
             if task is not None:
@@ -216,6 +247,19 @@ class PersistenceWorker:
                 if not write_task.done():
                     write_task.cancel()
             self._pending_writes.clear()
+        if flush and incomplete_retained > 0:
+            self._mark_degraded(
+                f"flush_incomplete_retained={incomplete_retained}"
+            )
+            logger.error(
+                "persist flush incomplete: %s undurable retained sale(s) remain %s",
+                incomplete_retained,
+                list(retained_keys),
+            )
+            raise PersistFlushIncompleteError(
+                retained_count=incomplete_retained,
+                identity_keys=retained_keys,
+            )
 
     async def _flush_pending_writes(self, *, timeout_s: float) -> None:
         pending = [t for t in self._pending_writes.values() if not t.done()]
@@ -485,50 +529,60 @@ class PersistenceWorker:
         return restored
 
     async def _retry_retained_sales(self) -> int:
-        """When storage returns, spill retained sales and re-queue for handler work."""
-        if not self._retained_sales or self._recovery_store is None:
-            return 0
-        restored = 0
-        for key, retained in list(self._retained_sales.items()):
-            if self.depth >= self._maxsize:
-                break
-            try:
-                await self._store_upsert(
-                    identity_key=retained.identity_key,
-                    kind=retained.kind,
-                    payload=retained.payload,
-                    attempt=0,
-                    last_error=retained.last_error,
-                )
-            except PersistRecoveryError:
-                # Storage still unavailable — keep retained + degraded.
-                continue
-            self._retained_sales.pop(key, None)
-            self._critical_durable_spills += 1
-            # Fresh attempts once durable again.
-            try:
-                self.submit(
-                    kind=retained.kind,
-                    payload=retained.payload,
-                    handler=retained.handler,
-                    priority=PersistPriority.CRITICAL,
-                    attempt=0,
-                    identity_key=retained.identity_key,
-                    write_ahead=False,
-                )
-            except PersistenceQueueFullError:
-                # Already on disk — recover_pending will pick it up.
-                self._release_inflight(retained.identity_key)
+        """When storage returns, spill retained sales and re-queue for handler work.
+
+        Serialized so ``_run`` and ``_requeue_while_busy`` cannot spill/submit the
+        same retained sale concurrently.
+        """
+        async with self._ensure_retained_lock():
+            if not self._retained_sales or self._recovery_store is None:
+                return 0
+            restored = 0
+            for key, retained in list(self._retained_sales.items()):
+                if self.depth >= self._maxsize:
+                    break
+                try:
+                    await self._store_upsert(
+                        identity_key=retained.identity_key,
+                        kind=retained.kind,
+                        payload=retained.payload,
+                        attempt=0,
+                        last_error=retained.last_error,
+                    )
+                except PersistRecoveryError:
+                    # Storage still unavailable — keep retained + degraded.
+                    continue
+                self._retained_sales.pop(key, None)
+                self._critical_durable_spills += 1
+                # Fresh attempts once durable again.
+                try:
+                    self.submit(
+                        kind=retained.kind,
+                        payload=retained.payload,
+                        handler=retained.handler,
+                        priority=PersistPriority.CRITICAL,
+                        attempt=0,
+                        identity_key=retained.identity_key,
+                        write_ahead=False,
+                    )
+                except PersistenceQueueFullError:
+                    # Already on disk — recover_pending will pick it up.
+                    self._release_inflight(retained.identity_key)
+                    restored += 1
+                    continue
                 restored += 1
-                continue
-            restored += 1
-            logger.warning(
-                "retained CRITICAL sale spilled after storage recovery identity=%s",
-                key,
-            )
-        if restored and not self._retained_sales:
-            self.clear_degraded_if_idle()
-        return restored
+                logger.warning(
+                    "retained CRITICAL sale spilled after storage recovery identity=%s",
+                    key,
+                )
+            if restored and not self._retained_sales:
+                self.clear_degraded_if_idle()
+            return restored
+
+    def _ensure_retained_lock(self) -> asyncio.Lock:
+        if self._retained_lock is None:
+            self._retained_lock = asyncio.Lock()
+        return self._retained_lock
 
     def _mark_degraded(self, reason: str) -> None:
         self._degraded = True

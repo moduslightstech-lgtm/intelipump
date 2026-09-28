@@ -26,7 +26,10 @@ from intelipump_fdc.persistence.migrations import init_schema
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 from intelipump_fdc.services.lab_persistence import _persist_recovery_path
 from intelipump_fdc.services.persist_recovery import PersistRecoveryStore
-from intelipump_fdc.services.persistence_worker import PersistenceWorker
+from intelipump_fdc.services.persistence_worker import (
+    PersistFlushIncompleteError,
+    PersistenceWorker,
+)
 from intelipump_fdc.services.recovery_service import RecoveryService
 
 logger = structlog.get_logger(__name__)
@@ -174,7 +177,10 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
             with contextlib.suppress(asyncio.CancelledError):
                 await state.controller_task
         if state.worker is not None:
-            await state.worker.stop(flush=True, timeout_s=5.0)
+            try:
+                await state.worker.stop(flush=True, timeout_s=5.0)
+            except PersistFlushIncompleteError as exc:
+                logger.error("persistence_worker_flush_incomplete: %s", exc)
         await broker.close_all()
         await dispose_engine(engine)
         logger.info("api_shutdown_complete")

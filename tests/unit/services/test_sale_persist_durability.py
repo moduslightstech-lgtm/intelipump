@@ -17,9 +17,11 @@ from intelipump_fdc.services.persist_recovery import (
     sale_persist_identity,
 )
 from intelipump_fdc.services.persistence_worker import (
+    PersistFlushIncompleteError,
     PersistJob,
     PersistenceWorker,
     PersistPriority,
+    _RetainedSale,
 )
 
 
@@ -627,3 +629,104 @@ async def test_persistent_disk_failure_retains_sale_until_storage_returns(
     assert worker.retained_sale_count == 0
     assert store.pending_count() == 0
     assert worker.processed >= 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retained_recovery_serialized_single_spill(
+    tmp_path: Path,
+) -> None:
+    """Two retained-recovery callers must not spill/submit the same sale twice."""
+    store = PersistRecoveryStore(tmp_path / "concurrent.jsonl")
+    worker = PersistenceWorker(maxsize=8, recovery_store=store)
+    real_upsert = store.upsert
+    enter_spill = threading.Event()
+    release_spill = threading.Event()
+    spill_keys: list[str] = []
+
+    def gated_upsert(**kwargs):
+        spill_keys.append(str(kwargs["identity_key"]))
+        enter_spill.set()
+        if not release_spill.wait(timeout=2.0):
+            raise TimeoutError("spill gate not released")
+        return real_upsert(**kwargs)
+
+    store.upsert = gated_upsert  # type: ignore[method-assign]
+
+    async def handler(_payload: dict) -> None:
+        return None
+
+    key = "state_changed:1:tx-concurrent:FILLING_COMPLETE"
+    worker._retained_sales[key] = _RetainedSale(
+        kind="state_changed",
+        payload=_completion_payload("tx-concurrent"),
+        identity_key=key,
+        handler=handler,
+        last_error="prior_spill_failed",
+        attempt=2,
+    )
+    worker._inflight_identities.add(key)
+    worker._ensure_retained_lock()
+
+    first = asyncio.create_task(worker._retry_retained_sales())
+    entered = await asyncio.to_thread(enter_spill.wait, 2.0)
+    assert entered, "first recovery never entered spill"
+    second = asyncio.create_task(worker._retry_retained_sales())
+    # While first holds the lock inside spill, second must not start another spill.
+    await asyncio.sleep(0.1)
+    assert spill_keys == [key]
+    release_spill.set()
+    results = await asyncio.gather(first, second)
+    assert sorted(results) == [0, 1] or sum(results) == 1
+    assert spill_keys == [key]
+    assert worker.retained_sale_count == 0
+    # Drain the submitted job.
+    worker.start()
+    for _ in range(40):
+        if worker.processed >= 1:
+            break
+        await asyncio.sleep(0.05)
+    await worker.stop(flush=True, timeout_s=2.0)
+    assert store.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_flush_fails_when_retained_sales_undurable(
+    tmp_path: Path,
+) -> None:
+    """stop(flush=True) must fail when storage is still down and sales are retained."""
+    store = PersistRecoveryStore(tmp_path / "flushfail.jsonl")
+    worker = PersistenceWorker(
+        maxsize=8,
+        critical_max_attempts=2,
+        recovery_store=store,
+    )
+
+    def always_down(**kwargs):
+        raise PersistRecoveryIOError("storage unavailable at shutdown")
+
+    store.upsert = always_down  # type: ignore[method-assign]
+    worker.start()
+
+    async def handler(_payload: dict) -> None:
+        return None
+
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-flush-fail"),
+        handler=handler,
+        priority=PersistPriority.CRITICAL,
+    )
+    for _ in range(80):
+        if worker.retained_sale_count >= 1:
+            break
+        await asyncio.sleep(0.05)
+    assert worker.retained_sale_count >= 1
+    assert worker.processed == 0
+
+    with pytest.raises(PersistFlushIncompleteError) as exc_info:
+        await worker.stop(flush=True, timeout_s=1.0)
+    assert exc_info.value.retained_count >= 1
+    assert any("tx-flush-fail" in k for k in exc_info.value.identity_keys)
+    # Sale still retained — not silently discarded as flushed/safe.
+    assert worker.retained_sale_count >= 1
+    assert worker.is_degraded is True
