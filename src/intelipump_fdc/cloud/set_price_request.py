@@ -333,6 +333,15 @@ def write_set_price_outcome(outcome: SetPriceOutcome) -> Path:
     return path
 
 
+def has_set_price_outcome(correlation_id: str) -> bool:
+    """True when a durable outcome file already exists for this correlation."""
+    _migrate_legacy_outcome_file()
+    try:
+        return _outcome_file_path(correlation_id).is_file()
+    except ValueError:
+        return False
+
+
 def list_set_price_outcomes() -> list[SetPriceOutcome]:
     """Read pending outcomes without removing them (ordered by filename)."""
     _migrate_legacy_outcome_file()
