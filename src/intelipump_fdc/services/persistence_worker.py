@@ -57,48 +57,62 @@ _REQUEUE_IDLE_INTERVAL_S = 0.1
 class PersistFlushIncompleteError(Exception):
     """Raised when ``stop(flush=True)`` cannot make all CRITICAL sales durable.
 
-    Sales listed in ``identity_keys`` were held only in process memory
-    (``_retained_sales``) when flush finished. They are **not** on the recovery
-    store and **will be lost** when the process exits. Raising this error must
-    never be treated as a successful / safe durability shutdown.
+    Covers undurable CRITICAL work still in memory at flush end: retained sales,
+    queue-join timeout (blocked handler), and pending write-ahead timeout.
+    Those jobs are **not** safely on durable storage for process exit. Raising
+    this error must never be treated as a successful / safe durability shutdown.
+
+    The unavoidable hard-crash window (async write-ahead after queue accept,
+    before the tracked write completes) is separate and cannot be closed by flush.
     """
 
     def __init__(
         self,
         *,
-        retained_count: int,
+        retained_count: int = 0,
         identity_keys: tuple[str, ...] = (),
+        reasons: tuple[str, ...] = (),
+        queue_depth: int = 0,
+        pending_writes: int = 0,
     ) -> None:
         self.retained_count = retained_count
         self.identity_keys = identity_keys
+        self.reasons = reasons
+        self.queue_depth = queue_depth
+        self.pending_writes = pending_writes
+        reason_txt = ",".join(reasons) if reasons else "undurable_critical"
         keys = ", ".join(identity_keys[:5])
         extra = f" identities={keys}" if keys else ""
         super().__init__(
-            f"persist flush incomplete: {retained_count} undurable retained sale(s)"
-            f"{extra}"
+            f"persist flush incomplete ({reason_txt}): "
+            f"retained={retained_count} queue_depth={queue_depth} "
+            f"pending_writes={pending_writes}{extra}"
         )
 
     def operator_message(self) -> str:
-        """Explicit operator-facing text: memory-only sales are not safe."""
+        """Explicit operator-facing text: undurable CRITICAL work is not safe."""
+        reason_txt = ", ".join(self.reasons) if self.reasons else "undurable_critical"
         return (
-            "SALE_DURABILITY_NOT_SAFE: storage unavailable at shutdown; "
-            f"{self.retained_count} completed sale(s) remain only in process "
-            f"memory (_retained_sales) and will be LOST when this process exits. "
+            "SALE_DURABILITY_NOT_SAFE: graceful flush incomplete "
+            f"({reason_txt}); "
+            f"{self.retained_count} sale(s) in _retained_sales, "
+            f"queue_depth={self.queue_depth}, "
+            f"pending_writes={self.pending_writes}. "
             f"identities={list(self.identity_keys)}. "
-            "Do not treat shutdown as durable success; restore writable recovery "
-            "storage and retry, or reconcile sales manually."
+            "These CRITICAL jobs are not durably stored for process exit and "
+            "may be LOST. Do not treat shutdown as durable success."
         )
 
 
-# Bounded shutdown policy when recovery storage is unavailable:
-# 1) stop(flush=True) attempts one final retained-sale spill within the flush timeout.
-# 2) If any sale remains in _retained_sales, raise PersistFlushIncompleteError.
-# 3) Callers must dispose resources, log operator_message() at ERROR, and must not
-#    claim shutdown/flush success. Controller CLI exits non-zero. API lifespan logs
-#    api_shutdown_sale_durability_incomplete (never api_shutdown_complete).
+# Bounded shutdown flush policy:
+# 1) Await queue join and pending write-ahead within timeout_s.
+# 2) One final retained-sale spill attempt.
+# 3) Snapshot undurable CRITICAL state (timeouts / retained / inflight) BEFORE
+#    cancelling worker tasks; then cancel; then raise PersistFlushIncompleteError
+#    if anything was undurable.
 # 4) No unbounded retry loop at shutdown.
-# Hard crash caveat: async write-ahead means a process crash after queue accept and
-# before the tracked durable write completes can also lose a sale (memory-only window).
+# Hard crash caveat: async write-ahead after put_nowait until write completes
+# remains an unavoidable memory-only loss window (not closed by flush).
 
 
 class PersistPriority(IntEnum):
@@ -244,19 +258,61 @@ class PersistenceWorker:
             )
 
     async def stop(self, *, flush: bool = True, timeout_s: float = 5.0) -> None:
-        incomplete_retained = 0
-        retained_keys: tuple[str, ...] = ()
+        flush_error: PersistFlushIncompleteError | None = None
         if flush:
-            with contextlib.suppress(TimeoutError):
+            reasons: list[str] = []
+            join_timed_out = False
+            writes_timed_out = False
+            try:
                 await asyncio.wait_for(self._queue.join(), timeout=timeout_s)
-            # Handlers await their tracked write, but drain any stragglers
-            # (e.g. write scheduled then job not yet joined under timing races).
-            await self._flush_pending_writes(timeout_s=timeout_s)
-            # Last attempt to spill undurable retained sales before declaring flush done.
+            except TimeoutError:
+                join_timed_out = True
+                reasons.append("queue_join_timeout")
+            writes_timed_out = not await self._flush_pending_writes(timeout_s=timeout_s)
+            if writes_timed_out:
+                reasons.append("pending_write_timeout")
+            # Last attempt to spill undurable retained sales before snapshot.
             with contextlib.suppress(PersistRecoveryError):
                 await self._retry_retained_sales()
-            incomplete_retained = len(self._retained_sales)
+            # Snapshot undurable CRITICAL state BEFORE cancelling tasks.
             retained_keys = tuple(self._retained_sales.keys())
+            inflight_keys = tuple(sorted(self._inflight_identities))
+            pending_write_keys = tuple(
+                sorted(k for k, t in self._pending_writes.items() if not t.done())
+            )
+            identity_keys = tuple(
+                dict.fromkeys((*retained_keys, *inflight_keys, *pending_write_keys))
+            )
+            if retained_keys:
+                reasons.append("retained_undurable")
+            queue_depth = self.depth
+            pending_writes = self.pending_durable_writes
+            incomplete = bool(
+                reasons
+                or retained_keys
+                or join_timed_out
+                or writes_timed_out
+                or queue_depth > 0
+                or pending_writes > 0
+                or (join_timed_out and inflight_keys)
+            )
+            # If join timed out with inflight CRITICAL work, that work is undurable
+            # for exit even when reasons already set.
+            if incomplete:
+                if not reasons:
+                    reasons.append("undurable_critical")
+                flush_error = PersistFlushIncompleteError(
+                    retained_count=len(retained_keys),
+                    identity_keys=identity_keys,
+                    reasons=tuple(dict.fromkeys(reasons)),
+                    queue_depth=queue_depth,
+                    pending_writes=pending_writes,
+                )
+                self._mark_degraded(
+                    f"flush_incomplete:{','.join(flush_error.reasons)}"
+                )
+                logger.error("%s", flush_error.operator_message())
+
         self._stop.set()
         for task in (self._requeue_task, self._task):
             if task is not None:
@@ -265,36 +321,26 @@ class PersistenceWorker:
                     await task
         self._requeue_task = None
         self._task = None
-        if not flush:
-            for write_task in list(self._pending_writes.values()):
+        for write_task in list(self._pending_writes.values()):
+            if not write_task.done():
                 write_task.cancel()
-            self._pending_writes.clear()
-        else:
-            # Cancel anything still running after flush timeout.
-            for write_task in list(self._pending_writes.values()):
-                if not write_task.done():
-                    write_task.cancel()
-            self._pending_writes.clear()
-        if flush and incomplete_retained > 0:
-            self._mark_degraded(
-                f"flush_incomplete_retained={incomplete_retained}"
-            )
-            err = PersistFlushIncompleteError(
-                retained_count=incomplete_retained,
-                identity_keys=retained_keys,
-            )
-            logger.error("%s", err.operator_message())
-            raise err
+        self._pending_writes.clear()
+        if flush_error is not None:
+            raise flush_error
 
-    async def _flush_pending_writes(self, *, timeout_s: float) -> None:
+    async def _flush_pending_writes(self, *, timeout_s: float) -> bool:
+        """Await in-flight write-ahead tasks. Returns False if timed out."""
         pending = [t for t in self._pending_writes.values() if not t.done()]
         if not pending:
-            return
-        with contextlib.suppress(TimeoutError):
+            return True
+        try:
             await asyncio.wait_for(
                 asyncio.gather(*pending, return_exceptions=True),
                 timeout=timeout_s,
             )
+        except TimeoutError:
+            return False
+        return True
 
     async def _requeue_while_busy(self) -> None:
         """Pull durable spills / retained sales into the memory queue."""

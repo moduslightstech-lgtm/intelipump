@@ -52,9 +52,16 @@ before the tracked durable write completes can lose that sale** (memory-only
 window). Queue-full CRITICAL spills still fsync synchronously on submit.
 
 If recovery storage is unavailable after retries, the sale is held in
-`_retained_sales` (degraded). At graceful shutdown the worker attempts **one**
-final spill; if anything remains memory-only it raises
-`PersistFlushIncompleteError` (`SALE_DURABILITY_NOT_SAFE`). Controllers exit
-non-zero; API lifespan logs `api_shutdown_sale_durability_incomplete` and must
-**not** log `api_shutdown_complete`. Raising/logging the error is **not**
-durability success — those sales are lost when the process exits.
+`_retained_sales` (degraded). Graceful `stop(flush=True)` awaits queue join and
+pending write-ahead (bounded timeout), attempts **one** final retained spill,
+snapshots undurable CRITICAL state **before** cancelling tasks, then raises
+`PersistFlushIncompleteError` (`SALE_DURABILITY_NOT_SAFE`) on queue-join
+timeout, pending-write timeout, or remaining retained/inflight work.
+Controllers exit non-zero; API lifespan logs
+`api_shutdown_sale_durability_incomplete` and must **not** log
+`api_shutdown_complete`. An exception already raised by the app body is
+preserved (flush incomplete is logged, not substituted). Raising/logging the
+flush error is **not** durability success.
+
+**Unavoidable hard-crash window (unchanged):** after queue accept and before
+the tracked durable write completes, a hard process crash can lose that sale.

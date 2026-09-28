@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -166,8 +167,12 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Always finish cleanup. Never return early from finally.
+        # If the body already failed, do not replace that exception with a flush
+        # error (log flush incomplete alongside; preserve propagation).
         state.shutting_down = True
         state.metrics.accepting_commands = False
+        flush_incomplete: PersistFlushIncompleteError | None = None
         if state.cloud is not None:
             await state.cloud.stop()
         if state.controller_loop is not None:
@@ -180,16 +185,20 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
             try:
                 await state.worker.stop(flush=True, timeout_s=5.0)
             except PersistFlushIncompleteError as exc:
-                # Sales in _retained_sales are memory-only — not durable/safe.
+                flush_incomplete = exc
                 logger.error(
                     "api_shutdown_sale_durability_incomplete",
                     message=exc.operator_message(),
                     retained_count=exc.retained_count,
                     identity_keys=list(exc.identity_keys),
+                    reasons=list(exc.reasons),
                 )
-                await broker.close_all()
-                await dispose_engine(engine)
-                return
         await broker.close_all()
         await dispose_engine(engine)
-        logger.info("api_shutdown_complete")
+        if flush_incomplete is not None:
+            # Body already raising → keep that exception; only raise flush when
+            # shutdown would otherwise look successful.
+            if sys.exception() is None:
+                raise flush_incomplete
+        else:
+            logger.info("api_shutdown_complete")

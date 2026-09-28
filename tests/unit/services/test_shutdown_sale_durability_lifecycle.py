@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -13,9 +14,13 @@ from intelipump_fdc.api.lifespan import app_lifespan
 from intelipump_fdc.controller.session_events import EventBus
 from intelipump_fdc.core.config import get_settings
 from intelipump_fdc.services.lab_persistence import start_persistence
-from intelipump_fdc.services.persist_recovery import PersistRecoveryIOError
+from intelipump_fdc.services.persist_recovery import (
+    PersistRecoveryIOError,
+    PersistRecoveryStore,
+)
 from intelipump_fdc.services.persistence_worker import (
     PersistFlushIncompleteError,
+    PersistenceWorker,
     PersistPriority,
 )
 
@@ -83,6 +88,78 @@ async def test_persistence_runtime_shutdown_raises_not_safe(
     assert "SALE_DURABILITY_NOT_SAFE" in msg
     assert "LOST" in msg
     assert "tx-runtime-flush" in msg
+    assert "retained_undurable" in exc_info.value.reasons
+
+
+@pytest.mark.asyncio
+async def test_stop_flush_incomplete_on_queue_join_timeout_blocked_handler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocked CRITICAL handler → queue.join timeout → incomplete flush."""
+    monkeypatch.setenv("INTELIPUMP_PERSIST_RECOVERY_ALLOW_TMP", "1")
+    store = PersistRecoveryStore(tmp_path / "join.jsonl")
+    worker = PersistenceWorker(maxsize=8, recovery_store=store)
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    worker.start()
+
+    async def blocked(_payload: dict) -> None:
+        entered.set()
+        await gate.wait()
+
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-join-block"),
+        handler=blocked,
+        priority=PersistPriority.CRITICAL,
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+    with pytest.raises(PersistFlushIncompleteError) as exc_info:
+        await worker.stop(flush=True, timeout_s=0.15)
+    assert "queue_join_timeout" in exc_info.value.reasons
+    assert any("tx-join-block" in k for k in exc_info.value.identity_keys)
+    assert "SALE_DURABILITY_NOT_SAFE" in exc_info.value.operator_message()
+    gate.set()
+
+
+@pytest.mark.asyncio
+async def test_stop_flush_incomplete_on_pending_write_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocked durable write-ahead → pending_write_timeout → incomplete flush."""
+    monkeypatch.setenv("INTELIPUMP_PERSIST_RECOVERY_ALLOW_TMP", "1")
+    store = PersistRecoveryStore(tmp_path / "write.jsonl")
+    worker = PersistenceWorker(maxsize=8, recovery_store=store)
+    release_write = threading.Event()
+    enter_write = threading.Event()
+    real_upsert = store.upsert
+
+    def gated_upsert(**kwargs):
+        enter_write.set()
+        if not release_write.wait(timeout=5.0):
+            raise TimeoutError("write still gated")
+        return real_upsert(**kwargs)
+
+    store.upsert = gated_upsert  # type: ignore[method-assign]
+    worker.start()
+
+    async def handler(_payload: dict) -> None:
+        return None
+
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("tx-write-block"),
+        handler=handler,
+        priority=PersistPriority.CRITICAL,
+    )
+    assert await asyncio.to_thread(enter_write.wait, 2.0)
+
+    with pytest.raises(PersistFlushIncompleteError) as exc_info:
+        await worker.stop(flush=True, timeout_s=0.15)
+    assert "pending_write_timeout" in exc_info.value.reasons
+    assert any("tx-write-block" in k for k in exc_info.value.identity_keys)
+    release_write.set()
 
 
 @pytest.mark.asyncio
@@ -122,12 +199,61 @@ async def test_api_lifespan_incomplete_flush_does_not_claim_complete(
     monkeypatch.setattr(lifespan_mod.logger, "error", track_error)
 
     app: FastAPI = create_app()
-    async with app_lifespan(app):
-        state = app.state.app_state
-        worker = state.worker
-        assert worker is not None
-        await _force_undurable_retained(worker, tx="tx-api-flush")
-        assert worker.retained_sale_count >= 1
+    with pytest.raises(PersistFlushIncompleteError):
+        async with app_lifespan(app):
+            state = app.state.app_state
+            worker = state.worker
+            assert worker is not None
+            await _force_undurable_retained(worker, tx="tx-api-flush")
+            assert worker.retained_sale_count >= 1
+
+    assert "api_shutdown_sale_durability_incomplete" in error_events
+    assert "api_shutdown_complete" not in info_events
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_api_lifespan_preserves_body_exception_over_flush_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Body exception must propagate; flush incomplete must not suppress it."""
+    get_settings.cache_clear()
+    monkeypatch.setenv(
+        "INTELIPUMP_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'api2.db'}"
+    )
+    monkeypatch.setenv("INTELIPUMP_CONTROLLER__MODE", "LISTEN_ONLY")
+    monkeypatch.setenv("INTELIPUMP_API__START_CONTROLLER_LOOP", "false")
+    monkeypatch.setenv("INTELIPUMP_MQTT__ENABLED", "false")
+    monkeypatch.setenv("INTELIPUMP_PERSIST_RECOVERY_ALLOW_TMP", "1")
+    get_settings.cache_clear()
+
+    error_events: list[str] = []
+    info_events: list[str] = []
+    import intelipump_fdc.api.lifespan as lifespan_mod
+
+    real_info = lifespan_mod.logger.info
+    real_error = lifespan_mod.logger.error
+
+    def track_info(event: str | None = None, *args, **kwargs):
+        if isinstance(event, str):
+            info_events.append(event)
+        return real_info(event, *args, **kwargs)
+
+    def track_error(event: str | None = None, *args, **kwargs):
+        if isinstance(event, str):
+            error_events.append(event)
+        return real_error(event, *args, **kwargs)
+
+    monkeypatch.setattr(lifespan_mod.logger, "info", track_info)
+    monkeypatch.setattr(lifespan_mod.logger, "error", track_error)
+
+    app: FastAPI = create_app()
+    with pytest.raises(RuntimeError, match="body boom"):
+        async with app_lifespan(app):
+            state = app.state.app_state
+            assert state.worker is not None
+            await _force_undurable_retained(state.worker, tx="tx-api-body")
+            raise RuntimeError("body boom")
 
     assert "api_shutdown_sale_durability_incomplete" in error_events
     assert "api_shutdown_complete" not in info_events
