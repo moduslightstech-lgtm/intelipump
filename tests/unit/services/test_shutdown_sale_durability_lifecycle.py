@@ -163,6 +163,56 @@ async def test_stop_flush_incomplete_on_pending_write_timeout(
 
 
 @pytest.mark.asyncio
+async def test_stop_flush_incomplete_on_retained_spill_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stalled final _retry_retained_sales → retained_spill_timeout → incomplete."""
+    monkeypatch.setenv("INTELIPUMP_PERSIST_RECOVERY_ALLOW_TMP", "1")
+    store = PersistRecoveryStore(tmp_path / "retained-spill.jsonl")
+    worker = PersistenceWorker(maxsize=8, recovery_store=store)
+    release_spill = threading.Event()
+    enter_spill = threading.Event()
+    real_upsert = store.upsert
+
+    def stalled_upsert(**kwargs):
+        enter_spill.set()
+        if not release_spill.wait(timeout=5.0):
+            raise TimeoutError("retained spill still gated")
+        return real_upsert(**kwargs)
+
+    store.upsert = stalled_upsert  # type: ignore[method-assign]
+
+    async def handler(_payload: dict) -> None:
+        return None
+
+    key = "state_changed:1:tx-spill-stall:FILLING_COMPLETE"
+    from intelipump_fdc.services.persistence_worker import _RetainedSale
+
+    worker._retained_sales[key] = _RetainedSale(
+        kind="state_changed",
+        payload=_completion_payload("tx-spill-stall"),
+        identity_key=key,
+        handler=handler,
+        last_error="prior_disk_down",
+        attempt=2,
+    )
+    worker._inflight_identities.add(key)
+    # Do not start background requeue — only the stop() final spill should run.
+
+    with pytest.raises(PersistFlushIncompleteError) as exc_info:
+        await worker.stop(flush=True, timeout_s=0.2)
+    assert "retained_spill_timeout" in exc_info.value.reasons
+    assert exc_info.value.retained_count >= 1
+    assert key in exc_info.value.identity_keys
+    assert "SALE_DURABILITY_NOT_SAFE" in exc_info.value.operator_message()
+    # Cleanup completed (worker tasks cleared) despite incomplete flush.
+    assert worker._task is None
+    release_spill.set()
+    # Confirm the spill did start (stalled under the deadline).
+    assert enter_spill.is_set()
+
+
+@pytest.mark.asyncio
 async def test_api_lifespan_incomplete_flush_does_not_claim_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

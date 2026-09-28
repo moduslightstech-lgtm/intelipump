@@ -105,12 +105,12 @@ class PersistFlushIncompleteError(Exception):
 
 
 # Bounded shutdown flush policy:
-# 1) Await queue join and pending write-ahead within timeout_s.
-# 2) One final retained-sale spill attempt.
-# 3) Snapshot undurable CRITICAL state (timeouts / retained / inflight) BEFORE
+# 1) Await queue join, pending write-ahead, and one final retained spill — each
+#    bounded by the remaining flush deadline (timeout_s from stop start).
+# 2) Snapshot undurable CRITICAL state (timeouts / retained / inflight) BEFORE
 #    cancelling worker tasks; then cancel; then raise PersistFlushIncompleteError
-#    if anything was undurable.
-# 4) No unbounded retry loop at shutdown.
+#    if anything was undurable (including retained_spill_timeout).
+# 3) No unbounded retry loop at shutdown.
 # Hard crash caveat: async write-ahead after put_nowait until write completes
 # remains an unavoidable memory-only loss window (not closed by flush).
 
@@ -260,20 +260,34 @@ class PersistenceWorker:
     async def stop(self, *, flush: bool = True, timeout_s: float = 5.0) -> None:
         flush_error: PersistFlushIncompleteError | None = None
         if flush:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + max(0.0, float(timeout_s))
+
+            def _remaining() -> float:
+                return max(0.0, deadline - loop.time())
+
             reasons: list[str] = []
-            join_timed_out = False
-            writes_timed_out = False
             try:
-                await asyncio.wait_for(self._queue.join(), timeout=timeout_s)
+                await asyncio.wait_for(self._queue.join(), timeout=_remaining())
             except TimeoutError:
-                join_timed_out = True
                 reasons.append("queue_join_timeout")
-            writes_timed_out = not await self._flush_pending_writes(timeout_s=timeout_s)
-            if writes_timed_out:
+            if not await self._flush_pending_writes(timeout_s=_remaining()):
                 reasons.append("pending_write_timeout")
-            # Last attempt to spill undurable retained sales before snapshot.
-            with contextlib.suppress(PersistRecoveryError):
-                await self._retry_retained_sales()
+            # Final retained spill bounded by whatever deadline remains.
+            if self._retained_sales:
+                rem = _remaining()
+                if rem <= 0:
+                    reasons.append("retained_spill_timeout")
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            self._retry_retained_sales(), timeout=rem
+                        )
+                    except TimeoutError:
+                        reasons.append("retained_spill_timeout")
+                    except PersistRecoveryError:
+                        # Spill failed but may have left sales retained — snapshot below.
+                        pass
             # Snapshot undurable CRITICAL state BEFORE cancelling tasks.
             retained_keys = tuple(self._retained_sales.keys())
             inflight_keys = tuple(sorted(self._inflight_identities))
@@ -283,21 +297,18 @@ class PersistenceWorker:
             identity_keys = tuple(
                 dict.fromkeys((*retained_keys, *inflight_keys, *pending_write_keys))
             )
-            if retained_keys:
-                reasons.append("retained_undurable")
+            if retained_keys and "retained_undurable" not in reasons:
+                # Still memory-only after spill attempt / timeout.
+                if "retained_spill_timeout" not in reasons:
+                    reasons.append("retained_undurable")
             queue_depth = self.depth
             pending_writes = self.pending_durable_writes
             incomplete = bool(
                 reasons
                 or retained_keys
-                or join_timed_out
-                or writes_timed_out
                 or queue_depth > 0
                 or pending_writes > 0
-                or (join_timed_out and inflight_keys)
             )
-            # If join timed out with inflight CRITICAL work, that work is undurable
-            # for exit even when reasons already set.
             if incomplete:
                 if not reasons:
                     reasons.append("undurable_critical")
