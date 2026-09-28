@@ -40,7 +40,6 @@ from intelipump_fdc.controller.session_events import (
 )
 from intelipump_fdc.controller.sale_lifecycle import SaleLifecycle
 from intelipump_fdc.controller.session_models import (
-    CommunicationHealth,
     IdempotencyClass,
     NozzlePosition,
     ObservedStatus,
@@ -60,14 +59,6 @@ from intelipump_fdc.simulator.config import next_sequence
 from intelipump_fdc.simulator.encoding import encode_cd1_command, encode_cd5_price_update
 
 logger = structlog.get_logger(__name__)
-
-# Wedged-open RS-485: pyserial reports is_open while the adapter no longer
-# exchanges frames. Without a forced close, reconnect never runs.
-_WEDGE_POLL_STALE_S = 20.0
-_WEDGE_STARTUP_GRACE_S = 30.0
-_WEDGE_REOPEN_COOLDOWN_S = 15.0
-# Must stay below systemd WatchdogSec (30s) so a wedged bus triggers restart.
-_WATCHDOG_MAX_POLL_AGE_S = 25.0
 
 
 @dataclass
@@ -192,7 +183,6 @@ class ControllerLoop:
         self._cloud_set_price_next_try: dict[str, float] = {}
         self._set_price_defer_log_at: dict[str, float] = {}
         self._cloud_set_price_retry_log_at: float = 0.0
-        self._last_forced_reopen_mono: float | None = None
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
         self.runtime.liveness.notify_socket_present = (
@@ -313,105 +303,9 @@ class ControllerLoop:
         for session in self.sessions.values():
             session.mark_serial_lost()
 
-    def _successful_poll_age_s(self) -> float | None:
-        mono = self.runtime.liveness.last_successful_poll_mono
-        if mono is None:
-            return None
-        return max(0.0, time.monotonic() - mono)
-
-    def _serial_open_age_s(self) -> float | None:
-        open_mono = self.serial_health.state.last_open_ok_mono
-        if open_mono is None:
-            return None
-        return max(0.0, time.monotonic() - open_mono)
-
-    def _should_feed_watchdog(self) -> bool:
-        """Keep systemd alive while reconnecting; stop when the bus is wedged.
-
-        Loop progress alone is not enough: a wedged-open serial port still
-        completes poll iterations (all timeouts) and would never trip WatchdogSec.
-        """
-        if not self.runtime.transport.is_open:
-            return True
-        age = self._successful_poll_age_s()
-        if age is None:
-            open_age = self._serial_open_age_s()
-            return open_age is None or open_age < _WATCHDOG_MAX_POLL_AGE_S
-        return age < _WATCHDOG_MAX_POLL_AGE_S
-
-    def _should_force_serial_reopen(self) -> bool:
-        """True when the port looks open but every pump stays DISCONNECTED."""
-        if not self.runtime.transport.is_open:
-            return False
-        if self.runtime.transport.metadata.is_virtual_or_memory:
-            return False
-        if not self.sessions:
-            return False
-        if not all(
-            s.state.communication is CommunicationHealth.DISCONNECTED
-            for s in self.sessions.values()
-        ):
-            return False
-        now = time.monotonic()
-        last = self._last_forced_reopen_mono
-        if last is not None and (now - last) < _WEDGE_REOPEN_COOLDOWN_S:
-            return False
-        age = self._successful_poll_age_s()
-        if age is None:
-            open_age = self._serial_open_age_s()
-            return open_age is not None and open_age >= _WEDGE_STARTUP_GRACE_S
-        return age >= _WEDGE_POLL_STALE_S
-
-    async def _maybe_force_serial_reopen(self) -> bool:
-        """Force close+reconnect when RS-485 is wedged-open. Returns True if closed."""
-        if not self._should_force_serial_reopen():
-            return False
-        self._last_forced_reopen_mono = time.monotonic()
-        poll_age = self._successful_poll_age_s()
-        logger.warning(
-            "serial_wedged_forcing_reopen",
-            pollAgeS=poll_age,
-            openAgeS=self._serial_open_age_s(),
-            pumps=len(self.sessions),
-        )
-        print(
-            "[BUS] wedged serial (all pumps DISCONNECTED while port open); "
-            "forcing reopen"
-        )
-        await self._stop_rx_task()
-        try:
-            await self.runtime.transport.close()
-        except Exception as exc:
-            logger.warning(
-                "serial_wedged_close_failed",
-                error=f"{type(exc).__name__}:{exc}",
-            )
-        self.serial_health.observe_closed(reason="wedged_force_reopen")
-        self._mark_all_pumps_disconnected()
-        self._sync_serial_status()
-        self._reset_cloud_set_price_backoff()
-        return True
-
-    def _reset_cloud_set_price_backoff(self) -> None:
-        """Clear SET_PRICE give-up / backoff so a recovered bus can retry CD5."""
-        self._cloud_set_price_gave_up.clear()
-        self._cloud_set_price_fail_count.clear()
-        self._cloud_set_price_next_try.clear()
-
-    def _revive_cloud_set_price_for_address(self, addr: int) -> None:
-        """After a successful poll, allow another CD5 attempt on this address."""
-        for gave in self._cloud_set_price_gave_up.values():
-            gave.discard(addr)
-        suffix = f":{addr}"
-        for key in list(self._cloud_set_price_fail_count):
-            if key.endswith(suffix):
-                self._cloud_set_price_fail_count.pop(key, None)
-                self._cloud_set_price_next_try.pop(key, None)
-
     def _on_loop_progress(self) -> None:
         self.runtime.liveness.mark_loop_progress()
-        if self._should_feed_watchdog():
-            self.runtime.notifier.watchdog()
+        self.runtime.notifier.watchdog()
         self._maybe_status()
 
     def _maybe_status(self) -> None:
@@ -475,9 +369,6 @@ class ControllerLoop:
                     self._sync_serial_status()
                     await self._stop_rx_task()
                     await self._reconnect()
-                    self._on_loop_progress()
-                    continue
-                if await self._maybe_force_serial_reopen():
                     self._on_loop_progress()
                     continue
                 if self._rx_task is None or self._rx_task.done():
@@ -604,7 +495,6 @@ class ControllerLoop:
         session.tick_awaiting_completion()
         if outcome != "timeout":
             self.runtime.liveness.mark_successful_poll()
-            self._revive_cloud_set_price_for_address(address)
         self._report_observed_changes(session)
         unknown = (
             session.state.observed_status is ObservedStatus.UNKNOWN
@@ -1658,9 +1548,6 @@ class ControllerLoop:
 
     def _set_price_defer_reason(self, addr: int, session: PumpSession) -> str | None:
         """Why this dart address must wait before CD5 (None = eligible now)."""
-        if session.state.communication is CommunicationHealth.DISCONNECTED:
-            # Do not burn give-up attempts while the bus is silent / wedged.
-            return "offline"
         status = session.state.observed_status
         if status in {
             ObservedStatus.AUTHORIZED,
@@ -1720,9 +1607,6 @@ class ControllerLoop:
 
         TIMED_OUT / failed CD5 uses backoff so a silent dart address cannot
         hammer the bus every poll tick (and must not re-open startup CD5).
-        Offline / DISCONNECTED addresses defer without counting as failures;
-        after a successful poll (or forced serial reopen) give-up is cleared
-        so price can apply without a service restart.
         """
         if not self.runtime.safety.owned_lab_active_session:
             return
