@@ -7,10 +7,13 @@ from pathlib import Path
 import pytest
 
 from intelipump_fdc.cloud.set_price_request import (
+    SetPriceOutcome,
     SetPriceRequest,
+    consume_set_price_outcome,
     consume_set_price_request,
     parse_prices_from_payload,
     read_set_price_request,
+    write_set_price_outcome,
     write_set_price_request,
 )
 
@@ -66,3 +69,32 @@ def test_persisted_unit_price_roundtrip(
     assert got.prices_raw == (1450,)
     assert got.source == "cloud"
     assert (tmp_path / "unit-price.json").is_file()
+
+
+def test_set_price_outcome_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_set_price_outcome(
+        SetPriceOutcome(
+            correlation_id="c-out",
+            command_id="cmd-out",
+            station_id="SAO-1",
+            pump_id="pump-3",
+            unit_price_raw=1400,
+            execution_status="PRICE_CONFIRMED",
+            accepted=True,
+            applied_addresses=(1, 2),
+            gave_up_addresses=(),
+            deferred_addresses=(),
+            detail="cd5_application_or_dc3_confirmed",
+        )
+    )
+    got = consume_set_price_outcome()
+    assert got is not None
+    assert got.correlation_id == "c-out"
+    assert got.pump_id == "pump-3"
+    assert got.station_id == "SAO-1"
+    assert got.execution_status == "PRICE_CONFIRMED"
+    assert got.applied_addresses == (1, 2)
+    assert consume_set_price_outcome() is None

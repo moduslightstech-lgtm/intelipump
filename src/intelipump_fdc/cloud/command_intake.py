@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import json
@@ -20,6 +21,7 @@ from intelipump_fdc.cloud.schemas import CloudCommandInbound
 from intelipump_fdc.cloud.set_price_ownership import local_set_price_pump_ids
 from intelipump_fdc.cloud.set_price_request import (
     SetPriceRequest,
+    consume_set_price_outcome,
     parse_prices_from_payload,
     write_set_price_request,
 )
@@ -85,17 +87,99 @@ class CloudCommandIntake:
         self._seen: set[str] = set()
         self.active = False
         self._seq = 0
+        self._outcome_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         topic = self._topics.commands(self._station_id)
         self._mqtt.set_message_handler(self._on_message)
         await self._mqtt.subscribe(topic, qos=1)
         self.active = True
+        if self._outcome_task is None or self._outcome_task.done():
+            self._outcome_task = asyncio.create_task(
+                self._outcome_loop(), name="set-price-outcome-publisher"
+            )
 
     async def stop(self) -> None:
         self.active = False
+        if self._outcome_task is not None:
+            self._outcome_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._outcome_task
+            self._outcome_task = None
         with contextlib.suppress(Exception):
             await self._mqtt.unsubscribe(self._topics.commands(self._station_id))
+
+    async def _outcome_loop(self) -> None:
+        while self.active:
+            try:
+                await self.publish_pending_set_price_outcomes()
+            except Exception:
+                logger.exception("set_price_outcome_publish_failed")
+            await asyncio.sleep(1.0)
+
+    async def publish_pending_set_price_outcomes(self) -> int:
+        """Publish final CD5 outcomes written by the controller (identity-preserving)."""
+        published = 0
+        while True:
+            outcome = consume_set_price_outcome()
+            if outcome is None:
+                break
+            pump_id = outcome.pump_id
+            station_id = outcome.station_id or self._station_id
+            result_payload = {
+                "commandId": outcome.command_id,
+                "correlationId": outcome.correlation_id,
+                "accepted": outcome.accepted,
+                "evaluated": True,
+                "executed": outcome.accepted
+                and outcome.execution_status
+                in {"PRICE_CONFIRMED", "PRICE_PARTIAL"},
+                "executionStatus": outcome.execution_status,
+                "blockingReasons": (
+                    [outcome.detail] if outcome.detail and not outcome.accepted else []
+                ),
+                "warnings": [],
+                "unitPriceRaw": outcome.unit_price_raw,
+                "appliedAddresses": list(outcome.applied_addresses),
+                "gaveUpAddresses": list(outcome.gave_up_addresses),
+                "deferredAddresses": list(outcome.deferred_addresses),
+                "environment": self._environment,
+                "simulated": self._simulated,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "detail": outcome.detail,
+            }
+            self._seq += 1
+            envelope = build_envelope(
+                event_type="COMMAND_RESULT",
+                environment=self._environment,
+                device_id=self._device_id,
+                station_id=station_id,
+                sequence=self._seq,
+                simulated=self._simulated,
+                deduplication_key=f"cmd-result-final:{outcome.correlation_id}",
+                payload=result_payload,
+                pump_id=pump_id,
+                correlation_id=outcome.correlation_id,
+            )
+            if self._mqtt.is_connected:
+                topic = self._topics.command_result(
+                    station_id, outcome.correlation_id
+                )
+                await self._mqtt.publish(
+                    topic,
+                    json.dumps(envelope.to_dict(), separators=(",", ":")),
+                    qos=qos_for_event("COMMAND_RESULT"),
+                )
+                published += 1
+                logger.info(
+                    "set_price_final_result_published",
+                    correlationId=outcome.correlation_id,
+                    pumpId=pump_id,
+                    stationId=station_id,
+                    executionStatus=outcome.execution_status,
+                    accepted=outcome.accepted,
+                )
+        return published
 
     async def _on_message(self, message: MqttMessage) -> None:
         if not self.active:
@@ -282,8 +366,9 @@ class CloudCommandIntake:
                             pump_id=cmd.pumpId,
                         )
                     )
-                    executed = True
-                    execution_status = "QUEUED_FOR_CONTROLLER"
+                    # Queued only — not applied on the pump yet (CD5 still pending).
+                    executed = False
+                    execution_status = "PENDING_CONTROLLER"
                     resulting_state = current_state
                     logger.info(
                         "set_price_queued_for_controller",
@@ -291,6 +376,7 @@ class CloudCommandIntake:
                         unitPriceRaw=unit_price,
                         path=str(path),
                         stationId=self._station_id,
+                        pumpId=cmd.pumpId,
                     )
                 except ValueError as exc:
                     reasons.append(f"invalid_set_price_payload:{exc}")
@@ -369,7 +455,13 @@ class CloudCommandIntake:
 
         accepted = not reasons or (
             eligible
-            and execution_status in {"QUEUED", "QUEUED_FOR_CONTROLLER", "EVALUATED_ONLY"}
+            and execution_status
+            in {
+                "QUEUED",
+                "QUEUED_FOR_CONTROLLER",
+                "PENDING_CONTROLLER",
+                "EVALUATED_ONLY",
+            }
             and "expired" not in reasons
             and "wrong_station" not in reasons
             and "duplicate_correlation_id" not in reasons

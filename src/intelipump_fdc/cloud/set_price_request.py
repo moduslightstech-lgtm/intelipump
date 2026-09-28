@@ -201,3 +201,113 @@ def consume_set_price_request() -> SetPriceRequest | None:
         return None
     return req
 
+
+DEFAULT_OUTCOME_NAME = "set-price-outcome.json"
+
+
+def outcome_path() -> Path:
+    return request_dir() / DEFAULT_OUTCOME_NAME
+
+
+@dataclass(frozen=True, slots=True)
+class SetPriceOutcome:
+    """Final CD5 apply outcome for cloud-sync to publish as COMMAND_RESULT."""
+
+    correlation_id: str
+    command_id: str
+    station_id: str | None
+    pump_id: str | None
+    unit_price_raw: int
+    execution_status: str
+    accepted: bool
+    applied_addresses: tuple[int, ...]
+    gave_up_addresses: tuple[int, ...]
+    deferred_addresses: tuple[int, ...]
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "correlationId": self.correlation_id,
+            "commandId": self.command_id,
+            "stationId": self.station_id,
+            "pumpId": self.pump_id,
+            "unitPriceRaw": self.unit_price_raw,
+            "executionStatus": self.execution_status,
+            "accepted": self.accepted,
+            "appliedAddresses": list(self.applied_addresses),
+            "gaveUpAddresses": list(self.gave_up_addresses),
+            "deferredAddresses": list(self.deferred_addresses),
+            "detail": self.detail,
+            "updatedAt": datetime.now(UTC).isoformat(),
+        }
+
+
+def write_set_price_outcome(outcome: SetPriceOutcome) -> Path:
+    """Controller → cloud-sync bridge for final SET_PRICE COMMAND_RESULT."""
+    path = outcome_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(outcome.to_dict(), separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def consume_set_price_outcome() -> SetPriceOutcome | None:
+    """Read and remove a final outcome file (cloud-sync publishes then clears)."""
+    path = outcome_path()
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    if not isinstance(raw, dict):
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    try:
+        unit = int(raw.get("unitPriceRaw") or 0)
+    except (TypeError, ValueError):
+        unit = 0
+    if unit <= 0:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    corr = str(raw.get("correlationId") or "").strip()
+    cmd = str(raw.get("commandId") or corr).strip()
+    if not corr:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+
+    def _addrs(key: str) -> tuple[int, ...]:
+        val = raw.get(key) or []
+        if not isinstance(val, list):
+            return ()
+        out: list[int] = []
+        for item in val:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return tuple(out)
+
+    outcome = SetPriceOutcome(
+        correlation_id=corr,
+        command_id=cmd or corr,
+        station_id=str(raw["stationId"]) if raw.get("stationId") else None,
+        pump_id=str(raw["pumpId"]) if raw.get("pumpId") else None,
+        unit_price_raw=unit,
+        execution_status=str(raw.get("executionStatus") or "UNKNOWN").strip().upper(),
+        accepted=bool(raw.get("accepted", False)),
+        applied_addresses=_addrs("appliedAddresses"),
+        gave_up_addresses=_addrs("gaveUpAddresses"),
+        deferred_addresses=_addrs("deferredAddresses"),
+        detail=str(raw["detail"]) if raw.get("detail") else None,
+    )
+    with contextlib.suppress(OSError):
+        path.unlink()
+    return outcome
+
