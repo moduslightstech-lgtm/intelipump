@@ -18,6 +18,7 @@ import contextlib
 
 DEFAULT_REQUEST_NAME = "set-price-request.json"
 DEFAULT_STORED_PRICE_NAME = "unit-price.json"
+DEFAULT_ACK_HOLD_DIR_NAME = "set-price-ack-holds"
 
 
 def request_dir() -> Path:
@@ -88,12 +89,18 @@ def parse_prices_from_payload(payload: dict[str, Any]) -> tuple[int, tuple[int, 
 
 
 def write_set_price_request(req: SetPriceRequest) -> Path:
+    """Best-effort request write (intake). Prefer durable restore helpers at finalize."""
     path = request_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(req.to_dict(), separators=(",", ":")), encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def write_set_price_request_durable(req: SetPriceRequest) -> Path:
+    """Power-loss durable request write (temp → fsync → replace → fsync dir)."""
+    return _atomic_write_json(request_path(), req.to_dict())
 
 
 def write_persisted_unit_price(
@@ -209,9 +216,11 @@ def consume_set_price_request() -> SetPriceRequest | None:
 def consume_set_price_request_durable() -> SetPriceRequest | None:
     """Unlink the pending request, then fsync its directory.
 
-    On directory sync failure the request is rewritten so cloud-sync cannot
-    ACK-delete the paired outcome while the unlink is not yet durable.
-    Raises OSError when durability cannot be guaranteed (after restore).
+    On directory sync failure the request is restored with a durable write so
+    cloud-sync cannot ACK-delete the paired outcome while the unlink is not
+    durable. If that restore cannot be made durable, a durable ACK-hold marker
+    is retained instead (still blocking outcome deletion). Raises OSError when
+    the unlink was not confirmed durable.
     """
     path = request_path()
     req = read_set_price_request()
@@ -226,10 +235,34 @@ def consume_set_price_request_durable() -> SetPriceRequest | None:
     path.unlink()
     try:
         _fsync_dir(path)
-    except OSError:
-        # Unlink may not be durable — put the request back and keep the outcome.
-        write_set_price_request(req)
-        raise
+    except OSError as unlink_sync_exc:
+        # Unlink may not be durable — restore request durably, or hold ACK.
+        try:
+            write_set_price_request_durable(req)
+            clear_ack_hold(req.correlation_id)
+        except (OSError, ValueError) as restore_exc:
+            try:
+                write_ack_hold(
+                    req.correlation_id,
+                    reason="request_restore_not_durable_after_unlink_sync_failure",
+                )
+            except (OSError, ValueError):
+                # Last resort: best-effort non-durable request so a live
+                # cloud-sync still sees a block; durability is not guaranteed.
+                with contextlib.suppress(OSError):
+                    write_set_price_request(req)
+                raise OSError(
+                    "set-price request unlink dir sync failed and neither "
+                    "durable restore nor durable ACK-hold could be written"
+                ) from restore_exc
+            raise OSError(
+                "set-price request unlink dir sync failed; durable restore "
+                "failed — ACK-hold retained to block outcome deletion"
+            ) from restore_exc
+        raise OSError(
+            "set-price request unlink dir sync failed; request restored durably"
+        ) from unlink_sync_exc
+    clear_ack_hold(req.correlation_id)
     return req
 
 
@@ -403,13 +436,62 @@ def write_set_price_outcome(outcome: SetPriceOutcome) -> Path:
     return _atomic_write_json(_outcome_file_path(outcome.correlation_id), outcome.to_dict())
 
 
-def pending_request_blocks_outcome_ack(correlation_id: str) -> bool:
-    """True when the pending request still pairs with this outcome correlation.
+def ack_hold_dir() -> Path:
+    return request_dir() / DEFAULT_ACK_HOLD_DIR_NAME
 
-    Cloud-sync must not delete the outcome while that request can survive a
-    crash — otherwise the only completion marker is gone and the request can
-    be re-applied after restart.
+
+def _ack_hold_file_path(correlation_id: str) -> Path:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "-_" else "_"
+        for ch in (correlation_id or "").strip()
+    )
+    if not safe:
+        raise ValueError("correlation_id required for ACK-hold file")
+    return ack_hold_dir() / f"{safe}.json"
+
+
+def write_ack_hold(correlation_id: str, *, reason: str) -> Path:
+    """Durable marker: cloud-sync must not ACK-delete this correlation's outcome."""
+    return _atomic_write_json(
+        _ack_hold_file_path(correlation_id),
+        {
+            "correlationId": correlation_id,
+            "reason": reason,
+            "updatedAt": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def clear_ack_hold(correlation_id: str) -> None:
+    """Best-effort remove of an ACK-hold after durable request unlink succeeds."""
+    try:
+        path = _ack_hold_file_path(correlation_id)
+    except ValueError:
+        return
+    if not path.is_file():
+        return
+    with contextlib.suppress(OSError):
+        path.unlink()
+    with contextlib.suppress(OSError):
+        _fsync_dir(path)
+
+
+def has_ack_hold(correlation_id: str) -> bool:
+    try:
+        return _ack_hold_file_path(correlation_id).is_file()
+    except ValueError:
+        return False
+
+
+def pending_request_blocks_outcome_ack(correlation_id: str) -> bool:
+    """True when cloud-sync must not ACK-delete this outcome yet.
+
+    Blocks while the matching request is still present, or while a durable
+    ACK-hold marker remains (request restore after unlink sync could not be
+    made durable).
     """
+    if has_ack_hold(correlation_id):
+        return True
     pending = read_set_price_request()
     if pending is None:
         return False

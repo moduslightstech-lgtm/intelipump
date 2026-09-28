@@ -388,6 +388,7 @@ def test_request_unlink_dir_sync_failure_restores_request_retains_outcome(
     import intelipump_fdc.cloud.set_price_request as spr
     from intelipump_fdc.cloud.set_price_request import (
         consume_set_price_request_durable,
+        has_ack_hold,
         pending_request_blocks_outcome_ack,
     )
 
@@ -402,20 +403,91 @@ def test_request_unlink_dir_sync_failure_restores_request_retains_outcome(
     )
     write_set_price_outcome(_outcome("corr-unlink-sync", "pump-1"))
 
-    real_fsync = os.fsync
+    real_fsync_dir = spr._fsync_dir
+    calls = {"n": 0}
 
-    def _fsync_fail_request_dir(fd: int) -> None:
-        # Fail the dir sync that follows request unlink (path.parent of request).
-        raise OSError("simulated request dir fsync failure")
+    def _fail_unlink_dir_only(path: Path) -> None:
+        calls["n"] += 1
+        # First call: post-unlink dir sync. Later calls: durable restore.
+        if calls["n"] == 1:
+            raise OSError("simulated request dir fsync failure")
+        return real_fsync_dir(path)
 
-    monkeypatch.setattr(spr, "_fsync_dir", _fsync_fail_request_dir)
-    with pytest.raises(OSError, match="simulated request dir fsync failure"):
+    monkeypatch.setattr(spr, "_fsync_dir", _fail_unlink_dir_only)
+    with pytest.raises(OSError, match="request restored durably"):
         consume_set_price_request_durable()
 
     assert read_set_price_request() is not None
     assert read_set_price_request().correlation_id == "corr-unlink-sync"
     assert has_set_price_outcome("corr-unlink-sync") is True
+    assert has_ack_hold("corr-unlink-sync") is False
     assert pending_request_blocks_outcome_ack("corr-unlink-sync") is True
+
+
+@pytest.mark.asyncio
+async def test_unlink_and_restore_sync_both_fail_retains_durable_ack_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If unlink sync and durable restore both fail, keep a durable ACK-hold."""
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    import intelipump_fdc.cloud.set_price_request as spr
+    from intelipump_fdc.cloud.command_intake import CloudCommandIntake
+    from intelipump_fdc.cloud.mqtt.models import MqttPublishResult
+    from intelipump_fdc.cloud.topics import TopicBuilder
+    from intelipump_fdc.cloud.set_price_request import (
+        consume_set_price_request_durable,
+        has_ack_hold,
+        pending_request_blocks_outcome_ack,
+    )
+
+    write_set_price_request(
+        SetPriceRequest(
+            correlation_id="corr-both-fail",
+            command_id="cmd-both-fail",
+            unit_price_raw=1425,
+            prices_raw=(1425,),
+            pump_id="pump-9",
+        )
+    )
+    write_set_price_outcome(_outcome("corr-both-fail", "pump-9"))
+
+    real_fsync_dir = spr._fsync_dir
+
+    def _fail_request_dir_only(path: Path) -> None:
+        # Fail sync of the request directory itself; allow ACK-hold subdir sync.
+        if path.parent.resolve() == spr.request_dir().resolve():
+            raise OSError("request dir sync failure")
+        return real_fsync_dir(path)
+
+    monkeypatch.setattr(spr, "_fsync_dir", _fail_request_dir_only)
+    with pytest.raises(OSError, match="ACK-hold retained"):
+        consume_set_price_request_durable()
+
+    assert has_ack_hold("corr-both-fail") is True
+    assert has_set_price_outcome("corr-both-fail") is True
+    assert pending_request_blocks_outcome_ack("corr-both-fail") is True
+    # Durable restore rolled back the non-durable request file.
+    assert read_set_price_request() is None
+
+    mqtt = MagicMock()
+    mqtt.is_connected = True
+    mqtt.publish = AsyncMock(
+        return_value=MqttPublishResult(topic="t", acknowledged=True, mid=11)
+    )
+    intake = CloudCommandIntake(
+        session_factory=MagicMock(),
+        mqtt=mqtt,
+        topics=TopicBuilder(environment="PRODUCTION"),
+        station_id="SAO-1",
+        device_id="pi-001",
+        environment="PRODUCTION",
+        simulated=False,
+        allow_lab_simulator_commands=False,
+    )
+    published = await intake.publish_pending_set_price_outcomes()
+    assert published == 0
+    mqtt.publish.assert_not_called()
+    assert has_set_price_outcome("corr-both-fail") is True
 
 
 @pytest.mark.asyncio
@@ -490,12 +562,17 @@ async def test_publish_blocked_when_request_unlink_sync_failed(
     )
     write_set_price_outcome(_outcome("corr-crash-window", "pump-4"))
 
-    monkeypatch.setattr(
-        spr,
-        "_fsync_dir",
-        lambda _path: (_ for _ in ()).throw(OSError("dir sync after unlink")),
-    )
-    with pytest.raises(OSError, match="dir sync after unlink"):
+    real_fsync_dir = spr._fsync_dir
+    calls = {"n": 0}
+
+    def _fail_first_dir_sync(path: Path) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("dir sync after unlink")
+        return real_fsync_dir(path)
+
+    monkeypatch.setattr(spr, "_fsync_dir", _fail_first_dir_sync)
+    with pytest.raises(OSError, match="request restored durably"):
         consume_set_price_request_durable()
 
     mqtt = MagicMock()
