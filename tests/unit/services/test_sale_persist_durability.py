@@ -80,6 +80,72 @@ async def test_temporary_sqlite_error_retries_without_duplicate(
 
 
 @pytest.mark.asyncio
+async def test_spilled_critical_requeues_while_worker_still_busy(tmp_path: Path) -> None:
+    """Spilled CRITICAL jobs re-enter the queue while another handler is still gated.
+
+    Does not require an idle/empty worker or a process restart: the background
+    requeue task fills a free slot as soon as depth < maxsize.
+    """
+    store = PersistRecoveryStore(tmp_path / "busy.jsonl")
+    worker = PersistenceWorker(
+        maxsize=2,
+        critical_max_attempts=3,
+        recovery_store=store,
+    )
+    gates = {
+        "busy-a": asyncio.Event(),
+        "busy-b": asyncio.Event(),
+        "busy-c": asyncio.Event(),
+        "busy-d": asyncio.Event(),
+    }
+    entered: list[str] = []
+
+    async def gated(payload: dict) -> None:
+        tx = str(payload["payload"]["active_transaction_id"])
+        entered.append(tx)
+        await gates[tx].wait()
+
+    worker.register_handler("state_changed", gated)
+    worker.start()
+    # A running; B+C fill the waiting queue; D spills to durable store.
+    for tx in ("busy-a", "busy-b", "busy-c"):
+        worker.submit(
+            kind="state_changed",
+            payload=_completion_payload(tx),
+            handler=gated,
+            priority=PersistPriority.CRITICAL,
+        )
+        await asyncio.sleep(0.02)
+    worker.submit(
+        kind="state_changed",
+        payload=_completion_payload("busy-d"),
+        handler=gated,
+        priority=PersistPriority.CRITICAL,
+    )
+    assert worker.critical_durable_spills >= 1
+    assert any("busy-d" in p.identity_key for p in store.list_pending())
+    assert "busy-a" in entered
+
+    # Free A so B starts; one queue slot opens while B remains gated.
+    gates["busy-a"].set()
+    for _ in range(50):
+        if any("busy-d" in key for key in worker._inflight_identities):
+            break
+        await asyncio.sleep(0.05)
+    assert any("busy-d" in key for key in worker._inflight_identities)
+    assert not gates["busy-b"].is_set()
+    for g in gates.values():
+        g.set()
+    for _ in range(40):
+        if worker.processed >= 4:
+            break
+        await asyncio.sleep(0.05)
+    await worker.stop(flush=True, timeout_s=2.0)
+    assert worker.processed >= 4
+    assert store.pending_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_queue_full_critical_requeues_without_restart(tmp_path: Path) -> None:
     store = PersistRecoveryStore(tmp_path / "qf.jsonl")
     worker = PersistenceWorker(

@@ -75,6 +75,7 @@ class PersistenceWorker:
         self._degraded = False
         self._degraded_reason: str | None = None
         self._inflight_identities: set[str] = set()
+        self._requeue_task: asyncio.Task[None] | None = None
 
     @property
     def depth(self) -> int:
@@ -129,17 +130,38 @@ class PersistenceWorker:
         if self._task is None or self._task.done():
             self._stop.clear()
             self._task = asyncio.create_task(self._run(), name="persistence-worker")
+            # Requeue spilled CRITICAL jobs even while a handler is still running
+            # (must not wait for an empty queue or process restart).
+            self._requeue_task = asyncio.create_task(
+                self._requeue_while_busy(), name="persistence-requeue"
+            )
 
     async def stop(self, *, flush: bool = True, timeout_s: float = 5.0) -> None:
         if flush:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._queue.join(), timeout=timeout_s)
         self._stop.set()
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
+        for task in (self._requeue_task, self._task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._requeue_task = None
+        self._task = None
+
+    async def _requeue_while_busy(self) -> None:
+        """Pull durable spills into the memory queue while work is in flight."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(_REQUEUE_IDLE_INTERVAL_S)
+                if self._recovery_store is None:
+                    continue
+                if self.depth >= self._maxsize:
+                    continue
+                with contextlib.suppress(PersistRecoveryError):
+                    self.recover_pending()
+            except asyncio.CancelledError:
+                raise
 
     def submit(
         self,
@@ -282,9 +304,11 @@ class PersistenceWorker:
             try:
                 await self._execute(job)
             finally:
-                if job.identity_key:
-                    self._inflight_identities.discard(job.identity_key)
                 self._queue.task_done()
+
+    def _release_inflight(self, identity_key: str | None) -> None:
+        if identity_key:
+            self._inflight_identities.discard(identity_key)
 
     async def _execute(self, job: PersistJob) -> None:
         handler = job.handler or self._handlers.get(job.kind)
@@ -293,12 +317,14 @@ class PersistenceWorker:
             logger.error("persistence job has no handler kind=%s", job.kind)
             if job.priority == int(PersistPriority.CRITICAL):
                 self._spill_failed(job, "missing_handler")
+            self._release_inflight(job.identity_key)
             return
         try:
             await handler(job.payload)
             self._processed += 1
             if job.identity_key and self._recovery_store is not None:
                 self._recovery_store.mark_done(job.identity_key)
+            self._release_inflight(job.identity_key)
             self.clear_degraded_if_idle()
         except Exception as exc:
             self._errors += 1
@@ -310,6 +336,7 @@ class PersistenceWorker:
                 job.identity_key,
             )
             if job.priority != int(PersistPriority.CRITICAL):
+                self._release_inflight(job.identity_key)
                 return
             next_attempt = job.attempt + 1
             if next_attempt < self._critical_max_attempts:
@@ -324,6 +351,8 @@ class PersistenceWorker:
                         last_error=err,
                     )
                 await asyncio.sleep(_CRITICAL_RETRY_DELAY_S * next_attempt)
+                # Keep identity in-flight across retry so the background requeue
+                # task cannot submit a duplicate while this retry is pending.
                 try:
                     self.submit(
                         kind=job.kind,
@@ -336,8 +365,10 @@ class PersistenceWorker:
                     )
                 except PersistenceQueueFullError:
                     self._spill_failed(job, err)
+                    self._release_inflight(job.identity_key)
                 return
             self._spill_failed(job, err)
+            self._release_inflight(job.identity_key)
 
     def _spill_failed(self, job: PersistJob, error: str) -> None:
         self._critical_durable_spills += 1
