@@ -21,7 +21,8 @@ from intelipump_fdc.cloud.schemas import CloudCommandInbound
 from intelipump_fdc.cloud.set_price_ownership import local_set_price_pump_ids
 from intelipump_fdc.cloud.set_price_request import (
     SetPriceRequest,
-    consume_set_price_outcome,
+    ack_set_price_outcome,
+    list_set_price_outcomes,
     parse_prices_from_payload,
     write_set_price_request,
 )
@@ -36,7 +37,7 @@ from intelipump_fdc.protocol.dart.application.constants import PumpControlComman
 from intelipump_fdc.simulator.encoding import encode_cd1_command
 from intelipump_fdc.state_machine.guards import evaluate_command_eligibility
 from intelipump_fdc.state_machine.models import PumpContext
-
+from intelipump_fdc.cloud.mqtt.errors import MqttError, MqttNotConnectedError, MqttPublishError
 logger = structlog.get_logger(__name__)
 
 _CD1_MAP: dict[PumpCommand, PumpControlCommand] = {
@@ -118,11 +119,14 @@ class CloudCommandIntake:
             await asyncio.sleep(1.0)
 
     async def publish_pending_set_price_outcomes(self) -> int:
-        """Publish final CD5 outcomes written by the controller (identity-preserving)."""
+        """Publish retained CD5 outcomes; ACK-delete only after MQTT delivery.
+
+        Multiple correlations stay on disk concurrently — a publish failure
+        leaves that outcome (and later ones) for the next loop tick.
+        """
         published = 0
-        while True:
-            outcome = consume_set_price_outcome()
-            if outcome is None:
+        for outcome in list_set_price_outcomes():
+            if not self._mqtt.is_connected:
                 break
             pump_id = outcome.pump_id
             station_id = outcome.station_id or self._station_id
@@ -161,24 +165,40 @@ class CloudCommandIntake:
                 pump_id=pump_id,
                 correlation_id=outcome.correlation_id,
             )
-            if self._mqtt.is_connected:
-                topic = self._topics.command_result(
-                    station_id, outcome.correlation_id
-                )
-                await self._mqtt.publish(
+            topic = self._topics.command_result(station_id, outcome.correlation_id)
+            try:
+                result = await self._mqtt.publish(
                     topic,
                     json.dumps(envelope.to_dict(), separators=(",", ":")),
                     qos=qos_for_event("COMMAND_RESULT"),
                 )
-                published += 1
-                logger.info(
-                    "set_price_final_result_published",
+            except (MqttNotConnectedError, MqttPublishError, MqttError) as exc:
+                logger.warning(
+                    "set_price_final_result_publish_failed_retained",
                     correlationId=outcome.correlation_id,
                     pumpId=pump_id,
                     stationId=station_id,
-                    executionStatus=outcome.execution_status,
-                    accepted=outcome.accepted,
+                    error=str(exc),
                 )
+                break
+            if not getattr(result, "acknowledged", True):
+                logger.warning(
+                    "set_price_final_result_unacked_retained",
+                    correlationId=outcome.correlation_id,
+                    pumpId=pump_id,
+                    stationId=station_id,
+                )
+                break
+            ack_set_price_outcome(outcome.correlation_id)
+            published += 1
+            logger.info(
+                "set_price_final_result_published",
+                correlationId=outcome.correlation_id,
+                pumpId=pump_id,
+                stationId=station_id,
+                executionStatus=outcome.execution_status,
+                accepted=outcome.accepted,
+            )
         return published
 
     async def _on_message(self, message: MqttMessage) -> None:

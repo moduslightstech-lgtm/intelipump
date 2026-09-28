@@ -722,6 +722,7 @@ class PumpSession:
                 self.state.logical_nozzle = mapped.selected_nozzle
         if mapped.filling_price_raw is not None:
             self.state.unit_price_raw = mapped.filling_price_raw
+            self.state.unit_price_obs_gen = int(self.state.unit_price_obs_gen or 0) + 1
         self.state.sale_lifecycle = self.state.sale_evidence.lifecycle
         self.evaluate_synchronized()
 

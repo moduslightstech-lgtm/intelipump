@@ -203,10 +203,16 @@ def consume_set_price_request() -> SetPriceRequest | None:
 
 
 DEFAULT_OUTCOME_NAME = "set-price-outcome.json"
+DEFAULT_OUTCOMES_DIR_NAME = "set-price-outcomes"
 
 
 def outcome_path() -> Path:
+    """Legacy single-file path (migrated into outcomes_dir on read)."""
     return request_dir() / DEFAULT_OUTCOME_NAME
+
+
+def outcomes_dir() -> Path:
+    return request_dir() / DEFAULT_OUTCOMES_DIR_NAME
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,44 +248,26 @@ class SetPriceOutcome:
         }
 
 
-def write_set_price_outcome(outcome: SetPriceOutcome) -> Path:
-    """Controller → cloud-sync bridge for final SET_PRICE COMMAND_RESULT."""
-    path = outcome_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(outcome.to_dict(), separators=(",", ":")), encoding="utf-8")
-    tmp.replace(path)
-    return path
+def _outcome_file_path(correlation_id: str) -> Path:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "-_" else "_"
+        for ch in (correlation_id or "").strip()
+    )
+    if not safe:
+        raise ValueError("correlation_id required for outcome file")
+    return outcomes_dir() / f"{safe}.json"
 
 
-def consume_set_price_outcome() -> SetPriceOutcome | None:
-    """Read and remove a final outcome file (cloud-sync publishes then clears)."""
-    path = outcome_path()
-    if not path.is_file():
-        return None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        with contextlib.suppress(OSError):
-            path.unlink()
-        return None
-    if not isinstance(raw, dict):
-        with contextlib.suppress(OSError):
-            path.unlink()
-        return None
+def _parse_outcome_dict(raw: dict[str, Any]) -> SetPriceOutcome | None:
     try:
         unit = int(raw.get("unitPriceRaw") or 0)
     except (TypeError, ValueError):
         unit = 0
     if unit <= 0:
-        with contextlib.suppress(OSError):
-            path.unlink()
         return None
     corr = str(raw.get("correlationId") or "").strip()
     cmd = str(raw.get("commandId") or corr).strip()
     if not corr:
-        with contextlib.suppress(OSError):
-            path.unlink()
         return None
 
     def _addrs(key: str) -> tuple[int, ...]:
@@ -294,7 +282,7 @@ def consume_set_price_outcome() -> SetPriceOutcome | None:
                 continue
         return tuple(out)
 
-    outcome = SetPriceOutcome(
+    return SetPriceOutcome(
         correlation_id=corr,
         command_id=cmd or corr,
         station_id=str(raw["stationId"]) if raw.get("stationId") else None,
@@ -307,7 +295,85 @@ def consume_set_price_outcome() -> SetPriceOutcome | None:
         deferred_addresses=_addrs("deferredAddresses"),
         detail=str(raw["detail"]) if raw.get("detail") else None,
     )
+
+
+def _migrate_legacy_outcome_file() -> None:
+    """Move legacy single-file outcome into the durable multi-correlation dir."""
+    legacy = outcome_path()
+    if not legacy.is_file():
+        return
+    try:
+        raw = json.loads(legacy.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        with contextlib.suppress(OSError):
+            legacy.unlink()
+        return
+    if not isinstance(raw, dict):
+        with contextlib.suppress(OSError):
+            legacy.unlink()
+        return
+    outcome = _parse_outcome_dict(raw)
+    with contextlib.suppress(OSError):
+        legacy.unlink()
+    if outcome is not None:
+        write_set_price_outcome(outcome)
+
+
+def write_set_price_outcome(outcome: SetPriceOutcome) -> Path:
+    """Persist a final outcome until cloud-sync MQTT delivery is acknowledged.
+
+    One file per correlationId so concurrent / sequential SET_PRICE results
+    never overwrite each other.
+    """
+    path = _outcome_file_path(outcome.correlation_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(outcome.to_dict(), separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def list_set_price_outcomes() -> list[SetPriceOutcome]:
+    """Read pending outcomes without removing them (ordered by filename)."""
+    _migrate_legacy_outcome_file()
+    directory = outcomes_dir()
+    if not directory.is_dir():
+        return []
+    out: list[SetPriceOutcome] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        parsed = _parse_outcome_dict(raw)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
+def ack_set_price_outcome(correlation_id: str) -> bool:
+    """Remove a retained outcome after MQTT publish was acknowledged."""
+    path = _outcome_file_path(correlation_id)
+    if not path.is_file():
+        return False
     with contextlib.suppress(OSError):
         path.unlink()
-    return outcome
+        return not path.is_file()
+    return False
+
+
+def consume_set_price_outcome() -> SetPriceOutcome | None:
+    """Compatibility helper: peek the oldest pending outcome and ACK it.
+
+    Prefer ``list_set_price_outcomes`` + ``ack_set_price_outcome`` when the
+    publisher must retain until MQTT ACK.
+    """
+    pending = list_set_price_outcomes()
+    if not pending:
+        return None
+    first = pending[0]
+    ack_set_price_outcome(first.correlation_id)
+    return first
 

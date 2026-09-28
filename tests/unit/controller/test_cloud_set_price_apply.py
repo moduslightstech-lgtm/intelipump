@@ -10,6 +10,7 @@ import pytest
 from intelipump_fdc.cloud.set_price_request import (
     SetPriceRequest,
     consume_set_price_outcome,
+    list_set_price_outcomes,
     read_set_price_request,
     write_set_price_request,
 )
@@ -108,7 +109,7 @@ async def test_set_price_applies_to_idle_sibling_while_other_awaits_hangup(
     assert 2 in loop._cloud_set_price_applied["corr-partial"]
     assert 1 not in loop._cloud_set_price_applied["corr-partial"]
     assert read_set_price_request() is not None
-    assert consume_set_price_outcome() is None
+    assert list_set_price_outcomes() == []
 
     # Hang-up makes addr=1 eligible: RESET retained face, then CD5.
     loop.sessions[1].state.nozzle_position = NozzlePosition.IN
@@ -165,14 +166,64 @@ async def test_set_price_retry_after_filling_completed_becomes_eligible(
 
 
 @pytest.mark.asyncio
-async def test_link_ack_alone_is_not_applied_price(
+async def test_reset_failure_does_not_clear_retained_sale_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    loop = _dual_addr_loop()
+    # Single-address focus: make addr=2 already applied via empty sessions? Use both idle
+    # except addr=1 held — RESET times out; sale bookkeeping must stay.
+    loop.sessions[1].state.observed_status = ObservedStatus.FILLING_COMPLETED
+    loop.sessions[1].state.nozzle_position = NozzlePosition.IN
+    loop.sessions[1].state.filled_volume_raw = 1234
+    loop.sessions[1].state.filled_amount_raw = 5678
+    loop._sale_display_held.add(1)
+    loop._sale_display_hold_since[1] = 1.0
+    loop._last_dc2[1] = (1234, 5678)
+    loop.sessions[2].state.observed_status = ObservedStatus.RESET
+
+    write_set_price_request(
+        SetPriceRequest(
+            correlation_id="corr-reset-fail",
+            command_id="cmd-reset-fail",
+            unit_price_raw=1410,
+            prices_raw=(1410,),
+            pump_id="pump-1",
+        )
+    )
+
+    async def _run(session, *args, **kwargs):
+        label = kwargs.get("command_label") or ""
+        if "RESET" in label:
+            return type("R", (), {"status": ExchangeResultStatus.TIMED_OUT})()
+        return type("R", (), {"status": ExchangeResultStatus.APPLICATION_CONFIRMED})()
+
+    loop._run_owned_command = AsyncMock(side_effect=_run)  # type: ignore[method-assign]
+
+    await loop._apply_pending_cloud_set_price()
+
+    assert 1 in loop._sale_display_held
+    assert loop._sale_display_hold_since.get(1) == 1.0
+    assert loop._last_dc2.get(1) == (1234, 5678)
+    assert loop.sessions[1].state.filled_volume_raw == 1234
+    assert loop.sessions[1].state.filled_amount_raw == 5678
+    # addr=2 still got CD5; request retained for addr=1
+    assert 2 in loop._cloud_set_price_applied["corr-reset-fail"]
+    assert 1 not in loop._cloud_set_price_applied["corr-reset-fail"]
+    assert read_set_price_request() is not None
+
+
+@pytest.mark.asyncio
+async def test_link_ack_stale_price_does_not_confirm_without_fresh_dc3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
     loop = _dual_addr_loop()
     for addr in (1, 2):
         loop.sessions[addr].state.observed_status = ObservedStatus.RESET
-        loop.sessions[addr].state.unit_price_raw = 1000  # not yet new price
+        # Stale face already shows commanded price — must NOT confirm on LINK_ACK.
+        loop.sessions[addr].state.unit_price_raw = 1500
+        loop.sessions[addr].state.unit_price_obs_gen = 3
 
     write_set_price_request(
         SetPriceRequest(
@@ -196,10 +247,16 @@ async def test_link_ack_alone_is_not_applied_price(
     assert read_set_price_request() is not None
     assert "corr-link" in loop._cloud_set_price_awaiting_dc3
     assert not loop._cloud_set_price_applied.get("corr-link")
-    assert consume_set_price_outcome() is None
+    assert list_set_price_outcomes() == []
 
-    # DC3 face matches → confirm without re-sending CD5 as applied.
+    # Same gen + same price still not confirmed.
+    await loop._apply_pending_cloud_set_price()
+    assert not loop._cloud_set_price_applied.get("corr-link")
+    assert read_set_price_request() is not None
+
+    # Fresh DC3 observation (gen bump) with matching price → confirm.
     for addr in (1, 2):
+        loop.sessions[addr].state.unit_price_obs_gen = 4
         loop.sessions[addr].state.unit_price_raw = 1500
     await loop._apply_pending_cloud_set_price()
     assert read_set_price_request() is None
@@ -244,4 +301,4 @@ async def test_cd5_timeout_is_not_applied_price(
     assert timed_out.await_count == first_calls
     assert read_set_price_request() is not None
     assert not loop._cloud_set_price_applied.get("corr-timeout")
-    assert consume_set_price_outcome() is None
+    assert list_set_price_outcomes() == []
