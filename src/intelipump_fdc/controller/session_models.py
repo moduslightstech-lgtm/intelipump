@@ -163,6 +163,9 @@ class PumpSessionState:
     filled_volume_raw: int = 0
     filled_amount_raw: int = 0
     unit_price_raw: int | None = None
+    # Bumped whenever a DC3 (or other frame) supplies filling_price_raw so
+    # LINK_ACK confirmations can require a fresh observation after CD5.
+    unit_price_obs_gen: int = 0
     last_valid_frame_time: float | None = None
     last_status_time: float | None = None
     last_nozio_time: float | None = None

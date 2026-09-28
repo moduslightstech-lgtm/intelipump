@@ -18,6 +18,7 @@ import contextlib
 
 DEFAULT_REQUEST_NAME = "set-price-request.json"
 DEFAULT_STORED_PRICE_NAME = "unit-price.json"
+DEFAULT_ACK_HOLD_DIR_NAME = "set-price-ack-holds"
 
 
 def request_dir() -> Path:
@@ -88,12 +89,18 @@ def parse_prices_from_payload(payload: dict[str, Any]) -> tuple[int, tuple[int, 
 
 
 def write_set_price_request(req: SetPriceRequest) -> Path:
+    """Best-effort request write (intake). Prefer durable restore helpers at finalize."""
     path = request_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(req.to_dict(), separators=(",", ":")), encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def write_set_price_request_durable(req: SetPriceRequest) -> Path:
+    """Power-loss durable request write (temp → fsync → replace → fsync dir)."""
+    return _atomic_write_json(request_path(), req.to_dict())
 
 
 def write_persisted_unit_price(
@@ -187,7 +194,11 @@ def read_set_price_request() -> SetPriceRequest | None:
 
 
 def consume_set_price_request() -> SetPriceRequest | None:
-    """Read and remove a pending request. Returns None if absent or invalid."""
+    """Read and remove a pending request. Returns None if absent or invalid.
+
+    Prefer ``consume_set_price_request_durable`` at finalization so the unlink
+    is power-loss durable before cloud-sync may ACK-delete the outcome.
+    """
     path = request_path()
     req = read_set_price_request()
     if req is None:
@@ -200,4 +211,343 @@ def consume_set_price_request() -> SetPriceRequest | None:
     except OSError:
         return None
     return req
+
+
+def consume_set_price_request_durable() -> SetPriceRequest | None:
+    """Unlink the pending request, then fsync its directory.
+
+    On directory sync failure the request is restored with a durable write so
+    cloud-sync cannot ACK-delete the paired outcome while the unlink is not
+    durable. If that restore cannot be made durable, a durable ACK-hold marker
+    is retained instead (still blocking outcome deletion). Raises OSError when
+    the unlink was not confirmed durable.
+    """
+    path = request_path()
+    req = read_set_price_request()
+    if req is None:
+        if path.is_file():
+            try:
+                path.unlink()
+                _fsync_dir(path)
+            except OSError:
+                pass
+        return None
+    path.unlink()
+    try:
+        _fsync_dir(path)
+    except OSError as unlink_sync_exc:
+        # Unlink may not be durable — restore request durably, or hold ACK.
+        try:
+            write_set_price_request_durable(req)
+            clear_ack_hold(req.correlation_id)
+        except (OSError, ValueError) as restore_exc:
+            try:
+                write_ack_hold(
+                    req.correlation_id,
+                    reason="request_restore_not_durable_after_unlink_sync_failure",
+                )
+            except (OSError, ValueError):
+                # Last resort: best-effort non-durable request so a live
+                # cloud-sync still sees a block; durability is not guaranteed.
+                with contextlib.suppress(OSError):
+                    write_set_price_request(req)
+                raise OSError(
+                    "set-price request unlink dir sync failed and neither "
+                    "durable restore nor durable ACK-hold could be written"
+                ) from restore_exc
+            raise OSError(
+                "set-price request unlink dir sync failed; durable restore "
+                "failed — ACK-hold retained to block outcome deletion"
+            ) from restore_exc
+        raise OSError(
+            "set-price request unlink dir sync failed; request restored durably"
+        ) from unlink_sync_exc
+    clear_ack_hold(req.correlation_id)
+    return req
+
+
+DEFAULT_OUTCOME_NAME = "set-price-outcome.json"
+DEFAULT_OUTCOMES_DIR_NAME = "set-price-outcomes"
+
+
+def outcome_path() -> Path:
+    """Legacy single-file path (migrated into outcomes_dir on read)."""
+    return request_dir() / DEFAULT_OUTCOME_NAME
+
+
+def outcomes_dir() -> Path:
+    return request_dir() / DEFAULT_OUTCOMES_DIR_NAME
+
+
+@dataclass(frozen=True, slots=True)
+class SetPriceOutcome:
+    """Final CD5 apply outcome for cloud-sync to publish as COMMAND_RESULT."""
+
+    correlation_id: str
+    command_id: str
+    station_id: str | None
+    pump_id: str | None
+    unit_price_raw: int
+    execution_status: str
+    accepted: bool
+    applied_addresses: tuple[int, ...]
+    gave_up_addresses: tuple[int, ...]
+    deferred_addresses: tuple[int, ...]
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "correlationId": self.correlation_id,
+            "commandId": self.command_id,
+            "stationId": self.station_id,
+            "pumpId": self.pump_id,
+            "unitPriceRaw": self.unit_price_raw,
+            "executionStatus": self.execution_status,
+            "accepted": self.accepted,
+            "appliedAddresses": list(self.applied_addresses),
+            "gaveUpAddresses": list(self.gave_up_addresses),
+            "deferredAddresses": list(self.deferred_addresses),
+            "detail": self.detail,
+            "updatedAt": datetime.now(UTC).isoformat(),
+        }
+
+
+def _outcome_file_path(correlation_id: str) -> Path:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "-_" else "_"
+        for ch in (correlation_id or "").strip()
+    )
+    if not safe:
+        raise ValueError("correlation_id required for outcome file")
+    return outcomes_dir() / f"{safe}.json"
+
+
+def _parse_outcome_dict(raw: dict[str, Any]) -> SetPriceOutcome | None:
+    try:
+        unit = int(raw.get("unitPriceRaw") or 0)
+    except (TypeError, ValueError):
+        unit = 0
+    if unit <= 0:
+        return None
+    corr = str(raw.get("correlationId") or "").strip()
+    cmd = str(raw.get("commandId") or corr).strip()
+    if not corr:
+        return None
+
+    def _addrs(key: str) -> tuple[int, ...]:
+        val = raw.get(key) or []
+        if not isinstance(val, list):
+            return ()
+        out: list[int] = []
+        for item in val:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return tuple(out)
+
+    return SetPriceOutcome(
+        correlation_id=corr,
+        command_id=cmd or corr,
+        station_id=str(raw["stationId"]) if raw.get("stationId") else None,
+        pump_id=str(raw["pumpId"]) if raw.get("pumpId") else None,
+        unit_price_raw=unit,
+        execution_status=str(raw.get("executionStatus") or "UNKNOWN").strip().upper(),
+        accepted=bool(raw.get("accepted", False)),
+        applied_addresses=_addrs("appliedAddresses"),
+        gave_up_addresses=_addrs("gaveUpAddresses"),
+        deferred_addresses=_addrs("deferredAddresses"),
+        detail=str(raw["detail"]) if raw.get("detail") else None,
+    )
+
+
+def _migrate_legacy_outcome_file() -> None:
+    """Move legacy single-file outcome into the durable multi-correlation dir."""
+    legacy = outcome_path()
+    if not legacy.is_file():
+        return
+    try:
+        raw = json.loads(legacy.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        with contextlib.suppress(OSError):
+            legacy.unlink()
+        return
+    if not isinstance(raw, dict):
+        with contextlib.suppress(OSError):
+            legacy.unlink()
+        return
+    outcome = _parse_outcome_dict(raw)
+    with contextlib.suppress(OSError):
+        legacy.unlink()
+    if outcome is not None:
+        write_set_price_outcome(outcome)
+
+
+def _fsync_dir(path: Path) -> None:
+    """Fsync the parent directory so the rename is power-loss durable."""
+    dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> Path:
+    """Write JSON with: temp → fsync file → atomic replace → fsync directory.
+
+    If the post-replace directory sync fails, the final path is removed so
+    callers (``has_set_price_outcome``) never treat a non-durable write as done.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    body = json.dumps(payload, separators=(",", ":"))
+    replaced = False
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        replaced = True
+        _fsync_dir(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            if tmp.is_file():
+                tmp.unlink()
+        if replaced:
+            with contextlib.suppress(OSError):
+                if path.is_file():
+                    path.unlink()
+            with contextlib.suppress(OSError):
+                _fsync_dir(path)
+        raise
+    return path
+
+
+def write_set_price_outcome(outcome: SetPriceOutcome) -> Path:
+    """Persist a final outcome until cloud-sync MQTT delivery is acknowledged.
+
+    One file per correlationId so concurrent / sequential SET_PRICE results
+    never overwrite each other. Power-loss durable before return so the
+    controller may safely clear the pending request afterward. A failed
+    directory sync after replace removes the file so it is not treated as
+    durable on the next tick.
+    """
+    return _atomic_write_json(_outcome_file_path(outcome.correlation_id), outcome.to_dict())
+
+
+def ack_hold_dir() -> Path:
+    return request_dir() / DEFAULT_ACK_HOLD_DIR_NAME
+
+
+def _ack_hold_file_path(correlation_id: str) -> Path:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "-_" else "_"
+        for ch in (correlation_id or "").strip()
+    )
+    if not safe:
+        raise ValueError("correlation_id required for ACK-hold file")
+    return ack_hold_dir() / f"{safe}.json"
+
+
+def write_ack_hold(correlation_id: str, *, reason: str) -> Path:
+    """Durable marker: cloud-sync must not ACK-delete this correlation's outcome."""
+    return _atomic_write_json(
+        _ack_hold_file_path(correlation_id),
+        {
+            "correlationId": correlation_id,
+            "reason": reason,
+            "updatedAt": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def clear_ack_hold(correlation_id: str) -> None:
+    """Best-effort remove of an ACK-hold after durable request unlink succeeds."""
+    try:
+        path = _ack_hold_file_path(correlation_id)
+    except ValueError:
+        return
+    if not path.is_file():
+        return
+    with contextlib.suppress(OSError):
+        path.unlink()
+    with contextlib.suppress(OSError):
+        _fsync_dir(path)
+
+
+def has_ack_hold(correlation_id: str) -> bool:
+    try:
+        return _ack_hold_file_path(correlation_id).is_file()
+    except ValueError:
+        return False
+
+
+def pending_request_blocks_outcome_ack(correlation_id: str) -> bool:
+    """True when cloud-sync must not ACK-delete this outcome yet.
+
+    Blocks while the matching request is still present, or while a durable
+    ACK-hold marker remains (request restore after unlink sync could not be
+    made durable).
+    """
+    if has_ack_hold(correlation_id):
+        return True
+    pending = read_set_price_request()
+    if pending is None:
+        return False
+    return pending.correlation_id.strip() == (correlation_id or "").strip()
+
+
+def has_set_price_outcome(correlation_id: str) -> bool:
+    """True when a durable outcome file already exists for this correlation."""
+    _migrate_legacy_outcome_file()
+    try:
+        return _outcome_file_path(correlation_id).is_file()
+    except ValueError:
+        return False
+
+
+def list_set_price_outcomes() -> list[SetPriceOutcome]:
+    """Read pending outcomes without removing them (ordered by filename)."""
+    _migrate_legacy_outcome_file()
+    directory = outcomes_dir()
+    if not directory.is_dir():
+        return []
+    out: list[SetPriceOutcome] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        parsed = _parse_outcome_dict(raw)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
+def ack_set_price_outcome(correlation_id: str) -> bool:
+    """Remove a retained outcome after MQTT publish was acknowledged."""
+    path = _outcome_file_path(correlation_id)
+    if not path.is_file():
+        return False
+    with contextlib.suppress(OSError):
+        path.unlink()
+        return not path.is_file()
+    return False
+
+
+def consume_set_price_outcome() -> SetPriceOutcome | None:
+    """Compatibility helper: peek the oldest pending outcome and ACK it.
+
+    Prefer ``list_set_price_outcomes`` + ``ack_set_price_outcome`` when the
+    publisher must retain until MQTT ACK.
+    """
+    pending = list_set_price_outcomes()
+    if not pending:
+        return None
+    first = pending[0]
+    ack_set_price_outcome(first.correlation_id)
+    return first
 

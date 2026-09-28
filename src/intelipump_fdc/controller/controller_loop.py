@@ -179,10 +179,18 @@ class ControllerLoop:
         # correlationId -> dart addresses that already got this cloud CD5
         self._cloud_set_price_applied: dict[str, set[int]] = {}
         self._cloud_set_price_gave_up: dict[str, set[int]] = {}
+        # LINK_ACK only — await a fresh DC3 unit_price match after that CD5.
+        self._cloud_set_price_awaiting_dc3: dict[str, set[int]] = {}
+        # corr:addr -> unit_price_obs_gen at LINK_ACK (confirm only when gen increases)
+        self._cloud_set_price_dc3_baseline: dict[str, int] = {}
+        # corr:addr -> monotonic deadline to stop awaiting DC3
+        self._cloud_set_price_dc3_deadline: dict[str, float] = {}
         self._cloud_set_price_fail_count: dict[str, int] = {}
         self._cloud_set_price_next_try: dict[str, float] = {}
         self._set_price_defer_log_at: dict[str, float] = {}
         self._cloud_set_price_retry_log_at: float = 0.0
+        # Bound wait for fresh DC3 after LINK_ACK before safe CD5 retry/backoff.
+        self._cloud_set_price_dc3_timeout_s: float = 30.0
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
         self.runtime.liveness.notify_socket_present = (
@@ -1547,7 +1555,13 @@ class ControllerLoop:
         )
 
     def _set_price_defer_reason(self, addr: int, session: PumpSession) -> str | None:
-        """Why this dart address must wait before CD5 (None = eligible now)."""
+        """Why this dart address must wait before CD5 (None = eligible now).
+
+        FILLING_COMPLETED / display-hold with nozzle still OUT must wait for
+        hang-up. Once the nozzle is IN, the address is eligible: the apply
+        path clears the retained face with RESET then runs CD5 so the price
+        cannot remain deferred forever until a Pi restart.
+        """
         status = session.state.observed_status
         if status in {
             ObservedStatus.AUTHORIZED,
@@ -1555,17 +1569,16 @@ class ControllerLoop:
             ObservedStatus.SUSPENDED,
         }:
             return "busy"
-        # Keep last sale on the pump LCD; apply after next lift's pre-auth RESET
-        # (or post-hold RESET while hung). Sibling addresses must not block.
-        if (
+        needs_clear = (
             status
             in {
                 ObservedStatus.FILLING_COMPLETED,
                 ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
             }
             or addr in self._sale_display_held
-        ):
-            return "display_hold"
+        )
+        if needs_clear and session.state.nozzle_position is not NozzlePosition.IN:
+            return "await_hangup"
         return None
 
     def _log_set_price_deferred(
@@ -1593,31 +1606,195 @@ class ControllerLoop:
             saleDisplayHeld=address in self._sale_display_held,
         )
 
+    def _clear_cloud_set_price_tracking(self, corr: str) -> None:
+        self._cloud_set_price_applied.pop(corr, None)
+        self._cloud_set_price_gave_up.pop(corr, None)
+        self._cloud_set_price_awaiting_dc3.pop(corr, None)
+        for key in list(self._cloud_set_price_fail_count):
+            if key.startswith(f"{corr}:"):
+                self._cloud_set_price_fail_count.pop(key, None)
+                self._cloud_set_price_next_try.pop(key, None)
+        for key in list(self._cloud_set_price_dc3_baseline):
+            if key.startswith(f"{corr}:"):
+                self._cloud_set_price_dc3_baseline.pop(key, None)
+                self._cloud_set_price_dc3_deadline.pop(key, None)
+
+    def _set_price_dc3_miss(
+        self,
+        *,
+        corr: str,
+        addr: int,
+        awaiting_dc3: set[int],
+        gave_up: set[int],
+        now: float,
+        reason: str,
+        observed: int | None,
+        unit_price_raw: int,
+    ) -> None:
+        """Exit LINK_ACK wait on timeout / nonmatching DC3; reuse CD5 fail backoff."""
+        awaiting_dc3.discard(addr)
+        retry_key = f"{corr}:{addr}"
+        self._cloud_set_price_dc3_baseline.pop(retry_key, None)
+        self._cloud_set_price_dc3_deadline.pop(retry_key, None)
+        fails = self._cloud_set_price_fail_count.get(retry_key, 0) + 1
+        self._cloud_set_price_fail_count[retry_key] = fails
+        delay = min(120.0, 15.0 * (2 ** min(fails - 1, 3)))
+        self._cloud_set_price_next_try[retry_key] = now + delay
+        logger.warning(
+            "cloud_set_price_dc3_confirm_missed",
+            correlationId=corr,
+            address=addr,
+            unitPriceRaw=unit_price_raw,
+            observedUnitPriceRaw=observed,
+            reason=reason,
+            failures=fails,
+            retryInSeconds=delay,
+        )
+        if fails >= 5:
+            gave_up.add(addr)
+            logger.warning(
+                "set_price_gave_up_address",
+                correlationId=corr,
+                address=addr,
+                unitPriceRaw=unit_price_raw,
+                failures=fails,
+                lastResult=reason,
+            )
+            print(
+                f"[CLOUD-PRICE addr={addr}] giving up after {fails} "
+                f"failed CD5/DC3 confirms ({reason}); "
+                "other nozzles / next lift can still apply"
+            )
+
+    def _finalize_cloud_set_price_outcome(
+        self,
+        *,
+        pending: object,
+        applied_final: set[int],
+        gave_up_final: set[int],
+        exec_status: str,
+        accepted: bool,
+        detail: str,
+    ) -> bool:
+        """Write durable outcome first; only then durably remove the request.
+
+        Returns False when the outcome could not be persisted or the request
+        unlink/dir-sync failed — request is kept (or restored) and the outcome
+        is retained so the next tick can finalize again. Cloud-sync must not
+        ACK-delete the outcome until request removal is durable.
+        """
+        from intelipump_fdc.cloud.set_price_request import (
+            SetPriceOutcome,
+            consume_set_price_request_durable,
+            has_set_price_outcome,
+            write_set_price_outcome,
+        )
+
+        corr = pending.correlation_id
+        outcome = SetPriceOutcome(
+            correlation_id=corr,
+            command_id=pending.command_id,
+            station_id=None,
+            pump_id=pending.pump_id,
+            unit_price_raw=pending.unit_price_raw,
+            execution_status=exec_status,
+            accepted=accepted,
+            applied_addresses=tuple(sorted(applied_final)),
+            gave_up_addresses=tuple(sorted(gave_up_final)),
+            deferred_addresses=(),
+            detail=detail,
+        )
+        if not has_set_price_outcome(corr):
+            try:
+                write_set_price_outcome(outcome)
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "cloud_set_price_outcome_write_failed_request_retained",
+                    correlationId=corr,
+                    unitPriceRaw=pending.unit_price_raw,
+                    executionStatus=exec_status,
+                    error=str(exc),
+                )
+                return False
+        try:
+            consumed = consume_set_price_request_durable()
+        except OSError as exc:
+            logger.warning(
+                "cloud_set_price_request_unlink_sync_failed_outcome_retained",
+                correlationId=corr,
+                unitPriceRaw=pending.unit_price_raw,
+                error=str(exc),
+            )
+            return False
+        if consumed is None:
+            logger.warning(
+                "set_price_consume_missing_after_outcome",
+                correlationId=corr,
+                unitPriceRaw=pending.unit_price_raw,
+            )
+        self._clear_cloud_set_price_tracking(corr)
+        logger.info(
+            "cloud_set_price_complete",
+            correlationId=corr,
+            unitPriceRaw=pending.unit_price_raw,
+            applied=sorted(applied_final),
+            gaveUp=sorted(gave_up_final),
+            executionStatus=exec_status,
+        )
+        if not applied_final:
+            print(
+                f"[CLOUD-PRICE] cleared pending {pending.unit_price_raw} "
+                f"corr={corr} with no confirmed price (gave up on "
+                f"{sorted(gave_up_final)}); re-send from admin if needed"
+            )
+        return True
+
     async def _apply_pending_cloud_set_price(self) -> None:
         """Apply a cloud-queued SET_PRICE (CD5) written by intelipump-cloud-sync.
 
-        Never RESET a retained last-sale face just to program price — SAO holds
-        totals until the next lift (``--hold-display-until-lift``). While *that*
-        address is held, leave it pending; CD5 runs on the next idle tick or
-        immediately after that address's pre-auth RESET on lift.
+        Safety gates: owned-lab session required; never CD5 while AUTHORIZED /
+        FILLING / SUSPENDED; never RESET/CD5 while nozzle is still OUT on a
+        retained sale face (await hang-up). Once hung up (nozzle IN) with a
+        held FILLING_COMPLETED face, RESET clears the face then CD5 runs so
+        the request cannot remain deferred until a service restart.
 
-        Multi-address controllers (e.g. dart 1+2 on one Pi) apply per eligible
-        address. A held sale on addr=1 must not block CD5 on addr=2 after RESET,
-        and must not require a service restart.
+        Multi-address controllers apply per eligible address. A held sale on
+        addr=1 must not block CD5 on addr=2.
 
-        TIMED_OUT / failed CD5 uses backoff so a silent dart address cannot
-        hammer the bus every poll tick (and must not re-open startup CD5).
+        LINK_ACK alone and TIMED_OUT never count as an applied price — only
+        APPLICATION_CONFIRMED or a matching DC3 unit_price_raw does.
         """
         if not self.runtime.safety.owned_lab_active_session:
             return
         from intelipump_fdc.cloud.set_price_request import (
-            consume_set_price_request,
+            consume_set_price_request_durable,
+            has_set_price_outcome,
             read_set_price_request,
             write_persisted_unit_price,
         )
 
         pending = read_set_price_request()
         if pending is None:
+            return
+
+        # Crash recovery: outcome already durable → durably clear leftover request.
+        if has_set_price_outcome(pending.correlation_id):
+            try:
+                consume_set_price_request_durable()
+            except OSError as exc:
+                logger.warning(
+                    "set_price_request_clear_sync_failed_outcome_retained",
+                    correlationId=pending.correlation_id,
+                    unitPriceRaw=pending.unit_price_raw,
+                    error=str(exc),
+                )
+                return
+            self._clear_cloud_set_price_tracking(pending.correlation_id)
+            logger.info(
+                "set_price_request_cleared_outcome_already_durable",
+                correlationId=pending.correlation_id,
+                unitPriceRaw=pending.unit_price_raw,
+            )
             return
 
         # Defense in depth: cloned AGO Pi must not apply a PMS pumpId left in
@@ -1648,24 +1825,95 @@ class ControllerLoop:
                     f"(this Pi owns {sorted(owned) if owned else 'unscoped'}); "
                     f"corr={pending.correlation_id}"
                 )
-                consume_set_price_request()
+                if not self._finalize_cloud_set_price_outcome(
+                    pending=pending,
+                    applied_final=set(),
+                    gave_up_final=set(),
+                    exec_status="REJECTED",
+                    accepted=False,
+                    detail="set_price_not_for_this_device",
+                ):
+                    return
                 return
 
         corr = pending.correlation_id
         now = time.monotonic()
         for old in list(self._cloud_set_price_applied):
             if old != corr:
-                self._cloud_set_price_applied.pop(old, None)
-                self._cloud_set_price_gave_up.pop(old, None)
+                self._clear_cloud_set_price_tracking(old)
         applied = self._cloud_set_price_applied.setdefault(corr, set())
         gave_up = self._cloud_set_price_gave_up.setdefault(corr, set())
+        awaiting_dc3 = self._cloud_set_price_awaiting_dc3.setdefault(corr, set())
+
+        # Promote LINK_ACK → applied only on a *fresh* DC3 after that CD5.
+        # Missing / nonmatching DC3 after the bound → safe retry/backoff.
+        for addr in list(awaiting_dc3):
+            session = self.sessions.get(addr)
+            if session is None:
+                awaiting_dc3.discard(addr)
+                self._cloud_set_price_dc3_baseline.pop(f"{corr}:{addr}", None)
+                self._cloud_set_price_dc3_deadline.pop(f"{corr}:{addr}", None)
+                continue
+            baseline = self._cloud_set_price_dc3_baseline.get(f"{corr}:{addr}", 0)
+            deadline = self._cloud_set_price_dc3_deadline.get(f"{corr}:{addr}")
+            obs_gen = int(session.state.unit_price_obs_gen or 0)
+            observed = session.state.unit_price_raw
+            if obs_gen > baseline:
+                if (
+                    isinstance(observed, int)
+                    and not isinstance(observed, bool)
+                    and observed == pending.unit_price_raw
+                ):
+                    self._price_programmed.add(addr)
+                    applied.add(addr)
+                    awaiting_dc3.discard(addr)
+                    self._cloud_set_price_dc3_baseline.pop(f"{corr}:{addr}", None)
+                    self._cloud_set_price_dc3_deadline.pop(f"{corr}:{addr}", None)
+                    retry_key = f"{corr}:{addr}"
+                    self._cloud_set_price_fail_count.pop(retry_key, None)
+                    self._cloud_set_price_next_try.pop(retry_key, None)
+                    logger.info(
+                        "cloud_set_price_confirmed_via_dc3",
+                        address=addr,
+                        unitPriceRaw=pending.unit_price_raw,
+                        correlationId=corr,
+                        unitPriceObsGen=obs_gen,
+                        baselineGen=baseline,
+                    )
+                else:
+                    self._set_price_dc3_miss(
+                        corr=corr,
+                        addr=addr,
+                        awaiting_dc3=awaiting_dc3,
+                        gave_up=gave_up,
+                        now=now,
+                        reason="dc3_price_mismatch",
+                        observed=observed if isinstance(observed, int) else None,
+                        unit_price_raw=pending.unit_price_raw,
+                    )
+            elif deadline is not None and now >= deadline:
+                self._set_price_dc3_miss(
+                    corr=corr,
+                    addr=addr,
+                    awaiting_dc3=awaiting_dc3,
+                    gave_up=gave_up,
+                    now=now,
+                    reason="dc3_confirm_timeout",
+                    observed=observed if isinstance(observed, int) else None,
+                    unit_price_raw=pending.unit_price_raw,
+                )
 
         eligible: list[tuple[int, PumpSession]] = []
+        deferred_addrs: list[int] = []
         for addr, session in self.sessions.items():
             if addr in applied or addr in gave_up:
                 continue
+            if addr in awaiting_dc3:
+                # Waiting for DC3 confirm — do not re-blast CD5 every tick.
+                continue
             reason = self._set_price_defer_reason(addr, session)
             if reason is not None:
+                deferred_addrs.append(addr)
                 self._log_set_price_deferred(
                     reason,
                     correlation_id=corr,
@@ -1680,78 +1928,166 @@ class ControllerLoop:
                 continue
             eligible.append((addr, session))
 
-        if not eligible:
-            return
+        if not eligible and not awaiting_dc3:
+            # May have just confirmed via DC3 with nothing left to send.
+            settled_early = (
+                bool(self.sessions)
+                and all(a in applied or a in gave_up for a in self.sessions)
+                and not awaiting_dc3
+            )
+            if not settled_early:
+                # Still deferred or backing off — keep request for retry when eligible.
+                return
+            prices = list(pending.prices_raw) or [pending.unit_price_raw]
+            nozzle_n = max(1, int(self.runtime.logical_nozzle_count or 1))
+            if len(prices) == 1 and nozzle_n > 1:
+                prices = prices * nozzle_n
+            any_ok = bool(applied)
+            # Jump to persist + settle using existing block below by not returning.
+        else:
+            prices = list(pending.prices_raw) or [pending.unit_price_raw]
+            # Match startup CD5: one price per logical nozzle on each address.
+            nozzle_n = max(1, int(self.runtime.logical_nozzle_count or 1))
+            if len(prices) == 1 and nozzle_n > 1:
+                prices = prices * nozzle_n
+            self.runtime.startup_unit_price = pending.unit_price_raw
 
-        prices = list(pending.prices_raw) or [pending.unit_price_raw]
-        # Match startup CD5: one price per logical nozzle on each address.
-        nozzle_n = max(1, int(self.runtime.logical_nozzle_count or 1))
-        if len(prices) == 1 and nozzle_n > 1:
-            prices = prices * nozzle_n
-        self.runtime.startup_unit_price = pending.unit_price_raw
-
-        any_ok = False
-        for addr, session in eligible:
-            # Suppress parallel startup CD5 while cloud is driving this address.
-            # Do not clear _startup_price_attempted — that re-opens OWNED-LAB CD5
-            # spam on every TIMED_OUT cloud attempt.
-            self._startup_price_attempted.add(addr)
-            payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
-            result = await self._run_owned_command(
-                session,
-                payload,
-                PumpCommand.SET_PRICE,
-                idempotency=IdempotencyClass.NON_IDEMPOTENT,
-                command_label="CD5_SET_PRICE_CLOUD",
-            )
-            print(
-                f"[CLOUD-PRICE addr={addr}] CD5 price {pending.unit_price_raw} "
-                f"result={result.status.value} corr={corr}"
-            )
-            logger.info(
-                "cloud_set_price_applied",
-                address=addr,
-                unitPriceRaw=pending.unit_price_raw,
-                correlationId=corr,
-                result=result.status.value,
-                requestedBy=pending.requested_by,
-            )
-            retry_key = f"{corr}:{addr}"
-            if result.status in {
-                ExchangeResultStatus.LINK_ACKNOWLEDGED,
-                ExchangeResultStatus.APPLICATION_CONFIRMED,
-            }:
-                self._price_programmed.add(addr)
-                applied.add(addr)
-                self._cloud_set_price_fail_count.pop(retry_key, None)
-                self._cloud_set_price_next_try.pop(retry_key, None)
-                any_ok = True
-            else:
-                fails = self._cloud_set_price_fail_count.get(retry_key, 0) + 1
-                self._cloud_set_price_fail_count[retry_key] = fails
-                # Back off: 15s, 30s, 60s… so a silent dart cannot own the bus.
-                delay = min(120.0, 15.0 * (2 ** min(fails - 1, 3)))
-                self._cloud_set_price_next_try[retry_key] = now + delay
-                if fails >= 5:
-                    gave_up.add(addr)
-                    logger.warning(
-                        "set_price_gave_up_address",
-                        correlationId=corr,
-                        address=addr,
-                        unitPriceRaw=pending.unit_price_raw,
-                        failures=fails,
-                        lastResult=result.status.value,
+            any_ok = False
+            for addr, session in eligible:
+                # Suppress parallel startup CD5 while cloud is driving this address.
+                # Do not clear _startup_price_attempted — that re-opens OWNED-LAB CD5
+                # spam on every TIMED_OUT cloud attempt.
+                self._startup_price_attempted.add(addr)
+                status = session.state.observed_status
+                needs_clear = (
+                    status
+                    in {
+                        ObservedStatus.FILLING_COMPLETED,
+                        ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+                    }
+                    or addr in self._sale_display_held
+                )
+                if needs_clear and session.state.nozzle_position is NozzlePosition.IN:
+                    reset = await self._run_owned_command(
+                        session,
+                        encode_cd1_command(PumpControlCommand.RESET),
+                        PumpCommand.RESET,
+                        expect_status=ObservedStatus.RESET,
+                        idempotency=IdempotencyClass.NON_IDEMPOTENT,
+                        command_label="CD1_RESET_BEFORE_CLOUD_PRICE",
                     )
                     print(
-                        f"[CLOUD-PRICE addr={addr}] giving up after {fails} "
-                        f"failed CD5 ({result.status.value}); "
-                        "other nozzles / next lift can still apply"
+                        f"[CLOUD-PRICE addr={addr}] clear retained face before CD5 "
+                        f"result={reset.status.value}"
                     )
+                    if reset.status not in {
+                        ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                        ExchangeResultStatus.APPLICATION_CONFIRMED,
+                    }:
+                        logger.warning(
+                            "set_price_reset_before_cd5_failed",
+                            address=addr,
+                            correlationId=corr,
+                            result=reset.status.value,
+                        )
+                        retry_key = f"{corr}:{addr}"
+                        fails = self._cloud_set_price_fail_count.get(retry_key, 0) + 1
+                        self._cloud_set_price_fail_count[retry_key] = fails
+                        delay = min(120.0, 15.0 * (2 ** min(fails - 1, 3)))
+                        self._cloud_set_price_next_try[retry_key] = now + delay
+                        continue
+                    # Retained-sale bookkeeping only after RESET is confirmed.
+                    self._sale_display_held.discard(addr)
+                    self._sale_display_hold_since.pop(addr, None)
+                    self._last_dc2.pop(addr, None)
+                    session.state.filled_volume_raw = 0
+                    session.state.filled_amount_raw = 0
+                payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
+                result = await self._run_owned_command(
+                    session,
+                    payload,
+                    PumpCommand.SET_PRICE,
+                    idempotency=IdempotencyClass.NON_IDEMPOTENT,
+                    command_label="CD5_SET_PRICE_CLOUD",
+                )
+                print(
+                    f"[CLOUD-PRICE addr={addr}] CD5 price {pending.unit_price_raw} "
+                    f"result={result.status.value} corr={corr}"
+                )
+                logger.info(
+                    "cloud_set_price_cd5_result",
+                    address=addr,
+                    unitPriceRaw=pending.unit_price_raw,
+                    correlationId=corr,
+                    result=result.status.value,
+                    requestedBy=pending.requested_by,
+                )
+                retry_key = f"{corr}:{addr}"
+                if result.status is ExchangeResultStatus.APPLICATION_CONFIRMED:
+                    # Only application-confirmed (or fresh DC3 match) counts as applied.
+                    self._price_programmed.add(addr)
+                    applied.add(addr)
+                    awaiting_dc3.discard(addr)
+                    self._cloud_set_price_dc3_baseline.pop(f"{corr}:{addr}", None)
+                    self._cloud_set_price_dc3_deadline.pop(f"{corr}:{addr}", None)
+                    self._cloud_set_price_fail_count.pop(retry_key, None)
+                    self._cloud_set_price_next_try.pop(retry_key, None)
+                    any_ok = True
+                elif result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED:
+                    # Link ACK alone is NOT an applied price — require a fresh
+                    # DC3 observation after this CD5 (stale face price must not
+                    # confirm).
+                    awaiting_dc3.add(addr)
+                    self._cloud_set_price_dc3_baseline[f"{corr}:{addr}"] = int(
+                        session.state.unit_price_obs_gen or 0
+                    )
+                    self._cloud_set_price_dc3_deadline[f"{corr}:{addr}"] = (
+                        now + float(self._cloud_set_price_dc3_timeout_s)
+                    )
+                    logger.info(
+                        "cloud_set_price_link_ack_awaiting_dc3",
+                        address=addr,
+                        unitPriceRaw=pending.unit_price_raw,
+                        observedUnitPriceRaw=session.state.unit_price_raw,
+                        baselineGen=self._cloud_set_price_dc3_baseline[
+                            f"{corr}:{addr}"
+                        ],
+                        dc3DeadlineInSeconds=self._cloud_set_price_dc3_timeout_s,
+                        correlationId=corr,
+                    )
+                    # Soft backoff so we re-check DC3 without re-sending CD5.
+                    self._cloud_set_price_next_try[retry_key] = now + 2.0
+                else:
+                    # TIMED_OUT / REJECTED — never report as applied.
+                    fails = self._cloud_set_price_fail_count.get(retry_key, 0) + 1
+                    self._cloud_set_price_fail_count[retry_key] = fails
+                    delay = min(120.0, 15.0 * (2 ** min(fails - 1, 3)))
+                    self._cloud_set_price_next_try[retry_key] = now + delay
+                    if fails >= 5:
+                        gave_up.add(addr)
+                        awaiting_dc3.discard(addr)
+                        self._cloud_set_price_dc3_baseline.pop(f"{corr}:{addr}", None)
+                        self._cloud_set_price_dc3_deadline.pop(f"{corr}:{addr}", None)
+                        logger.warning(
+                            "set_price_gave_up_address",
+                            correlationId=corr,
+                            address=addr,
+                            unitPriceRaw=pending.unit_price_raw,
+                            failures=fails,
+                            lastResult=result.status.value,
+                        )
+                        print(
+                            f"[CLOUD-PRICE addr={addr}] giving up after {fails} "
+                            f"failed CD5 ({result.status.value}); "
+                            "other nozzles / next lift can still apply"
+                        )
 
-        settled = bool(self.sessions) and all(
-            a in applied or a in gave_up for a in self.sessions
+        settled = (
+            bool(self.sessions)
+            and all(a in applied or a in gave_up for a in self.sessions)
+            and not awaiting_dc3
         )
-        if any_ok:
+        if any_ok or applied:
             try:
                 path = write_persisted_unit_price(
                     pending.unit_price_raw,
@@ -1771,36 +2107,30 @@ class ControllerLoop:
 
         if settled:
             # Finish when every address succeeded or gave up — stops retry storm.
-            # If nothing succeeded, still consume so the bus recovers; operator
-            # can re-send SET_PRICE.
-            consumed = consume_set_price_request()
-            self._cloud_set_price_applied.pop(corr, None)
-            self._cloud_set_price_gave_up.pop(corr, None)
-            for key in list(self._cloud_set_price_fail_count):
-                if key.startswith(f"{corr}:"):
-                    self._cloud_set_price_fail_count.pop(key, None)
-                    self._cloud_set_price_next_try.pop(key, None)
-            if consumed is None:
-                logger.warning(
-                    "set_price_consume_missing_after_apply",
-                    correlationId=corr,
-                    unitPriceRaw=pending.unit_price_raw,
-                )
+            # Outcome must be durable before the request file is removed.
+            applied_final = set(applied)
+            gave_up_final = set(gave_up)
+            if applied_final and not gave_up_final:
+                exec_status = "PRICE_CONFIRMED"
+                accepted = True
+                detail = "cd5_application_or_dc3_confirmed"
+            elif applied_final and gave_up_final:
+                exec_status = "PRICE_PARTIAL"
+                accepted = True
+                detail = "some_addresses_confirmed_some_gave_up"
             else:
-                logger.info(
-                    "cloud_set_price_complete",
-                    correlationId=corr,
-                    unitPriceRaw=pending.unit_price_raw,
-                    applied=sorted(applied),
-                    gaveUp=sorted(gave_up),
-                )
-                if not applied:
-                    print(
-                        f"[CLOUD-PRICE] cleared pending {pending.unit_price_raw} "
-                        f"corr={corr} with no ACK (gave up on "
-                        f"{sorted(gave_up)}); re-send from admin if needed"
-                    )
-        elif not any_ok and eligible:
+                exec_status = "PRICE_FAILED"
+                accepted = False
+                detail = "cd5_timeout_or_reject_no_confirmed_price"
+            self._finalize_cloud_set_price_outcome(
+                pending=pending,
+                applied_final=applied_final,
+                gave_up_final=gave_up_final,
+                exec_status=exec_status,
+                accepted=accepted,
+                detail=detail,
+            )
+        elif not any_ok and eligible and not awaiting_dc3:
             if (now - self._cloud_set_price_retry_log_at) >= 5.0:
                 self._cloud_set_price_retry_log_at = now
                 logger.warning(
@@ -1811,7 +2141,7 @@ class ControllerLoop:
                 )
                 print(
                     f"[CLOUD-PRICE] retry pending {pending.unit_price_raw} "
-                    f"corr={corr} (CD5 not acknowledged; backing off)"
+                    f"corr={corr} (CD5 not application-confirmed; backing off)"
                 )
 
     def _refresh_arm_requests(self) -> None:
