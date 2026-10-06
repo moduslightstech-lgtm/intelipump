@@ -131,9 +131,11 @@ def test_set_price_defer_reason_busy_and_hangup() -> None:
 
     s1.state.nozzle_position = NozzlePosition.IN
     s1.state.last_nozio_time = time.monotonic() - 60.0
+    s1.state.last_status_time = time.monotonic() - 60.0
     assert loop._set_price_defer_reason(1, s1) == "nozzle_stale"
 
     s1.state.last_nozio_time = time.monotonic()
+    s1.state.last_status_time = time.monotonic()
     assert loop._set_price_defer_reason(1, s1) is None
 
     s2 = loop.sessions[2]
@@ -806,6 +808,212 @@ async def test_expired_request_does_not_apply_after_later_hangup(
     leftover = list_set_price_outcomes()
     assert len(leftover) == 1
     assert leftover[0].detail == "set_price_deferred_timeout"
+
+
+def test_unchanged_reset_in_payload_refreshes_observation_age() -> None:
+    """Repeated RESET+IN DATA must advance timestamps without a state change."""
+    from intelipump_fdc.controller.pump_session import PumpSession
+    from intelipump_fdc.controller.session_events import EventBus
+    from intelipump_fdc.domain.pump_event import PumpEvent
+    from intelipump_fdc.protocol.dart.application.status import WaynePumpStatus
+    from intelipump_fdc.state_machine.models import ObservationRef
+    from intelipump_fdc.state_machine.wayne_mapper import MappedWayneObservation
+
+    session = PumpSession(address=1, pump_id="pump-1", events=EventBus())
+    session.state.observed_status = ObservedStatus.RESET
+    session.state.nozzle_position = NozzlePosition.IN
+    session.state.last_status_time = 100.0
+    session.state.last_nozio_time = 100.0
+
+    mapped = MappedWayneObservation(
+        event=PumpEvent.RESET_OBSERVED,
+        observation=ObservationRef(raw_wayne_status=int(WaynePumpStatus.RESET)),
+        raw_wayne_status=int(WaynePumpStatus.RESET),
+        nozzle_out=False,
+    )
+    session._update_observed_from_mapped(mapped, capture_mono=150.0)
+    assert session.state.observed_status is ObservedStatus.RESET
+    assert session.state.nozzle_position is NozzlePosition.IN
+    assert session.state.last_status_time == 150.0
+    assert session.state.last_nozio_time == 150.0
+
+    session._update_observed_from_mapped(mapped, capture_mono=175.0)
+    assert session.state.last_status_time == 175.0
+    assert session.state.last_nozio_time == 175.0
+
+
+@pytest.mark.asyncio
+async def test_idle_stale_reset_in_refreshes_then_applies_cd5_without_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dashboard price on idle RESET+IN must refresh evidence then CD5 (no RESET)."""
+    _write_price(
+        tmp_path, monkeypatch, "564f784f-7389-468b-affe-b67eb9b1525d", 1365
+    )
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.last_nozio_time = time.monotonic() - 50.0
+        loop.sessions[addr].state.last_status_time = time.monotonic() - 50.0
+    assert loop._set_price_defer_reason(1, loop.sessions[1]) == "nozzle_stale"
+
+    async def _run(session, *args, **kwargs):
+        label = kwargs.get("command_label") or ""
+        if "RETURN_STATUS" in label:
+            now = time.monotonic()
+            session.state.last_status_time = now
+            session.state.last_nozio_time = now
+            session.state.observed_status = ObservedStatus.RESET
+            session.state.nozzle_position = NozzlePosition.IN
+            return type(
+                "R", (), {"status": ExchangeResultStatus.APPLICATION_CONFIRMED}
+            )()
+        assert "RESET" not in label
+        return type(
+            "R", (), {"status": ExchangeResultStatus.APPLICATION_CONFIRMED}
+        )()
+
+    loop._run_owned_command = AsyncMock(side_effect=_run)  # type: ignore[method-assign]
+    loop._write_frame = AsyncMock(return_value=(time.monotonic(), time.monotonic()))  # type: ignore[method-assign]
+    loop._read_poll_session = AsyncMock()  # type: ignore[method-assign]
+    loop._drain_pending_data = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    await loop._apply_pending_cloud_set_price()
+
+    labels = [
+        (c.args[0].address, c.kwargs.get("command_label"))
+        for c in loop._run_owned_command.await_args_list
+    ]
+    assert any("RETURN_STATUS" in (lab or "") for _, lab in labels)
+    assert (1, "CD5_SET_PRICE_CLOUD") in labels
+    assert (2, "CD5_SET_PRICE_CLOUD") in labels
+    assert not any("RESET" in (lab or "") for _, lab in labels)
+    assert read_set_price_request() is None
+    outcome = consume_set_price_outcome()
+    assert outcome is not None
+    assert outcome.execution_status == "PRICE_CONFIRMED"
+    assert outcome.unit_price_raw == 1365
+    assert outcome.correlation_id == "564f784f-7389-468b-affe-b67eb9b1525d"
+
+
+@pytest.mark.asyncio
+async def test_link_ack_alone_does_not_refresh_stale_nozzle_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_price(tmp_path, monkeypatch, "corr-ack-only", 1365)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.last_nozio_time = time.monotonic() - 50.0
+        loop.sessions[addr].state.last_status_time = time.monotonic() - 50.0
+
+    async def _run(session, *args, **kwargs):
+        # ACK only — no DATA timestamp advancement.
+        return type("R", (), {"status": ExchangeResultStatus.LINK_ACKNOWLEDGED})()
+
+    loop._run_owned_command = AsyncMock(side_effect=_run)  # type: ignore[method-assign]
+    loop._write_frame = AsyncMock(return_value=(time.monotonic(), time.monotonic()))  # type: ignore[method-assign]
+    loop._read_poll_session = AsyncMock()  # type: ignore[method-assign]
+    loop._drain_pending_data = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop._set_price_refresh_min_interval_s = 0.0
+
+    await loop._apply_pending_cloud_set_price()
+
+    assert not any(
+        "CD5" in (c.kwargs.get("command_label") or "")
+        for c in loop._run_owned_command.await_args_list
+    )
+    assert loop._set_price_defer_reason(1, loop.sessions[1]) == "nozzle_stale"
+    assert read_set_price_request() is not None
+    assert list_set_price_outcomes() == []
+
+
+@pytest.mark.asyncio
+async def test_stale_idle_refresh_is_triggered_for_reset_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: RESET+IN stale must call refresh (previously skipped)."""
+    _write_price(tmp_path, monkeypatch, "corr-refresh-trigger", 1365)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.last_nozio_time = time.monotonic() - 44.0
+        loop.sessions[addr].state.last_status_time = time.monotonic() - 44.0
+
+    refreshed: list[int] = []
+
+    async def _refresh(session):
+        refreshed.append(session.address)
+        now = time.monotonic()
+        session.state.last_status_time = now
+        session.state.last_nozio_time = now
+        return True
+
+    loop._refresh_set_price_target_evidence = _refresh  # type: ignore[method-assign]
+    loop._run_owned_command = _confirmed()  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+    assert set(refreshed) == {1, 2}
+    assert read_set_price_request() is None
+
+
+@pytest.mark.asyncio
+async def test_owned_lab_startup_price_does_not_override_persisted_dashboard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import write_persisted_unit_price
+    from intelipump_fdc.controller.feature_flags import WayneFeatureFlags
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_persisted_unit_price(1365, (1365,), source="cloud")
+    loop = _dual_addr_loop()
+    loop.runtime.feature_flags = WayneFeatureFlags(
+        poll_and_observe=False,
+        automatic_startup_price_programming=True,
+        automatic_reset=False,
+        automatic_authorization=False,
+    )
+    loop.runtime.startup_unit_price = 1300  # stale CLI default
+    _fresh_in(loop.sessions[1], status=ObservedStatus.RESET)
+    loop.sessions[1].state.unit_price_raw = 1365  # face already matches dashboard
+
+    ok = _confirmed()
+    loop._run_owned_command = ok  # type: ignore[method-assign]
+    await loop._owned_lab_tick(loop.sessions[1])
+
+    assert loop.runtime.startup_unit_price == 1365
+    assert 1 in loop._price_programmed
+    assert ok.await_count == 0  # no CD5 overwrite
+
+
+@pytest.mark.asyncio
+async def test_owned_lab_startup_uses_persisted_when_face_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import write_persisted_unit_price
+    from intelipump_fdc.controller.feature_flags import WayneFeatureFlags
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_persisted_unit_price(1365, (1365,), source="cloud")
+    loop = _dual_addr_loop()
+    loop.runtime.feature_flags = WayneFeatureFlags(
+        poll_and_observe=False,
+        automatic_startup_price_programming=True,
+        automatic_reset=False,
+        automatic_authorization=False,
+    )
+    loop.runtime.startup_unit_price = 1300
+    _fresh_in(loop.sessions[1], status=ObservedStatus.RESET)
+    loop.sessions[1].state.unit_price_raw = 1300
+
+    ok = _confirmed()
+    loop._run_owned_command = ok  # type: ignore[method-assign]
+    await loop._owned_lab_tick(loop.sessions[1])
+
+    assert loop.runtime.startup_unit_price == 1365
+    assert ok.await_count == 1
+    # CD5 programmed the persisted dashboard price, not CLI 1300.
+    assert 1 in loop._price_programmed
+
 
 
 @pytest.mark.asyncio

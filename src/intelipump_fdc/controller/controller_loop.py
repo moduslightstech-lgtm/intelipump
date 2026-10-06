@@ -197,8 +197,9 @@ class ControllerLoop:
         # Rate-limit RETURN_STATUS refresh per dart address.
         self._set_price_refresh_at: dict[int, float] = {}
         self._set_price_refresh_min_interval_s: float = 2.0
-        # NOZIO observation older than this is stale safety evidence.
+        # NOZIO/status observation older than this is stale safety evidence.
         self._set_price_nozio_fresh_s: float = 15.0
+        self._set_price_status_fresh_s: float = 15.0
         # Matches DigitalTwin MQTT_COMMAND_TTL_SECONDS default.
         self._set_price_defer_timeout_s: float = float(
             os.environ.get("INTELIPUMP_SET_PRICE_DEFER_TIMEOUT_S") or 120.0
@@ -1466,29 +1467,54 @@ class ControllerLoop:
         ):
             # Cloud SET_PRICE owns CD5 while a request file is pending — do not
             # also fire startup CD5 on the same tick (bus contention / timeout spam).
-            from intelipump_fdc.cloud.set_price_request import read_set_price_request
+            from intelipump_fdc.cloud.set_price_request import (
+                read_persisted_unit_price,
+                read_set_price_request,
+            )
 
-            if read_set_price_request() is None:
-                self._startup_price_attempted.add(addr)
-                payload = encode_cd5_price_update(
-                    prices_raw=[self.runtime.startup_unit_price]
-                    * self.runtime.logical_nozzle_count
-                )
-                result = await self._run_owned_command(
-                    session,
-                    payload,
-                    PumpCommand.SET_PRICE,
-                    idempotency=IdempotencyClass.NON_IDEMPOTENT,
-                )
-                print(
-                    f"[OWNED-LAB addr={addr}] CD5 price "
-                    f"{self.runtime.startup_unit_price} result={result.status.value}"
-                )
-                if result.status in {
-                    ExchangeResultStatus.LINK_ACKNOWLEDGED,
-                    ExchangeResultStatus.APPLICATION_CONFIRMED,
-                }:
+            if read_set_price_request() is not None:
+                pass  # cloud request owns the bus
+            else:
+                # Prefer durable dashboard price over a stale CLI --price default.
+                persisted = read_persisted_unit_price()
+                if (
+                    persisted is not None
+                    and persisted.unit_price_raw > 0
+                    and persisted.unit_price_raw != self.runtime.startup_unit_price
+                ):
+                    logger.info(
+                        "owned_lab_startup_price_deferred_to_persisted",
+                        address=addr,
+                        cliStartupPrice=self.runtime.startup_unit_price,
+                        persistedUnitPriceRaw=persisted.unit_price_raw,
+                        persistedSource=persisted.source,
+                    )
+                    self.runtime.startup_unit_price = persisted.unit_price_raw
+                # Face already shows the target price — do not re-blast CD5.
+                if session.state.unit_price_raw == self.runtime.startup_unit_price:
                     self._price_programmed.add(addr)
+                    self._startup_price_attempted.add(addr)
+                else:
+                    self._startup_price_attempted.add(addr)
+                    payload = encode_cd5_price_update(
+                        prices_raw=[self.runtime.startup_unit_price]
+                        * self.runtime.logical_nozzle_count
+                    )
+                    result = await self._run_owned_command(
+                        session,
+                        payload,
+                        PumpCommand.SET_PRICE,
+                        idempotency=IdempotencyClass.NON_IDEMPOTENT,
+                    )
+                    print(
+                        f"[OWNED-LAB addr={addr}] CD5 price "
+                        f"{self.runtime.startup_unit_price} result={result.status.value}"
+                    )
+                    if result.status in {
+                        ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                        ExchangeResultStatus.APPLICATION_CONFIRMED,
+                    }:
+                        self._price_programmed.add(addr)
 
         if flags.automatic_reset and addr not in self._startup_reset_done:
             if session.should_skip_reset():
@@ -1629,14 +1655,25 @@ class ControllerLoop:
             return "positive_unpersisted"
         return "none"
 
+    def _set_price_evidence_stale(self, session: PumpSession) -> bool:
+        """True when status or nozzle observation ages exceed the fresh window."""
+        nozio_age = self._set_price_nozio_age_s(session)
+        status_age = self._set_price_status_age_s(session)
+        if nozio_age is None or status_age is None:
+            return True
+        return (
+            nozio_age > self._set_price_nozio_fresh_s
+            or status_age > self._set_price_status_fresh_s
+        )
+
     def _set_price_defer_reason(self, addr: int, session: PumpSession) -> str | None:
         """Why this dart address must wait before RESET/CD5 (None = eligible).
 
         ``saleDisplayHeld=False`` is not proof the nozzle is IN. Wayne often
         idles in FILLING_COMPLETED after hang-up without starting the LCD hold
-        (hold requires nozzle IN). Deployed ``display_hold`` deferred that
-        idle forever. Progress only with fresh nozzle IN, no active
-        dispensing, and a captured completed sale when totals exist.
+        (hold requires nozzle IN). Idle RESET+IN with only EOT polls also goes
+        stale — observation ages must be refreshed via RETURN_STATUS DATA, not
+        poll ACK alone, before CD5.
         """
         status = session.state.observed_status
         if status in {
@@ -1650,9 +1687,14 @@ class ControllerLoop:
             return "nozzle_out"
         if pos is NozzlePosition.UNKNOWN:
             return "nozzle_unknown"
+        if status is ObservedStatus.UNKNOWN:
+            return "status_unknown"
         nozio_age = self._set_price_nozio_age_s(session)
-        if nozio_age is not None and nozio_age > self._set_price_nozio_fresh_s:
+        status_age = self._set_price_status_age_s(session)
+        if nozio_age is None or nozio_age > self._set_price_nozio_fresh_s:
             return "nozzle_stale"
+        if status_age is None or status_age > self._set_price_status_fresh_s:
+            return "status_stale"
         if self._set_price_needs_completed_clear(addr, session):
             if not self._capture_completed_sale_snapshot(session):
                 return "sale_unpersisted"
@@ -1681,7 +1723,8 @@ class ControllerLoop:
         changed = prev != reason
         self._set_price_defer_last_reason[change_key] = reason
         last = self._set_price_defer_log_at.get(throttle_key)
-        if not changed and last is not None and (now - last) < 5.0:
+        # Unchanged reason: low-rate diagnostic (not every poll / 5s cloud retry).
+        if not changed and last is not None and (now - last) < 30.0:
             return
         self._set_price_defer_log_at[throttle_key] = now
         nozio_age = self._set_price_nozio_age_s(session)
@@ -1725,26 +1768,34 @@ class ControllerLoop:
             self._cloud_set_price_seen_at[corr] = seen
         return now - self._cloud_set_price_seen_at[corr]
 
-    async def _refresh_set_price_target_evidence(self, session: PumpSession) -> None:
-        """Drain pending DATA; RETURN_STATUS when nozzle/status evidence is weak."""
+    async def _refresh_set_price_target_evidence(self, session: PumpSession) -> bool:
+        """Obtain fresh DC1/NOZIO DATA for SET_PRICE; ACK alone is not evidence.
+
+        Idle Wayne is often EOT-only on polls, so observation ages grow while
+        state stays RESET/IN. RETURN_STATUS must elicit a status payload; a
+        repeated RESET/IN DATA frame still advances ``last_status_time`` /
+        ``last_nozio_time``. Returns True when both observations advanced.
+        """
         await self._drain_pending_data(session)
         pos = session.state.nozzle_position
         status = session.state.observed_status
-        nozio_age = self._set_price_nozio_age_s(session)
-        stale = nozio_age is not None and nozio_age > self._set_price_nozio_fresh_s
         needs_probe = (
             pos is NozzlePosition.UNKNOWN
             or status is ObservedStatus.UNKNOWN
-            or stale
+            or self._set_price_evidence_stale(session)
         )
         if not needs_probe:
-            return
+            return True
         addr = session.address
         now = time.monotonic()
         last = self._set_price_refresh_at.get(addr, 0.0)
         if now - last < self._set_price_refresh_min_interval_s:
-            return
+            return not self._set_price_evidence_stale(session)
         self._set_price_refresh_at[addr] = now
+
+        status_before = session.state.last_status_time
+        nozio_before = session.state.last_nozio_time
+        cmd_started = time.monotonic()
         result = await self._run_owned_command(
             session,
             encode_cd1_command(PumpControlCommand.RETURN_STATUS),
@@ -1752,6 +1803,37 @@ class ControllerLoop:
             idempotency=IdempotencyClass.IDEMPOTENT,
             command_label="CD1_RETURN_STATUS_BEFORE_SET_PRICE",
         )
+        # LINK_ACK / pre-existing known state is not fresh evidence — poll for
+        # DATA payloads that advance observation timestamps.
+        refreshed = False
+        for attempt in range(8):
+            await self._drain_pending_data(session)
+            status_t = session.state.last_status_time
+            nozio_t = session.state.last_nozio_time
+            status_fresh = (
+                status_t is not None
+                and status_t > (status_before or 0.0)
+                and status_t >= cmd_started - 0.05
+            )
+            nozio_fresh = (
+                nozio_t is not None
+                and nozio_t > (nozio_before or 0.0)
+                and nozio_t >= cmd_started - 0.05
+            )
+            if status_fresh and nozio_fresh:
+                refreshed = True
+                break
+            if attempt >= 7:
+                break
+            if not self.runtime.transport.is_open:
+                break
+            write_start, _wc = await self._write_frame(
+                session.build_poll(),
+                address=addr,
+                note="POLL_SET_PRICE_REFRESH",
+            )
+            await self._read_poll_session(session, not_before_mono=write_start)
+
         logger.info(
             "set_price_status_refresh",
             address=addr,
@@ -1759,8 +1841,20 @@ class ControllerLoop:
             result=result.status.value,
             observedStatus=session.state.observed_status.value,
             nozzleState=session.state.nozzle_position.value,
+            statusRefreshed=(
+                session.state.last_status_time is not None
+                and session.state.last_status_time > (status_before or 0.0)
+            ),
+            nozzleRefreshed=(
+                session.state.last_nozio_time is not None
+                and session.state.last_nozio_time > (nozio_before or 0.0)
+            ),
+            evidenceRefreshed=refreshed,
+            commandResultOnlyAck=result.status
+            is ExchangeResultStatus.LINK_ACKNOWLEDGED
+            and not refreshed,
         )
-        await self._drain_pending_data(session)
+        return refreshed
 
     def _clear_cloud_set_price_tracking(self, corr: str) -> None:
         self._cloud_set_price_applied.pop(corr, None)
@@ -2146,12 +2240,23 @@ class ControllerLoop:
             if addr in awaiting_dc3:
                 # Waiting for DC3 confirm — do not re-blast CD5 every tick.
                 continue
-            if (
-                self._set_price_needs_completed_clear(addr, session)
-                or session.state.nozzle_position is NozzlePosition.UNKNOWN
-                or session.state.observed_status is ObservedStatus.UNKNOWN
-            ):
-                await self._refresh_set_price_target_evidence(session)
+            # Refresh only when fresh DATA could make this address eligible.
+            # OUT / busy already cannot apply — do not burn RETURN_STATUS/polls.
+            status = session.state.observed_status
+            pos = session.state.nozzle_position
+            busy = status in {
+                ObservedStatus.AUTHORIZED,
+                ObservedStatus.FILLING,
+                ObservedStatus.SUSPENDED,
+            }
+            if not busy and pos is not NozzlePosition.OUT:
+                if (
+                    self._set_price_needs_completed_clear(addr, session)
+                    or pos is NozzlePosition.UNKNOWN
+                    or status is ObservedStatus.UNKNOWN
+                    or self._set_price_evidence_stale(session)
+                ):
+                    await self._refresh_set_price_target_evidence(session)
             reason = self._set_price_defer_reason(addr, session)
             if expired:
                 gave_up.add(addr)
