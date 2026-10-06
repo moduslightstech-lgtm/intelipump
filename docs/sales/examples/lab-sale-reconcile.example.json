@@ -1,0 +1,112 @@
+{
+  "generatedAt": "2026-10-06T17:07:27.238044+00:00",
+  "completenessWarnings": [
+    "Empty outbox does not prove pump capture completeness.",
+    "Matching totals do not prove every individual sale is correct.",
+    "Equal amount/time patterns are suspicious candidates only."
+  ],
+  "counts": {
+    "pi": 2,
+    "cloud": 2,
+    "matchedIdentities": 2,
+    "piOnly": 0,
+    "cloudOnly": 0,
+    "conflicts": 0
+  },
+  "totals": {
+    "piAmount": "2740",
+    "cloudAmount": "2740",
+    "piVolume": "2.000",
+    "cloudVolume": "2.000",
+    "amountDeltaCloudMinusPi": "0"
+  },
+  "matchedIdentities": [
+    "InteliPump-US-Lab|tx-completed:InteliPump-US-Lab:complete:lab-tx-001",
+    "InteliPump-US-Lab|tx-completed:InteliPump-US-Lab:complete:lab-tx-002"
+  ],
+  "piOnlyIdentities": [],
+  "cloudOnlyIdentities": [],
+  "conflicts": [],
+  "suspiciousEqualAmountCandidates": [
+    {
+      "note": "equal_amount_volume_candidates_not_confirmed_duplicates",
+      "pumpId": "pump-1",
+      "amount": "1370",
+      "volume": "1.000",
+      "identities": [
+        "InteliPump-US-Lab|tx-completed:InteliPump-US-Lab:complete:lab-tx-001",
+        "InteliPump-US-Lab|tx-completed:InteliPump-US-Lab:complete:lab-tx-002"
+      ]
+    }
+  ],
+  "perNozzle": [
+    {
+      "pumpId": "pump-1",
+      "nozzleId": "1",
+      "piCount": 2,
+      "cloudCount": 2,
+      "piAmount": "2740",
+      "cloudAmount": "2740",
+      "piVolume": "2.000",
+      "cloudVolume": "2.000",
+      "amountDelta": "0",
+      "volumeDelta": "0.000"
+    }
+  ],
+  "managerReportedAmount": null,
+  "managerVsCloudDelta": null,
+  "rows": {
+    "pi": [
+      {
+        "identity": "InteliPump-US-Lab|tx-completed:InteliPump-US-Lab:complete:lab-tx-001",
+        "transaction_id": "lab-tx-001",
+        "station_id": "InteliPump-US-Lab",
+        "pump_id": "pump-1",
+        "nozzle_id": "1",
+        "amount": "1370",
+        "volume": "1.000",
+        "price": "1370",
+        "completed_at": "2026-10-06T16:20:39+00:00",
+        "source": "pi"
+      },
+      {
+        "identity": "InteliPump-US-Lab|tx-completed:InteliPump-US-Lab:complete:lab-tx-002",
+        "transaction_id": "lab-tx-002",
+        "station_id": "InteliPump-US-Lab",
+        "pump_id": "pump-1",
+        "nozzle_id": "1",
+        "amount": "1370",
+        "volume": "1.000",
+        "price": "1370",
+        "completed_at": "2026-10-06T16:25:47+00:00",
+        "source": "pi"
+      }
+    ],
+    "cloud": [
+      {
+        "identity": "InteliPump-US-Lab|tx-completed:InteliPump-US-Lab:complete:lab-tx-001",
+        "transaction_id": "lab-tx-001",
+        "station_id": "InteliPump-US-Lab",
+        "pump_id": "pump-1",
+        "nozzle_id": "1",
+        "amount": "1370",
+        "volume": "1.000",
+        "price": "1370",
+        "completed_at": "2026-10-06T16:20:39+00:00",
+        "source": "cloud"
+      },
+      {
+        "identity": "InteliPump-US-Lab|tx-completed:InteliPump-US-Lab:complete:lab-tx-002",
+        "transaction_id": "lab-tx-002",
+        "station_id": "InteliPump-US-Lab",
+        "pump_id": "pump-1",
+        "nozzle_id": "1",
+        "amount": "1370",
+        "volume": "1.000",
+        "price": "1370",
+        "completed_at": "2026-10-06T16:25:47+00:00",
+        "source": "cloud"
+      }
+    ]
+  }
+}

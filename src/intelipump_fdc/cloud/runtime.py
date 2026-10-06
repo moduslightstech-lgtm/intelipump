@@ -45,6 +45,7 @@ class CloudRuntime:
     heartbeat: HeartbeatService | None = None
     fill_stream: LiveFillStream | None = None
     command_intake: CloudCommandIntake | None = None
+    sale_ack_intake: Any = None
     started: bool = False
     online_published: bool = False
     payload_provider: Any = None
@@ -192,6 +193,9 @@ class CloudRuntime:
             poll_interval_seconds=self.settings.mqtt.sync_poll_interval_seconds,
             stale_lock_seconds=self.settings.mqtt.sync_stale_lock_seconds,
             max_attempts=self.settings.mqtt.sync_max_attempts,
+            require_application_sale_ack=bool(
+                getattr(self.settings.mqtt, "require_application_sale_ack", False)
+            ),
         )
         self.heartbeat = HeartbeatService(
             mqtt=self.mqtt,
@@ -248,6 +252,20 @@ class CloudRuntime:
             self.fill_stream.start()
         if self.command_intake is not None and self.mqtt.is_connected:
             await self.command_intake.start()
+        if (
+            bool(getattr(self.settings.mqtt, "require_application_sale_ack", False))
+            and self.sync_worker is not None
+            and self.mqtt.is_connected
+        ):
+            from intelipump_fdc.cloud.sale_ack_intake import SaleAckIntake
+
+            self.sale_ack_intake = SaleAckIntake(
+                mqtt=self.mqtt,
+                topics=self.topics,
+                device_id=device_id,
+                sync_worker=self.sync_worker,
+            )
+            await self.sale_ack_intake.start()
         if self.mqtt.is_connected:
             await self._publish_online()
         self.started = True
@@ -268,6 +286,9 @@ class CloudRuntime:
             await self.fill_stream.stop()
         if self.sync_worker is not None:
             await self.sync_worker.stop()
+        if self.sale_ack_intake is not None:
+            await self.sale_ack_intake.stop()
+            self.sale_ack_intake = None
         if self.command_intake is not None:
             await self.command_intake.stop()
         try:

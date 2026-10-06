@@ -124,6 +124,141 @@ class SyncQueueRepository:
         row.updated_at = datetime.now(UTC)
         await self._session.flush()
 
+    async def mark_awaiting_app_ack(self, item_id: str) -> None:
+        """MQTT PUBACK received; waiting for cloud SALE_COMMITTED."""
+        result = await self._session.execute(
+            select(SyncQueueRow).where(SyncQueueRow.id == item_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return
+        row.status = "AWAITING_APP_ACK"
+        row.locked_at = None
+        row.updated_at = datetime.now(UTC)
+        await self._session.flush()
+
+    async def ack_payload_conflicts(
+        self,
+        *,
+        deduplication_key: str | None,
+        entity_id: str | None,
+        amount: Any = None,
+        volume_liters: Any = None,
+    ) -> str | None:
+        """Return conflict detail if ACK money/volume disagrees with outbox payload.
+
+        Missing ACK money fields are treated as compatible (legacy cloud ACKs).
+        """
+        if amount is None and volume_liters is None:
+            return None
+        clauses = []
+        key = (deduplication_key or "").strip()
+        tx = (entity_id or "").strip()
+        if key:
+            clauses.append(SyncQueueRow.deduplication_key == key)
+        if tx:
+            clauses.append(SyncQueueRow.entity_id == tx)
+        if not clauses:
+            return None
+        from sqlalchemy import or_
+
+        result = await self._session.execute(
+            select(SyncQueueRow).where(
+                or_(*clauses),
+                SyncQueueRow.status.in_(("AWAITING_APP_ACK", "CLAIMED", "PENDING")),
+                SyncQueueRow.event_type.in_(
+                    ("TRANSACTION_COMPLETED", "TX_COMPLETED", "SALE_COMPLETED")
+                ),
+            )
+        )
+        rows = list(result.scalars().all())
+        for row in rows:
+            payload = row.payload if isinstance(row.payload, dict) else {}
+            nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+            stored_amount = (
+                payload.get("amount")
+                if payload.get("amount") is not None
+                else nested.get("amount")
+            )
+            stored_volume = (
+                payload.get("volume")
+                if payload.get("volume") is not None
+                else payload.get("volume_liters")
+                if payload.get("volume_liters") is not None
+                else nested.get("volume")
+                if nested.get("volume") is not None
+                else nested.get("volume_liters")
+            )
+            if amount is not None and stored_amount is not None:
+                try:
+                    if abs(float(amount) - float(stored_amount)) > 1e-6:
+                        return (
+                            f"amount_mismatch ack={amount} stored={stored_amount} "
+                            f"entity={row.entity_id}"
+                        )
+                except (TypeError, ValueError):
+                    if str(amount) != str(stored_amount):
+                        return (
+                            f"amount_mismatch ack={amount} stored={stored_amount} "
+                            f"entity={row.entity_id}"
+                        )
+            if volume_liters is not None and stored_volume is not None:
+                try:
+                    if abs(float(volume_liters) - float(stored_volume)) > 1e-6:
+                        return (
+                            f"volume_mismatch ack={volume_liters} stored={stored_volume} "
+                            f"entity={row.entity_id}"
+                        )
+                except (TypeError, ValueError):
+                    if str(volume_liters) != str(stored_volume):
+                        return (
+                            f"volume_mismatch ack={volume_liters} stored={stored_volume} "
+                            f"entity={row.entity_id}"
+                        )
+        return None
+
+    async def mark_delivered_by_dedupe_key(self, deduplication_key: str) -> int:
+        """Application ACK: promote matching awaiting rows to DELIVERED."""
+        key = (deduplication_key or "").strip()
+        if not key:
+            return 0
+        result = await self._session.execute(
+            select(SyncQueueRow).where(
+                SyncQueueRow.deduplication_key == key,
+                SyncQueueRow.status.in_(("AWAITING_APP_ACK", "CLAIMED", "PENDING")),
+            )
+        )
+        rows = list(result.scalars().all())
+        now = datetime.now(UTC)
+        for row in rows:
+            row.status = "DELIVERED"
+            row.locked_at = None
+            row.updated_at = now
+        await self._session.flush()
+        return len(rows)
+
+    async def mark_delivered_by_entity_id(self, entity_id: str) -> int:
+        tx = (entity_id or "").strip()
+        if not tx:
+            return 0
+        result = await self._session.execute(
+            select(SyncQueueRow).where(
+                SyncQueueRow.entity_id == tx,
+                SyncQueueRow.event_type.in_(
+                    ("TRANSACTION_COMPLETED", "TX_COMPLETED", "SALE_COMPLETED")
+                ),
+                SyncQueueRow.status.in_(("AWAITING_APP_ACK", "CLAIMED", "PENDING")),
+            )
+        )
+        rows = list(result.scalars().all())
+        now = datetime.now(UTC)
+        for row in rows:
+            row.status = "DELIVERED"
+            row.locked_at = None
+            row.updated_at = now
+        await self._session.flush()
+        return len(rows)
+
     async def release_stale_locks(self, *, older_than_seconds: int = 60) -> int:
         cutoff = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
         result = await self._session.execute(
@@ -145,7 +280,19 @@ class SyncQueueRepository:
         result = await self._session.execute(
             select(func.count())
             .select_from(SyncQueueRow)
-            .where(SyncQueueRow.status.in_(("PENDING", "CLAIMED")))
+            .where(
+                SyncQueueRow.status.in_(
+                    ("PENDING", "CLAIMED", "AWAITING_APP_ACK")
+                )
+            )
+        )
+        return int(result.scalar_one())
+
+    async def awaiting_app_ack_count(self) -> int:
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(SyncQueueRow)
+            .where(SyncQueueRow.status == "AWAITING_APP_ACK")
         )
         return int(result.scalar_one())
 
@@ -175,7 +322,9 @@ class SyncQueueRepository:
     async def oldest_pending_age_seconds(self) -> float | None:
         result = await self._session.execute(
             select(func.min(SyncQueueRow.created_at)).where(
-                SyncQueueRow.status.in_(("PENDING", "CLAIMED"))
+                SyncQueueRow.status.in_(
+                    ("PENDING", "CLAIMED", "AWAITING_APP_ACK")
+                )
             )
         )
         oldest = result.scalar_one_or_none()

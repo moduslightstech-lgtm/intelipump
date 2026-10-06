@@ -77,6 +77,11 @@ class TopicBuilder:
         c = _validate_id("correlation_id", correlation_id)
         return f"{self._root()}/stations/{s}/commands/{c}/result"
 
+    def sale_acks(self, device_id: str) -> str:
+        """Cloud → device application ACK that a sale was committed in PostgreSQL."""
+        d = _validate_id("device_id", device_id)
+        return f"{self._root()}/devices/{d}/sale-acks"
+
     def lab_wildcard(self) -> str:
         if self._seg != "lab":
             raise TopicError("lab_wildcard only valid for LAB environment")

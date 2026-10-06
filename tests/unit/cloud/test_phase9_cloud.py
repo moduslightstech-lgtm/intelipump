@@ -79,6 +79,10 @@ def test_topic_generation(topics: TopicBuilder) -> None:
     assert topics.command_result("InteliPump-US-Lab", "corr-1").endswith(
         "/commands/corr-1/result"
     )
+    assert (
+        topics.sale_acks("InteliPump-Lab-pi-001")
+        == "intelipump/lab/devices/InteliPump-Lab-pi-001/sale-acks"
+    )
 
 
 @pytest.mark.parametrize(

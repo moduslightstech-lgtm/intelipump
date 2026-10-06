@@ -19,6 +19,7 @@ Environment segment is derived from controller environment (`LAB` → `lab`, `PR
 | Audit | `intelipump/{env}/stations/{stationId}/audit` |
 | Commands (inbound) | `intelipump/{env}/stations/{stationId}/commands` |
 | Command result | `intelipump/{env}/stations/{stationId}/commands/{correlationId}/result` |
+| Sale application ACK | `intelipump/{env}/devices/{deviceId}/sale-acks` |
 
 ## Identifier rules
 

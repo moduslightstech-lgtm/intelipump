@@ -91,6 +91,10 @@ class MqttSettings(BaseModel):
     # local RS-485 controller (production sole-controller stations only).
     allow_production_remote_set_price: bool = False
     topic_environment: str | None = None  # defaults to settings.environment
+    # When true, sync_queue stays AWAITING_APP_ACK until SALE_COMMITTED
+    # from the cloud consumer (PostgreSQL commit). Default false preserves
+    # deployed SAO behaviour (PUBACK = delivered). Enable in LAB first.
+    require_application_sale_ack: bool = False
     # Fill publish throttling
     fill_min_interval_seconds: float = Field(default=2.0, ge=0.0)
     fill_min_volume_delta: int = Field(default=100, ge=0)

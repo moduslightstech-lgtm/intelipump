@@ -378,7 +378,9 @@ def run(argv: list[str] | None = None) -> None:
                 environment=settings.environment,
                 addresses=addresses,
                 events=runtime.events,
-                simulated=True,
+                # Honor API/env simulated flag — never force True in PRODUCTION
+                # or cloud consumers that exclude simulated=true will drop real sales.
+                simulated=bool(settings.api.simulated),
             )
             apply_recovered_contexts(loop_ctrl, persistence.recovery.pump_contexts)
             liveness.database_health = "ok"

@@ -1,0 +1,28 @@
+{
+  "sales": [
+    {
+      "stationId": "InteliPump-US-Lab",
+      "transactionId": "lab-tx-001",
+      "deduplicationKey": "tx-completed:InteliPump-US-Lab:complete:lab-tx-001",
+      "pumpId": "pump-1",
+      "nozzleId": "1",
+      "amount": "1370",
+      "volumeLiters": "1.000",
+      "pricePerLiter": "1370",
+      "transactionCompletedAt": "2026-10-06T16:20:39+00:00",
+      "_label": "TEST-ONLY cloud match for sale A"
+    },
+    {
+      "stationId": "InteliPump-US-Lab",
+      "transactionId": "lab-tx-002",
+      "deduplicationKey": "tx-completed:InteliPump-US-Lab:complete:lab-tx-002",
+      "pumpId": "pump-1",
+      "nozzleId": "1",
+      "amount": "1370",
+      "volumeLiters": "1.000",
+      "pricePerLiter": "1370",
+      "transactionCompletedAt": "2026-10-06T16:25:47+00:00",
+      "_label": "TEST-ONLY cloud match for sale B"
+    }
+  ]
+}

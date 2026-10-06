@@ -6,6 +6,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -37,6 +38,7 @@ class SyncWorker:
     poll_interval_seconds: float = 1.0
     stale_lock_seconds: int = 60
     max_attempts: int = 20
+    require_application_sale_ack: bool = False
     stats: SyncWorkerStats = field(default_factory=SyncWorkerStats)
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
@@ -138,7 +140,24 @@ class SyncWorker:
                     outboxId=record.id,
                 )
                 async with unit_of_work(self.session_factory) as uow:
-                    await uow.sync_queue.mark_delivered(record.id)
+                    if self.require_application_sale_ack and str(
+                        record.event_type or ""
+                    ).upper() in {
+                        "TRANSACTION_COMPLETED",
+                        "TX_COMPLETED",
+                        "SALE_COMPLETED",
+                    }:
+                        await uow.sync_queue.mark_awaiting_app_ack(record.id)
+                        logger.info(
+                            "sale_awaiting_application_ack",
+                            eventId=event_id,
+                            transactionId=env_dict.get("transactionId")
+                            or nested.get("transaction_uuid"),
+                            outboxId=record.id,
+                            deduplicationKey=record.deduplication_key,
+                        )
+                    else:
+                        await uow.sync_queue.mark_delivered(record.id)
                 self.stats.delivered += 1
                 self.stats.last_delivery_at = datetime.now(UTC)
             except (MqttNotConnectedError, MqttError) as exc:
@@ -172,3 +191,64 @@ class SyncWorker:
                     record_id=record.id,
                     error=str(exc),
                 )
+
+    async def handle_sale_ack_payload(self, payload: dict[str, Any]) -> int:
+        """Apply SALE_COMMITTED application ACK to awaiting sync_queue rows.
+
+        Conflicting amount/volume on an otherwise matching identity leaves the
+        row awaiting and returns 0 (visible via unmatched / conflict logs).
+        """
+        event = str(payload.get("eventType") or "").upper()
+        if event and event not in {"SALE_COMMITTED", "SALE_ACK", "TX_COMMITTED"}:
+            nested = payload.get("payload")
+            if isinstance(nested, dict):
+                payload = nested
+                event = str(payload.get("eventType") or "").upper()
+        dedupe = str(
+            payload.get("deduplicationKey")
+            or payload.get("deduplication_key")
+            or ""
+        ).strip()
+        tx_id = str(
+            payload.get("transactionId")
+            or payload.get("transaction_id")
+            or payload.get("transaction_uuid")
+            or ""
+        ).strip()
+        ack_amount = payload.get("amount")
+        ack_volume = payload.get("volumeLiters") or payload.get("volume_liters")
+        matched = 0
+        async with unit_of_work(self.session_factory) as uow:
+            if dedupe or tx_id:
+                conflict = await uow.sync_queue.ack_payload_conflicts(
+                    deduplication_key=dedupe or None,
+                    entity_id=tx_id or None,
+                    amount=ack_amount,
+                    volume_liters=ack_volume,
+                )
+                if conflict:
+                    logger.warning(
+                        "sale_application_ack_conflict",
+                        deduplicationKey=dedupe or None,
+                        transactionId=tx_id or None,
+                        detail=conflict,
+                    )
+                    return 0
+            if dedupe:
+                matched += await uow.sync_queue.mark_delivered_by_dedupe_key(dedupe)
+            if matched == 0 and tx_id:
+                matched += await uow.sync_queue.mark_delivered_by_entity_id(tx_id)
+        if matched:
+            logger.info(
+                "sale_application_ack_applied",
+                deduplicationKey=dedupe or None,
+                transactionId=tx_id or None,
+                matched=matched,
+            )
+        else:
+            logger.warning(
+                "sale_application_ack_unmatched",
+                deduplicationKey=dedupe or None,
+                transactionId=tx_id or None,
+            )
+        return matched
