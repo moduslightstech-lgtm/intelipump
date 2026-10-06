@@ -188,9 +188,21 @@ class ControllerLoop:
         self._cloud_set_price_fail_count: dict[str, int] = {}
         self._cloud_set_price_next_try: dict[str, float] = {}
         self._set_price_defer_log_at: dict[str, float] = {}
+        self._set_price_defer_last_reason: dict[str, str] = {}
         self._cloud_set_price_retry_log_at: float = 0.0
         # Bound wait for fresh DC3 after LINK_ACK before safe CD5 retry/backoff.
         self._cloud_set_price_dc3_timeout_s: float = 30.0
+        # First monotonic sighting of a correlationId (TTL uses requestedAt too).
+        self._cloud_set_price_seen_at: dict[str, float] = {}
+        # Rate-limit RETURN_STATUS refresh per dart address.
+        self._set_price_refresh_at: dict[int, float] = {}
+        self._set_price_refresh_min_interval_s: float = 2.0
+        # NOZIO observation older than this is stale safety evidence.
+        self._set_price_nozio_fresh_s: float = 15.0
+        # Matches DigitalTwin MQTT_COMMAND_TTL_SECONDS default.
+        self._set_price_defer_timeout_s: float = float(
+            os.environ.get("INTELIPUMP_SET_PRICE_DEFER_TIMEOUT_S") or 120.0
+        )
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
         self.runtime.liveness.notify_socket_present = (
@@ -1299,11 +1311,7 @@ class ControllerLoop:
                     f"unit_price_raw={price}"
                 )
                 if life in {SaleLifecycle.FILLING_COMPLETED, SaleLifecycle.CLOSED}:
-                    self._last_completed_sale[addr] = {
-                        "volume_raw": peak_vol,
-                        "amount_raw": peak_amt,
-                        "unit_price_raw": price,
-                    }
+                    self._capture_completed_sale_snapshot(session)
             self._last_sale[addr] = life
 
     def _should_hold_sale_display(self, session: PumpSession) -> bool:
@@ -1554,13 +1562,76 @@ class ControllerLoop:
             os.environ.get("INTELIPUMP_AUTHORIZE_REQUEST_DIR", "/var/lib/intelipump")
         )
 
-    def _set_price_defer_reason(self, addr: int, session: PumpSession) -> str | None:
-        """Why this dart address must wait before CD5 (None = eligible now).
+    def _capture_completed_sale_snapshot(self, session: PumpSession) -> bool:
+        """Record completed-sale amount/volume/identity before any RESET.
 
-        FILLING_COMPLETED / display-hold with nozzle still OUT must wait for
-        hang-up. Once the nozzle is IN, the address is eligible: the apply
-        path clears the retained face with RESET then runs CD5 so the price
-        cannot remain deferred forever until a Pi restart.
+        Returns False when a positive-delivery completed sale cannot be
+        captured; callers must not RESET (that would wipe the pump face).
+        """
+        ev = session.state.sale_evidence
+        life = session.state.sale_lifecycle
+        status = session.state.observed_status
+        completed = life in {
+            SaleLifecycle.FILLING_COMPLETED,
+            SaleLifecycle.CLOSED,
+        } or status in {
+            ObservedStatus.FILLING_COMPLETED,
+            ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+        }
+        if not completed:
+            return True
+        vol = ev.peak_volume_raw or session.state.filled_volume_raw
+        amt = ev.peak_amount_raw or session.state.filled_amount_raw
+        if vol <= 0 or amt <= 0:
+            return True
+        addr = session.address
+        self._last_completed_sale[addr] = {
+            "volume_raw": vol,
+            "amount_raw": amt,
+            "unit_price_raw": session.state.unit_price_raw,
+        }
+        ev.sale_published = True
+        return True
+
+    def _set_price_needs_completed_clear(self, addr: int, session: PumpSession) -> bool:
+        status = session.state.observed_status
+        return (
+            status
+            in {
+                ObservedStatus.FILLING_COMPLETED,
+                ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+            }
+            or addr in self._sale_display_held
+        )
+
+    def _set_price_nozio_age_s(self, session: PumpSession) -> float | None:
+        t = session.state.last_nozio_time
+        if t is None:
+            return None
+        return time.monotonic() - t
+
+    def _set_price_status_age_s(self, session: PumpSession) -> float | None:
+        t = session.state.last_status_time
+        if t is None:
+            return None
+        return time.monotonic() - t
+
+    def _set_price_sale_persist_state(self, addr: int, session: PumpSession) -> str:
+        ev = session.state.sale_evidence
+        if addr in self._last_completed_sale or ev.sale_published:
+            return "captured"
+        if ev.has_positive_delivery:
+            return "positive_unpersisted"
+        return "none"
+
+    def _set_price_defer_reason(self, addr: int, session: PumpSession) -> str | None:
+        """Why this dart address must wait before RESET/CD5 (None = eligible).
+
+        ``saleDisplayHeld=False`` is not proof the nozzle is IN. Wayne often
+        idles in FILLING_COMPLETED after hang-up without starting the LCD hold
+        (hold requires nozzle IN). Deployed ``display_hold`` deferred that
+        idle forever. Progress only with fresh nozzle IN, no active
+        dispensing, and a captured completed sale when totals exist.
         """
         status = session.state.observed_status
         if status in {
@@ -1569,16 +1640,22 @@ class ControllerLoop:
             ObservedStatus.SUSPENDED,
         }:
             return "busy"
-        needs_clear = (
-            status
-            in {
-                ObservedStatus.FILLING_COMPLETED,
-                ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
-            }
-            or addr in self._sale_display_held
-        )
-        if needs_clear and session.state.nozzle_position is not NozzlePosition.IN:
-            return "await_hangup"
+        pos = session.state.nozzle_position
+        if pos is NozzlePosition.OUT:
+            return "nozzle_out"
+        if pos is NozzlePosition.UNKNOWN:
+            return "nozzle_unknown"
+        nozio_age = self._set_price_nozio_age_s(session)
+        if nozio_age is not None and nozio_age > self._set_price_nozio_fresh_s:
+            return "nozzle_stale"
+        if self._set_price_needs_completed_clear(addr, session):
+            if not self._capture_completed_sale_snapshot(session):
+                return "sale_unpersisted"
+            ev = session.state.sale_evidence
+            if ev.has_positive_delivery and not (
+                ev.sale_published or addr in self._last_completed_sale
+            ):
+                return "sale_unpersisted"
         return None
 
     def _log_set_price_deferred(
@@ -1588,28 +1665,103 @@ class ControllerLoop:
         correlation_id: str,
         unit_price_raw: int,
         address: int,
-        status: ObservedStatus,
+        session: PumpSession,
+        pump_id: str | None = None,
     ) -> None:
-        """Throttle defer logs — multi-addr PIs used to spam every poll tick."""
-        key = f"{correlation_id}:{address}:{reason}"
+        """Log immediately when the defer reason changes; rate-limit repeats."""
+        change_key = f"{correlation_id}:{address}"
+        throttle_key = f"{change_key}:{reason}"
         now = time.monotonic()
-        last = self._set_price_defer_log_at.get(key)
-        if last is not None and (now - last) < 5.0:
+        prev = self._set_price_defer_last_reason.get(change_key)
+        changed = prev != reason
+        self._set_price_defer_last_reason[change_key] = reason
+        last = self._set_price_defer_log_at.get(throttle_key)
+        if not changed and last is not None and (now - last) < 5.0:
             return
-        self._set_price_defer_log_at[key] = now
+        self._set_price_defer_log_at[throttle_key] = now
+        nozio_age = self._set_price_nozio_age_s(session)
+        status_age = self._set_price_status_age_s(session)
         logger.info(
             f"set_price_deferred_{reason}",
             correlationId=correlation_id,
             unitPriceRaw=unit_price_raw,
             address=address,
-            observedStatus=getattr(status, "value", str(status)),
+            pumpId=pump_id or session.state.pump_id,
+            observedStatus=session.state.observed_status.value,
+            nozzleState=session.state.nozzle_position.value,
+            nozzleObservationAgeS=None if nozio_age is None else round(nozio_age, 3),
+            statusObservationAgeS=None if status_age is None else round(status_age, 3),
             saleDisplayHeld=address in self._sale_display_held,
+            displayHoldReason=(
+                "lcd_hold_until_lift"
+                if address in self._sale_display_held
+                else "not_held"
+            ),
+            salePersistState=self._set_price_sale_persist_state(address, session),
+            deferReasonChanged=changed,
         )
+
+    def _set_price_request_age_s(self, pending: object, now: float) -> float:
+        corr = pending.correlation_id  # type: ignore[attr-defined]
+        if corr not in self._cloud_set_price_seen_at:
+            seen = now
+            requested_at = getattr(pending, "requested_at", None)
+            if requested_at:
+                try:
+                    raw = str(requested_at).replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(raw)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=UTC)
+                    wall = (datetime.now(UTC) - dt).total_seconds()
+                    if wall > 0:
+                        seen = now - wall
+                except ValueError:
+                    pass
+            self._cloud_set_price_seen_at[corr] = seen
+        return now - self._cloud_set_price_seen_at[corr]
+
+    async def _refresh_set_price_target_evidence(self, session: PumpSession) -> None:
+        """Drain pending DATA; RETURN_STATUS when nozzle/status evidence is weak."""
+        await self._drain_pending_data(session)
+        pos = session.state.nozzle_position
+        status = session.state.observed_status
+        nozio_age = self._set_price_nozio_age_s(session)
+        stale = nozio_age is not None and nozio_age > self._set_price_nozio_fresh_s
+        needs_probe = (
+            pos is NozzlePosition.UNKNOWN
+            or status is ObservedStatus.UNKNOWN
+            or stale
+        )
+        if not needs_probe:
+            return
+        addr = session.address
+        now = time.monotonic()
+        last = self._set_price_refresh_at.get(addr, 0.0)
+        if now - last < self._set_price_refresh_min_interval_s:
+            return
+        self._set_price_refresh_at[addr] = now
+        result = await self._run_owned_command(
+            session,
+            encode_cd1_command(PumpControlCommand.RETURN_STATUS),
+            PumpCommand.READ_STATUS,
+            idempotency=IdempotencyClass.IDEMPOTENT,
+            command_label="CD1_RETURN_STATUS_BEFORE_SET_PRICE",
+        )
+        logger.info(
+            "set_price_status_refresh",
+            address=addr,
+            pumpId=session.state.pump_id,
+            result=result.status.value,
+            observedStatus=session.state.observed_status.value,
+            nozzleState=session.state.nozzle_position.value,
+        )
+        await self._drain_pending_data(session)
 
     def _clear_cloud_set_price_tracking(self, corr: str) -> None:
         self._cloud_set_price_applied.pop(corr, None)
         self._cloud_set_price_gave_up.pop(corr, None)
         self._cloud_set_price_awaiting_dc3.pop(corr, None)
+        self._cloud_set_price_seen_at.pop(corr, None)
         for key in list(self._cloud_set_price_fail_count):
             if key.startswith(f"{corr}:"):
                 self._cloud_set_price_fail_count.pop(key, None)
@@ -1618,6 +1770,9 @@ class ControllerLoop:
             if key.startswith(f"{corr}:"):
                 self._cloud_set_price_dc3_baseline.pop(key, None)
                 self._cloud_set_price_dc3_deadline.pop(key, None)
+        for key in list(self._set_price_defer_last_reason):
+            if key.startswith(f"{corr}:"):
+                self._set_price_defer_last_reason.pop(key, None)
 
     def _set_price_dc3_miss(
         self,
@@ -1753,16 +1908,17 @@ class ControllerLoop:
         """Apply a cloud-queued SET_PRICE (CD5) written by intelipump-cloud-sync.
 
         Safety gates: owned-lab session required; never CD5 while AUTHORIZED /
-        FILLING / SUSPENDED; never RESET/CD5 while nozzle is still OUT on a
-        retained sale face (await hang-up). Once hung up (nozzle IN) with a
-        held FILLING_COMPLETED face, RESET clears the face then CD5 runs so
-        the request cannot remain deferred until a service restart.
+        FILLING / SUSPENDED; never RESET/CD5 while nozzle is OUT, unknown, or
+        stale, or while a positive completed sale is not yet captured. Idle
+        FILLING_COMPLETED with a freshly confirmed nozzle IN progresses
+        RESET-then-CD5 without a Pi restart or a new sale.
 
         Multi-address controllers apply per eligible address. A held sale on
         addr=1 must not block CD5 on addr=2.
 
         LINK_ACK alone and TIMED_OUT never count as an applied price — only
-        APPLICATION_CONFIRMED or a matching DC3 unit_price_raw does.
+        APPLICATION_CONFIRMED or a matching DC3 unit_price_raw does. RESET
+        must reach APPLICATION_CONFIRMED (or observed RESET) before CD5.
         """
         if not self.runtime.safety.owned_lab_active_session:
             return
@@ -1838,6 +1994,7 @@ class ControllerLoop:
 
         corr = pending.correlation_id
         now = time.monotonic()
+        request_age_s = self._set_price_request_age_s(pending, now)
         for old in list(self._cloud_set_price_applied):
             if old != corr:
                 self._clear_cloud_set_price_tracking(old)
@@ -1903,6 +2060,7 @@ class ControllerLoop:
                     unit_price_raw=pending.unit_price_raw,
                 )
 
+        expired = request_age_s >= self._set_price_defer_timeout_s
         eligible: list[tuple[int, PumpSession]] = []
         deferred_addrs: list[int] = []
         for addr, session in self.sessions.items():
@@ -1911,7 +2069,29 @@ class ControllerLoop:
             if addr in awaiting_dc3:
                 # Waiting for DC3 confirm — do not re-blast CD5 every tick.
                 continue
+            if (
+                self._set_price_needs_completed_clear(addr, session)
+                or session.state.nozzle_position is NozzlePosition.UNKNOWN
+                or session.state.observed_status is ObservedStatus.UNKNOWN
+            ):
+                await self._refresh_set_price_target_evidence(session)
             reason = self._set_price_defer_reason(addr, session)
+            if expired:
+                gave_up.add(addr)
+                logger.warning(
+                    "set_price_deferred_timeout",
+                    correlationId=corr,
+                    address=addr,
+                    pumpId=pending.pump_id or session.state.pump_id,
+                    unitPriceRaw=pending.unit_price_raw,
+                    observedStatus=session.state.observed_status.value,
+                    nozzleState=session.state.nozzle_position.value,
+                    requestAgeS=round(request_age_s, 3),
+                    deferTimeoutS=self._set_price_defer_timeout_s,
+                    lastDeferReason=reason,
+                    salePersistState=self._set_price_sale_persist_state(addr, session),
+                )
+                continue
             if reason is not None:
                 deferred_addrs.append(addr)
                 self._log_set_price_deferred(
@@ -1919,7 +2099,8 @@ class ControllerLoop:
                     correlation_id=corr,
                     unit_price_raw=pending.unit_price_raw,
                     address=addr,
-                    status=session.state.observed_status,
+                    session=session,
+                    pump_id=pending.pump_id,
                 )
                 continue
             retry_key = f"{corr}:{addr}"
@@ -1967,7 +2148,41 @@ class ControllerLoop:
                     }
                     or addr in self._sale_display_held
                 )
-                if needs_clear and session.state.nozzle_position is NozzlePosition.IN:
+                if needs_clear:
+                    if not self._capture_completed_sale_snapshot(session):
+                        self._log_set_price_deferred(
+                            "sale_unpersisted",
+                            correlation_id=corr,
+                            unit_price_raw=pending.unit_price_raw,
+                            address=addr,
+                            session=session,
+                            pump_id=pending.pump_id,
+                        )
+                        continue
+                    # Recheck after capture: a new lift must not race RESET.
+                    race = self._set_price_defer_reason(addr, session)
+                    if race is not None:
+                        self._log_set_price_deferred(
+                            race,
+                            correlation_id=corr,
+                            unit_price_raw=pending.unit_price_raw,
+                            address=addr,
+                            session=session,
+                            pump_id=pending.pump_id,
+                        )
+                        continue
+                    logger.info(
+                        "set_price_reset_scheduled",
+                        address=addr,
+                        pumpId=pending.pump_id or session.state.pump_id,
+                        correlationId=corr,
+                        unitPriceRaw=pending.unit_price_raw,
+                        observedStatus=session.state.observed_status.value,
+                        nozzleState=session.state.nozzle_position.value,
+                        salePersistState=self._set_price_sale_persist_state(
+                            addr, session
+                        ),
+                    )
                     reset = await self._run_owned_command(
                         session,
                         encode_cd1_command(PumpControlCommand.RESET),
@@ -1976,19 +2191,29 @@ class ControllerLoop:
                         idempotency=IdempotencyClass.NON_IDEMPOTENT,
                         command_label="CD1_RESET_BEFORE_CLOUD_PRICE",
                     )
+                    logger.info(
+                        "set_price_reset_sent",
+                        address=addr,
+                        pumpId=pending.pump_id or session.state.pump_id,
+                        correlationId=corr,
+                        result=reset.status.value,
+                        observedStatus=session.state.observed_status.value,
+                    )
                     print(
                         f"[CLOUD-PRICE addr={addr}] clear retained face before CD5 "
                         f"result={reset.status.value}"
                     )
-                    if reset.status not in {
-                        ExchangeResultStatus.LINK_ACKNOWLEDGED,
-                        ExchangeResultStatus.APPLICATION_CONFIRMED,
-                    }:
+                    reset_ok = (
+                        reset.status is ExchangeResultStatus.APPLICATION_CONFIRMED
+                        or session.state.observed_status is ObservedStatus.RESET
+                    )
+                    if not reset_ok:
                         logger.warning(
                             "set_price_reset_before_cd5_failed",
                             address=addr,
                             correlationId=corr,
                             result=reset.status.value,
+                            observedStatus=session.state.observed_status.value,
                         )
                         retry_key = f"{corr}:{addr}"
                         fails = self._cloud_set_price_fail_count.get(retry_key, 0) + 1
@@ -1996,12 +2221,42 @@ class ControllerLoop:
                         delay = min(120.0, 15.0 * (2 ** min(fails - 1, 3)))
                         self._cloud_set_price_next_try[retry_key] = now + delay
                         continue
+                    logger.info(
+                        "set_price_reset_confirmed",
+                        address=addr,
+                        pumpId=pending.pump_id or session.state.pump_id,
+                        correlationId=corr,
+                        observedStatus=session.state.observed_status.value,
+                    )
                     # Retained-sale bookkeeping only after RESET is confirmed.
                     self._sale_display_held.discard(addr)
                     self._sale_display_hold_since.pop(addr, None)
                     self._last_dc2.pop(addr, None)
                     session.state.filled_volume_raw = 0
                     session.state.filled_amount_raw = 0
+                    # Recheck eligibility: a nozzle lift during RESET must not
+                    # receive CD5 (would change price mid-sale).
+                    race = self._set_price_defer_reason(addr, session)
+                    if (
+                        race is not None
+                        or session.state.nozzle_position is NozzlePosition.OUT
+                    ):
+                        logger.warning(
+                            "set_price_aborted_before_cd5",
+                            address=addr,
+                            correlationId=corr,
+                            deferReason=race or "nozzle_out",
+                            nozzleState=session.state.nozzle_position.value,
+                            observedStatus=session.state.observed_status.value,
+                        )
+                        continue
+                logger.info(
+                    "set_price_cd5_scheduled",
+                    address=addr,
+                    pumpId=pending.pump_id or session.state.pump_id,
+                    correlationId=corr,
+                    unitPriceRaw=pending.unit_price_raw,
+                )
                 payload = encode_cd5_price_update(prices_raw=prices[:nozzle_n])
                 result = await self._run_owned_command(
                     session,
@@ -2121,7 +2376,11 @@ class ControllerLoop:
             else:
                 exec_status = "PRICE_FAILED"
                 accepted = False
-                detail = "cd5_timeout_or_reject_no_confirmed_price"
+                detail = (
+                    "set_price_deferred_timeout"
+                    if expired
+                    else "cd5_timeout_or_reject_no_confirmed_price"
+                )
             self._finalize_cloud_set_price_outcome(
                 pending=pending,
                 applied_final=applied_final,
