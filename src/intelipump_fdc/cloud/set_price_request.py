@@ -308,6 +308,8 @@ class SetPriceOutcome:
     gave_up_addresses: tuple[int, ...]
     deferred_addresses: tuple[int, ...]
     detail: str | None = None
+    # LINK_ACK sent; DC3 never matched (idle readback often 0).
+    unverified_addresses: tuple[int, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -321,6 +323,7 @@ class SetPriceOutcome:
             "appliedAddresses": list(self.applied_addresses),
             "gaveUpAddresses": list(self.gave_up_addresses),
             "deferredAddresses": list(self.deferred_addresses),
+            "unverifiedAddresses": list(self.unverified_addresses),
             "detail": self.detail,
             "updatedAt": datetime.now(UTC).isoformat(),
         }
@@ -371,6 +374,7 @@ def _parse_outcome_dict(raw: dict[str, Any]) -> SetPriceOutcome | None:
         applied_addresses=_addrs("appliedAddresses"),
         gave_up_addresses=_addrs("gaveUpAddresses"),
         deferred_addresses=_addrs("deferredAddresses"),
+        unverified_addresses=_addrs("unverifiedAddresses"),
         detail=str(raw["detail"]) if raw.get("detail") else None,
     )
 

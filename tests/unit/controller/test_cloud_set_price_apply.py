@@ -401,7 +401,7 @@ async def test_crash_after_outcome_write_clears_leftover_request(
 
 
 @pytest.mark.asyncio
-async def test_dc3_timeout_uses_backoff_then_eventual_failed_outcome(
+async def test_dc3_timeout_after_link_ack_is_sent_unverified_no_cd5_resend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_price(tmp_path, monkeypatch, "corr-dc3-timeout", 1600, pump="pump-3")
@@ -409,7 +409,7 @@ async def test_dc3_timeout_uses_backoff_then_eventual_failed_outcome(
     loop._cloud_set_price_dc3_timeout_s = 0.01
     for addr in (1, 2):
         _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
-        loop.sessions[addr].state.unit_price_raw = 1000
+        loop.sessions[addr].state.unit_price_raw = 0
         loop.sessions[addr].state.unit_price_obs_gen = 1
 
     link = AsyncMock(
@@ -423,23 +423,18 @@ async def test_dc3_timeout_uses_backoff_then_eventual_failed_outcome(
 
     await loop._apply_pending_cloud_set_price()
     assert loop._cloud_set_price_awaiting_dc3.get("corr-dc3-timeout")
-    assert read_set_price_request() is not None
+    first_cd5 = link.await_count
+    assert first_cd5 == 2
+
+    # Idle zero DC3 gen bump must not resend CD5.
+    for addr in (1, 2):
+        loop.sessions[addr].state.unit_price_obs_gen = 2
+        loop.sessions[addr].state.unit_price_raw = 0
+    await loop._apply_pending_cloud_set_price()
+    assert link.await_count == first_cd5
+    assert loop._cloud_set_price_awaiting_dc3.get("corr-dc3-timeout")
 
     past = time.monotonic() - 1.0
-    for addr in (1, 2):
-        loop._cloud_set_price_dc3_deadline[f"corr-dc3-timeout:{addr}"] = past
-    await loop._apply_pending_cloud_set_price()
-    assert not loop._cloud_set_price_awaiting_dc3.get("corr-dc3-timeout")
-    assert loop._cloud_set_price_fail_count["corr-dc3-timeout:1"] == 1
-    assert loop._cloud_set_price_fail_count["corr-dc3-timeout:2"] == 1
-    assert read_set_price_request() is not None
-    assert list_set_price_outcomes() == []
-
-    for addr in (1, 2):
-        key = f"corr-dc3-timeout:{addr}"
-        loop._cloud_set_price_fail_count[key] = 4
-        loop._cloud_set_price_next_try.pop(key, None)
-    await loop._apply_pending_cloud_set_price()
     for addr in (1, 2):
         loop._cloud_set_price_dc3_deadline[f"corr-dc3-timeout:{addr}"] = past
     await loop._apply_pending_cloud_set_price()
@@ -447,13 +442,143 @@ async def test_dc3_timeout_uses_backoff_then_eventual_failed_outcome(
     assert read_set_price_request() is None
     outcome = consume_set_price_outcome()
     assert outcome is not None
-    assert outcome.execution_status == "PRICE_FAILED"
-    assert outcome.accepted is False
-    assert set(outcome.gave_up_addresses) == {1, 2}
+    assert outcome.execution_status == "SENT_UNVERIFIED"
+    assert outcome.accepted is True
+    assert set(outcome.unverified_addresses) == {1, 2}
+    assert link.await_count == first_cd5  # never resent CD5
 
 
 @pytest.mark.asyncio
-async def test_nonmatching_fresh_dc3_uses_backoff_not_confirm(
+async def test_idle_zero_dc3_then_later_matching_readback_confirms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_price(tmp_path, monkeypatch, "corr-late-dc3", 1365)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.unit_price_raw = 0
+        loop.sessions[addr].state.unit_price_obs_gen = 1
+
+    link = AsyncMock(
+        return_value=type(
+            "R",
+            (),
+            {"status": ExchangeResultStatus.LINK_ACKNOWLEDGED},
+        )()
+    )
+    loop._run_owned_command = link  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+    assert loop._cloud_set_price_awaiting_dc3.get("corr-late-dc3")
+
+    # Idle zeros — still awaiting, no CD5 resend.
+    for addr in (1, 2):
+        loop.sessions[addr].state.unit_price_obs_gen += 1
+        loop.sessions[addr].state.unit_price_raw = 0
+    await loop._apply_pending_cloud_set_price()
+    assert link.await_count == 2
+    assert read_set_price_request() is not None
+
+    # Later matching observation confirms.
+    for addr in (1, 2):
+        loop.sessions[addr].state.unit_price_obs_gen += 1
+        loop.sessions[addr].state.unit_price_raw = 1365
+    await loop._apply_pending_cloud_set_price()
+    assert read_set_price_request() is None
+    outcome = consume_set_price_outcome()
+    assert outcome is not None
+    assert outcome.execution_status == "PRICE_CONFIRMED"
+    assert set(outcome.applied_addresses) == {1, 2}
+    assert link.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sent_unverified_upgrades_on_late_dc3_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import (
+        SetPriceOutcome,
+        read_persisted_unit_price,
+        write_persisted_unit_price,
+        write_set_price_outcome,
+    )
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_persisted_unit_price(1365, (1365,), source="cloud")
+    write_set_price_outcome(
+        SetPriceOutcome(
+            correlation_id="corr-upgrade",
+            command_id="cmd-corr-upgrade",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1365,
+            execution_status="SENT_UNVERIFIED",
+            accepted=True,
+            applied_addresses=(),
+            gave_up_addresses=(),
+            deferred_addresses=(),
+            unverified_addresses=(1, 2),
+            detail="cd5_link_ack_dc3_idle_or_timeout",
+        )
+    )
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.unit_price_raw = 1365
+        loop.sessions[addr].state.unit_price_obs_gen = 5
+    ok = _confirmed()
+    loop._run_owned_command = ok  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+    assert ok.await_count == 0  # no CD5 replay
+    outcomes = list_set_price_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].execution_status == "PRICE_CONFIRMED"
+    assert set(outcomes[0].applied_addresses) == {1, 2}
+    assert read_persisted_unit_price().unit_price_raw == 1365
+
+
+@pytest.mark.asyncio
+async def test_superseding_price_blocks_late_unverified_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import (
+        SetPriceOutcome,
+        write_set_price_outcome,
+    )
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_set_price_outcome(
+        SetPriceOutcome(
+            correlation_id="corr-old",
+            command_id="cmd-corr-old",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1365,
+            execution_status="SENT_UNVERIFIED",
+            accepted=True,
+            applied_addresses=(),
+            gave_up_addresses=(),
+            deferred_addresses=(),
+            unverified_addresses=(1, 2),
+            detail="cd5_link_ack_dc3_idle_or_timeout",
+        )
+    )
+    _write_price(tmp_path, monkeypatch, "corr-new", 1400)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        # Face still shows old price from prior command.
+        loop.sessions[addr].state.unit_price_raw = 1365
+        loop.sessions[addr].state.unit_price_obs_gen = 9
+    loop._run_owned_command = _confirmed()  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+    # Old SENT_UNVERIFIED must not upgrade while newer request is active.
+    old = [o for o in list_set_price_outcomes() if o.correlation_id == "corr-old"]
+    assert len(old) == 1
+    assert old[0].execution_status == "SENT_UNVERIFIED"
+
+
+@pytest.mark.asyncio
+async def test_nonmatching_fresh_dc3_does_not_resend_cd5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_price(tmp_path, monkeypatch, "corr-mismatch", 1700, pump="pump-5")
@@ -474,15 +599,16 @@ async def test_nonmatching_fresh_dc3_uses_backoff_not_confirm(
 
     await loop._apply_pending_cloud_set_price()
     assert loop._cloud_set_price_awaiting_dc3.get("corr-mismatch")
+    first = link.await_count
 
     for addr in (1, 2):
         loop.sessions[addr].state.unit_price_obs_gen = 3
         loop.sessions[addr].state.unit_price_raw = 1699
     await loop._apply_pending_cloud_set_price()
 
-    assert not loop._cloud_set_price_awaiting_dc3.get("corr-mismatch")
+    assert link.await_count == first
+    assert loop._cloud_set_price_awaiting_dc3.get("corr-mismatch")
     assert not loop._cloud_set_price_applied.get("corr-mismatch")
-    assert loop._cloud_set_price_fail_count["corr-mismatch:1"] == 1
     assert read_set_price_request() is not None
     assert list_set_price_outcomes() == []
 
@@ -1038,13 +1164,8 @@ async def test_unit_price_persisted_once_across_many_polls(
         )()
     )
     loop._run_owned_command = link  # type: ignore[method-assign]
-    await loop._apply_pending_cloud_set_price()
-    assert loop._cloud_set_price_awaiting_dc3.get(
-        "882b3b45-c38b-4d51-b810-b0c59542a7f5"
-    )
 
     writes = {"n": 0}
-    real_write = None
     from intelipump_fdc.cloud import set_price_request as spr
 
     real_write = spr.write_persisted_unit_price
@@ -1055,11 +1176,17 @@ async def test_unit_price_persisted_once_across_many_polls(
 
     monkeypatch.setattr(spr, "write_persisted_unit_price", _counting_write)
 
+    await loop._apply_pending_cloud_set_price()
+    assert loop._cloud_set_price_awaiting_dc3.get(
+        "882b3b45-c38b-4d51-b810-b0c59542a7f5"
+    )
+    assert writes["n"] == 1  # persist on LINK_ACK
+
     for addr in (1, 2):
         loop.sessions[addr].state.unit_price_obs_gen = 8
         loop.sessions[addr].state.unit_price_raw = 1356
     await loop._apply_pending_cloud_set_price()
-    assert writes["n"] == 1
+    assert writes["n"] == 1  # confirm does not rewrite
     assert read_persisted_unit_price() is not None
     assert read_persisted_unit_price().unit_price_raw == 1356
 
@@ -1082,7 +1209,6 @@ async def test_unit_price_persisted_once_across_many_polls(
     for _ in range(20):
         await loop._apply_pending_cloud_set_price()
     assert writes["n"] == 1
-
 
 @pytest.mark.asyncio
 async def test_delayed_cloud_ack_does_not_rewrite_persisted_price(

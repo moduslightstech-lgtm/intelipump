@@ -160,6 +160,7 @@ class CloudCommandIntake:
                 "appliedAddresses": list(outcome.applied_addresses),
                 "gaveUpAddresses": list(outcome.gave_up_addresses),
                 "deferredAddresses": list(outcome.deferred_addresses),
+                "unverifiedAddresses": list(outcome.unverified_addresses),
                 "environment": self._environment,
                 "simulated": self._simulated,
                 "timestamp": datetime.now(UTC).isoformat(),
