@@ -211,3 +211,134 @@ def test_volume_tolerance_is_protocol_precision_not_min_sale() -> None:
     assert volume_increased(baseline_raw=100, current_raw=100) is False
     assert volume_increased(baseline_raw=100, current_raw=101) is False  # within 1 raw
     assert volume_increased(baseline_raw=100, current_raw=102) is True
+
+
+def test_stale_dc2_from_prior_session_does_not_phantom_sale() -> None:
+    """Historical DC2 (0.07 L @ 14:30) must not qualify a new lift/return."""
+    from datetime import UTC, datetime, timedelta
+
+    book = _book()
+    # Prior verified sale at 14:30.
+    prior_stamp = datetime(2026, 10, 6, 14, 30, tzinfo=UTC)
+    book.note_nozzle_lifted(
+        pump_id="pump-1", nozzle_id="nozzle-1", dart_address=1, at=prior_stamp
+    )
+    book.note_authorized(
+        pump_id="pump-1", nozzle_id="nozzle-1", baseline_volume_raw=0, at=prior_stamp
+    )
+    book.note_dc1_state(
+        pump_id="pump-1",
+        nozzle_id="nozzle-1",
+        dc1_state="FILLING",
+        at=prior_stamp,
+    )
+    book.note_volume(
+        pump_id="pump-1",
+        nozzle_id="nozzle-1",
+        volume_raw=7,
+        amount_raw=95,
+        at=prior_stamp,
+    )
+    prior = book.note_nozzle_returned(
+        pump_id="pump-1",
+        nozzle_id="nozzle-1",
+        at=prior_stamp + timedelta(minutes=2),
+    )
+    assert prior.phase is VerifiedPhase.COMPLETED
+    assert prior.transaction_id is not None
+    prior_tx = prior.transaction_id
+
+    # Retained-face DC2 after completion must not refresh increase timestamps.
+    book.note_volume(
+        pump_id="pump-1",
+        nozzle_id="nozzle-1",
+        volume_raw=7,
+        at=prior_stamp + timedelta(minutes=3),
+    )
+    after_face = book.get("pump-1", "nozzle-1")
+    assert after_face is not None
+    assert after_face.phase is VerifiedPhase.COMPLETED
+    assert after_face.first_volume_increase_at == prior_stamp
+
+    # New lift at 14:32:58 after pre_auth zero baseline — no FILLING.
+    new_lift = datetime(2026, 10, 6, 14, 32, 58, tzinfo=UTC)
+    book.note_nozzle_lifted(
+        pump_id="pump-1", nozzle_id="nozzle-1", dart_address=1, at=new_lift
+    )
+    state = book.note_authorized(
+        pump_id="pump-1", nozzle_id="nozzle-1", baseline_volume_raw=0, at=new_lift
+    )
+    assert state.current_volume_raw == 0
+    assert state.baseline_volume_raw == 0
+    assert state.volume_increased is False
+    assert state.first_volume_increase_at is None
+    assert state.last_volume_increase_at is None
+    assert state.verified_dispensing is False
+    assert state.transaction_id is None
+    # Prior sale id was cleared from the in-memory attempt; persistence keeps it.
+    assert prior_tx is not None
+
+    returned = book.note_nozzle_returned(
+        pump_id="pump-1", nozzle_id="nozzle-1", at=new_lift + timedelta(seconds=20)
+    )
+    assert returned.phase is VerifiedPhase.CANCELLED_NO_SALE
+    assert returned.transaction_id is None
+    assert returned.presentation_status() == "CANCELLED_NO_SALE"
+
+
+def test_missed_hangup_stale_verified_cleared_on_new_lift() -> None:
+    """If hang-up was missed, a new lift must not inherit prior volume evidence."""
+    from datetime import UTC, datetime
+
+    book = _book()
+    old = datetime(2026, 10, 6, 14, 30, tzinfo=UTC)
+    book.note_nozzle_lifted(pump_id="pump-1", nozzle_id="nozzle-1", at=old)
+    book.note_authorized(pump_id="pump-1", nozzle_id="nozzle-1", baseline_volume_raw=0)
+    book.note_dc1_state(pump_id="pump-1", nozzle_id="nozzle-1", dc1_state="FILLING")
+    book.note_volume(pump_id="pump-1", nozzle_id="nozzle-1", volume_raw=7, at=old)
+    stuck = book.get("pump-1", "nozzle-1")
+    assert stuck is not None
+    assert stuck.phase is VerifiedPhase.VERIFIED_DISPENSING
+    assert stuck.volume_increased is True
+
+    fresh = datetime(2026, 10, 6, 14, 32, 58, tzinfo=UTC)
+    book.note_nozzle_lifted(pump_id="pump-1", nozzle_id="nozzle-1", at=fresh)
+    state = book.note_authorized(
+        pump_id="pump-1", nozzle_id="nozzle-1", baseline_volume_raw=0, at=fresh
+    )
+    assert state.current_volume_raw == 0
+    assert state.volume_increased is False
+    assert state.first_volume_increase_at is None
+    assert state.verified_dispensing is False
+    returned = book.note_nozzle_returned(pump_id="pump-1", nozzle_id="nozzle-1")
+    assert returned.phase is VerifiedPhase.CANCELLED_NO_SALE
+    assert returned.transaction_id is None
+
+
+def test_fresh_real_dispensing_still_one_completed_sale() -> None:
+    book = _book()
+    book.note_nozzle_lifted(pump_id="pump-1", nozzle_id="nozzle-1")
+    book.note_authorized(pump_id="pump-1", nozzle_id="nozzle-1", baseline_volume_raw=0)
+    book.note_dc1_state(pump_id="pump-1", nozzle_id="nozzle-1", dc1_state="FILLING")
+    book.note_volume(pump_id="pump-1", nozzle_id="nozzle-1", volume_raw=7)
+    state = book.get("pump-1", "nozzle-1")
+    assert state is not None
+    assert state.verified_dispensing is True
+    tx = book.begin_verified_sale_if_needed(state)
+    book.note_volume(pump_id="pump-1", nozzle_id="nozzle-1", volume_raw=25)
+    done = book.note_nozzle_returned(pump_id="pump-1", nozzle_id="nozzle-1")
+    assert done.phase is VerifiedPhase.COMPLETED
+    assert done.transaction_id == tx
+    # Second session also produces exactly one new sale.
+    book.note_nozzle_lifted(pump_id="pump-1", nozzle_id="nozzle-1")
+    book.note_authorized(pump_id="pump-1", nozzle_id="nozzle-1", baseline_volume_raw=0)
+    book.note_dc1_state(pump_id="pump-1", nozzle_id="nozzle-1", dc1_state="FILLING")
+    book.note_volume(pump_id="pump-1", nozzle_id="nozzle-1", volume_raw=12)
+    state2 = book.get("pump-1", "nozzle-1")
+    assert state2 is not None
+    tx2 = book.begin_verified_sale_if_needed(state2)
+    assert tx2 is not None
+    assert tx2 != tx
+    done2 = book.note_nozzle_returned(pump_id="pump-1", nozzle_id="nozzle-1")
+    assert done2.phase is VerifiedPhase.COMPLETED
+    assert done2.transaction_id == tx2

@@ -199,12 +199,23 @@ class VerifiedDispensingBook:
         state = self.get_or_create(
             pump_id=pump_id, nozzle_id=nozzle_id, dart_address=dart_address
         )
-        if state.phase in {
-            VerifiedPhase.COMPLETED,
-            VerifiedPhase.CANCELLED_NO_SALE,
-            VerifiedPhase.IDLE,
-            VerifiedPhase.POSSIBLE_UNINTENDED_FLOW,
-        }:
+        # A new physical lift always starts a clean attempt. Prior completed
+        # sales live in persistence; do not carry historical DC2 / timestamps
+        # into the new session (including when hang-up never observed FILLING).
+        # VERIFIED_DISPENSING + new lift implies a missed hang-up; reset the book
+        # rather than letting prior volume qualify the next attempt.
+        if (
+            not state.nozzle_lifted
+            or state.nozzle_returned_at is not None
+            or state.phase
+            in {
+                VerifiedPhase.COMPLETED,
+                VerifiedPhase.CANCELLED_NO_SALE,
+                VerifiedPhase.IDLE,
+                VerifiedPhase.POSSIBLE_UNINTENDED_FLOW,
+                VerifiedPhase.VERIFIED_DISPENSING,
+            }
+        ):
             self._reset_attempt(state)
         state.nozzle_lifted = True
         state.nozzle_lifted_at = at or _now()
@@ -229,12 +240,18 @@ class VerifiedDispensingBook:
         state.authorized_at = at or _now()
         # New authorize attempt: baseline is the empty post-RESET face (0) unless
         # the caller passes an explicit non-negative reading. Never keep a prior
-        # sale's volume as baseline — that blocks verified_dispensing forever.
+        # sale's volume as baseline or current — that marks volumeIncreased from
+        # historical DC2 and can invent a phantom verified sale.
         if baseline_volume_raw is not None:
             state.baseline_volume_raw = max(0, int(baseline_volume_raw))
         else:
             state.baseline_volume_raw = 0
-        if state.current_volume_raw is None:
+        # Do not wipe a live verified meter if AUTHORIZED is re-observed mid-fill.
+        if state.phase is not VerifiedPhase.VERIFIED_DISPENSING:
+            state.current_volume_raw = state.baseline_volume_raw
+            state.first_volume_increase_at = None
+            state.last_volume_increase_at = None
+        elif state.current_volume_raw is None:
             state.current_volume_raw = state.baseline_volume_raw
         if state.phase in {VerifiedPhase.IDLE, VerifiedPhase.NOZZLE_LIFTED}:
             state.phase = VerifiedPhase.AUTHORIZED
@@ -281,6 +298,16 @@ class VerifiedDispensingBook:
         state = self.get_or_create(
             pump_id=pump_id, nozzle_id=nozzle_id, dart_address=dart_address
         )
+        # Terminal sessions may still see retained-face DC2. Record the face for
+        # diagnostics but never treat historical totals as a new-session increase.
+        if state.phase in {
+            VerifiedPhase.COMPLETED,
+            VerifiedPhase.CANCELLED_NO_SALE,
+        }:
+            state.current_volume_raw = int(volume_raw)
+            if amount_raw is not None:
+                state.preserved_amount_raw = int(amount_raw)
+            return state
         stamp = at or _now()
         prev = state.current_volume_raw
         state.current_volume_raw = int(volume_raw)

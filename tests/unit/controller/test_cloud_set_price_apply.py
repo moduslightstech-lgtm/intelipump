@@ -11,6 +11,7 @@ import pytest
 from intelipump_fdc.cloud.set_price_request import (
     SetPriceRequest,
     consume_set_price_outcome,
+    has_set_price_outcome,
     list_set_price_outcomes,
     read_set_price_request,
     write_set_price_request,
@@ -805,3 +806,289 @@ async def test_expired_request_does_not_apply_after_later_hangup(
     leftover = list_set_price_outcomes()
     assert len(leftover) == 1
     assert leftover[0].detail == "set_price_deferred_timeout"
+
+
+@pytest.mark.asyncio
+async def test_unit_price_persisted_once_across_many_polls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: DC3 confirm must not rewrite unit-price.json every poll."""
+    from intelipump_fdc.cloud.set_price_request import read_persisted_unit_price
+
+    _write_price(tmp_path, monkeypatch, "882b3b45-c38b-4d51-b810-b0c59542a7f5", 1356)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.unit_price_raw = 1000
+        loop.sessions[addr].state.unit_price_obs_gen = 7
+
+    link = AsyncMock(
+        return_value=type(
+            "R",
+            (),
+            {"status": ExchangeResultStatus.LINK_ACKNOWLEDGED},
+        )()
+    )
+    loop._run_owned_command = link  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+    assert loop._cloud_set_price_awaiting_dc3.get(
+        "882b3b45-c38b-4d51-b810-b0c59542a7f5"
+    )
+
+    writes = {"n": 0}
+    real_write = None
+    from intelipump_fdc.cloud import set_price_request as spr
+
+    real_write = spr.write_persisted_unit_price
+
+    def _counting_write(*args, **kwargs):
+        writes["n"] += 1
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(spr, "write_persisted_unit_price", _counting_write)
+
+    for addr in (1, 2):
+        loop.sessions[addr].state.unit_price_obs_gen = 8
+        loop.sessions[addr].state.unit_price_raw = 1356
+    await loop._apply_pending_cloud_set_price()
+    assert writes["n"] == 1
+    assert read_persisted_unit_price() is not None
+    assert read_persisted_unit_price().unit_price_raw == 1356
+
+    # Many subsequent polls / delayed cloud ACK: request may remain if we
+    # force applied state with pending request — must not rewrite.
+    write_set_price_request(
+        SetPriceRequest(
+            correlation_id="882b3b45-c38b-4d51-b810-b0c59542a7f5",
+            command_id="cmd-882b3b45-c38b-4d51-b810-b0c59542a7f5",
+            unit_price_raw=1356,
+            prices_raw=(1356,),
+            pump_id="pump-1",
+        )
+    )
+    # Simulate partial settle wait: addr1 applied, addr2 deferred hang-up.
+    loop._cloud_set_price_applied["882b3b45-c38b-4d51-b810-b0c59542a7f5"] = {1}
+    loop._cloud_set_price_unit_persisted["882b3b45-c38b-4d51-b810-b0c59542a7f5"] = 1356
+    loop.sessions[2].state.observed_status = ObservedStatus.FILLING_COMPLETED
+    loop.sessions[2].state.nozzle_position = NozzlePosition.OUT
+    for _ in range(20):
+        await loop._apply_pending_cloud_set_price()
+    assert writes["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_delayed_cloud_ack_does_not_rewrite_persisted_price(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import (
+        SetPriceOutcome,
+        read_persisted_unit_price,
+        write_set_price_outcome,
+    )
+
+    _write_price(tmp_path, monkeypatch, "corr-ack-hold", 1356)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+    loop._run_owned_command = _confirmed()  # type: ignore[method-assign]
+
+    writes = {"n": 0}
+    from intelipump_fdc.cloud import set_price_request as spr
+
+    real_write = spr.write_persisted_unit_price
+
+    def _counting_write(*args, **kwargs):
+        writes["n"] += 1
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(spr, "write_persisted_unit_price", _counting_write)
+    await loop._apply_pending_cloud_set_price()
+    assert writes["n"] == 1
+    assert read_set_price_request() is None
+    first = read_persisted_unit_price()
+    assert first is not None
+    first_updated = first.updated_at
+
+    # Outcome still waiting for cloud ACK; leftover request must not rewrite.
+    write_set_price_request(
+        SetPriceRequest(
+            correlation_id="corr-ack-hold",
+            command_id="cmd-corr-ack-hold",
+            unit_price_raw=1356,
+            prices_raw=(1356,),
+            pump_id="pump-1",
+        )
+    )
+    assert has_set_price_outcome("corr-ack-hold") or list_set_price_outcomes()
+    for _ in range(10):
+        await loop._apply_pending_cloud_set_price()
+    assert writes["n"] == 1
+    assert read_persisted_unit_price().updated_at == first_updated
+    assert read_set_price_request() is None
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_retries_then_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import read_persisted_unit_price
+
+    _write_price(tmp_path, monkeypatch, "corr-persist-fail", 1400)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+    ok = _confirmed()
+    loop._run_owned_command = ok  # type: ignore[method-assign]
+
+    from intelipump_fdc.cloud import set_price_request as spr
+
+    real_write = spr.write_persisted_unit_price
+    calls = {"n": 0}
+
+    def _flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk full")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(spr, "write_persisted_unit_price", _flaky)
+    await loop._apply_pending_cloud_set_price()
+    assert calls["n"] == 1
+    assert read_persisted_unit_price() is None
+    assert read_set_price_request() is not None
+    assert list_set_price_outcomes() == []
+    # Applied addresses retained — no CD5 storm while waiting for persist.
+    cd5_first = sum(
+        1 for c in ok.await_args_list if "CD5" in (c.kwargs.get("command_label") or "")
+    )
+    ok.reset_mock()
+    loop._cloud_set_price_persist_next_try.pop("corr-persist-fail", None)
+    await loop._apply_pending_cloud_set_price()
+    assert calls["n"] == 2
+    assert read_persisted_unit_price() is not None
+    assert read_persisted_unit_price().unit_price_raw == 1400
+    assert read_set_price_request() is None
+    assert consume_set_price_outcome() is not None
+    assert not any(
+        "CD5" in (c.kwargs.get("command_label") or "") for c in ok.await_args_list
+    )
+    assert cd5_first >= 1
+
+
+@pytest.mark.asyncio
+async def test_later_price_change_persists_new_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import (
+        consume_set_price_outcome,
+        read_persisted_unit_price,
+    )
+
+    _write_price(tmp_path, monkeypatch, "corr-price-a", 1356)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+    loop._run_owned_command = _confirmed()  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+    assert read_persisted_unit_price().unit_price_raw == 1356
+    consume_set_price_outcome()
+
+    _write_price(tmp_path, monkeypatch, "corr-price-b", 1410)
+    loop2 = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop2.sessions[addr], status=ObservedStatus.RESET)
+    loop2._run_owned_command = _confirmed()  # type: ignore[method-assign]
+    await loop2._apply_pending_cloud_set_price()
+    assert read_persisted_unit_price().unit_price_raw == 1410
+
+
+@pytest.mark.asyncio
+async def test_outcome_retry_does_not_resend_cd5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While outcome awaits ACK / request leftover, do not re-issue CD5."""
+    from intelipump_fdc.cloud.set_price_request import write_set_price_outcome
+
+    _write_price(tmp_path, monkeypatch, "corr-no-recd5", 1356)
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+    ok = _confirmed()
+    loop._run_owned_command = ok  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+    first_cd5 = sum(
+        1 for c in ok.await_args_list if "CD5" in (c.kwargs.get("command_label") or "")
+    )
+    assert first_cd5 >= 1
+
+    write_set_price_request(
+        SetPriceRequest(
+            correlation_id="corr-no-recd5",
+            command_id="cmd-corr-no-recd5",
+            unit_price_raw=1356,
+            prices_raw=(1356,),
+            pump_id="pump-1",
+        )
+    )
+    ok.reset_mock()
+    for _ in range(5):
+        await loop._apply_pending_cloud_set_price()
+    assert ok.await_count == 0
+    assert not any(
+        "CD5" in (c.kwargs.get("command_label") or "") for c in ok.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_between_persist_and_outcome_keeps_price(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import (
+        SetPriceOutcome,
+        read_persisted_unit_price,
+        write_persisted_unit_price,
+        write_set_price_outcome,
+    )
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_persisted_unit_price(1356, (1356,), source="cloud")
+    write_set_price_request(
+        SetPriceRequest(
+            correlation_id="corr-restart-persist",
+            command_id="cmd-corr-restart-persist",
+            unit_price_raw=1356,
+            prices_raw=(1356,),
+            pump_id="pump-1",
+        )
+    )
+    write_set_price_outcome(
+        SetPriceOutcome(
+            correlation_id="corr-restart-persist",
+            command_id="cmd-corr-restart-persist",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1356,
+            execution_status="PRICE_CONFIRMED",
+            accepted=True,
+            applied_addresses=(1, 2),
+            gave_up_addresses=(),
+            deferred_addresses=(),
+            detail="cd5_application_or_dc3_confirmed",
+        )
+    )
+    loop = _dual_addr_loop()
+    writes = {"n": 0}
+    from intelipump_fdc.cloud import set_price_request as spr
+
+    real_write = spr.write_persisted_unit_price
+
+    def _counting_write(*args, **kwargs):
+        writes["n"] += 1
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(spr, "write_persisted_unit_price", _counting_write)
+    await loop._apply_pending_cloud_set_price()
+    assert writes["n"] == 0
+    assert read_persisted_unit_price().unit_price_raw == 1356
+    assert read_set_price_request() is None
+

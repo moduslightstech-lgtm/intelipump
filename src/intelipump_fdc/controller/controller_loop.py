@@ -203,6 +203,11 @@ class ControllerLoop:
         self._set_price_defer_timeout_s: float = float(
             os.environ.get("INTELIPUMP_SET_PRICE_DEFER_TIMEOUT_S") or 120.0
         )
+        # corr -> unit_price_raw successfully written to unit-price.json.
+        # Waiting for sibling addresses or cloud outcome ACK must not rewrite.
+        self._cloud_set_price_unit_persisted: dict[str, int] = {}
+        self._cloud_set_price_persist_fail_count: dict[str, int] = {}
+        self._cloud_set_price_persist_next_try: dict[str, float] = {}
         self.runtime.liveness.controller_mode = runtime.safety.mode.value
         self.runtime.liveness.watchdog_enabled = runtime.notifier.enabled
         self.runtime.liveness.notify_socket_present = (
@@ -1762,6 +1767,9 @@ class ControllerLoop:
         self._cloud_set_price_gave_up.pop(corr, None)
         self._cloud_set_price_awaiting_dc3.pop(corr, None)
         self._cloud_set_price_seen_at.pop(corr, None)
+        self._cloud_set_price_unit_persisted.pop(corr, None)
+        self._cloud_set_price_persist_fail_count.pop(corr, None)
+        self._cloud_set_price_persist_next_try.pop(corr, None)
         for key in list(self._cloud_set_price_fail_count):
             if key.startswith(f"{corr}:"):
                 self._cloud_set_price_fail_count.pop(key, None)
@@ -1773,6 +1781,76 @@ class ControllerLoop:
         for key in list(self._set_price_defer_last_reason):
             if key.startswith(f"{corr}:"):
                 self._set_price_defer_last_reason.pop(key, None)
+
+    def _persist_cloud_unit_price_once(
+        self,
+        *,
+        corr: str,
+        unit_price_raw: int,
+        prices: list[int] | tuple[int, ...],
+        now: float,
+    ) -> bool:
+        """Write unit-price.json at most once per confirmed correlation/price.
+
+        Local persistence is independent of cloud outcome ACK. While a sibling
+        address is still deferred or the outcome file awaits ACK, do not rewrite
+        an already-durable price. Failures keep recoverable state and back off.
+        """
+        from intelipump_fdc.cloud.set_price_request import (
+            persisted_unit_price_matches,
+            write_persisted_unit_price,
+        )
+
+        price_tuple = tuple(prices)
+        if self._cloud_set_price_unit_persisted.get(corr) == unit_price_raw:
+            return True
+        if persisted_unit_price_matches(unit_price_raw, price_tuple):
+            self._cloud_set_price_unit_persisted[corr] = unit_price_raw
+            self._cloud_set_price_persist_fail_count.pop(corr, None)
+            self._cloud_set_price_persist_next_try.pop(corr, None)
+            logger.info(
+                "cloud_set_price_persist_already_durable",
+                correlationId=corr,
+                unitPriceRaw=unit_price_raw,
+            )
+            return True
+        next_try = self._cloud_set_price_persist_next_try.get(corr)
+        if next_try is not None and now < next_try:
+            return False
+        try:
+            path = write_persisted_unit_price(
+                unit_price_raw,
+                price_tuple,
+                source="cloud",
+            )
+        except (OSError, ValueError) as exc:
+            fails = self._cloud_set_price_persist_fail_count.get(corr, 0) + 1
+            self._cloud_set_price_persist_fail_count[corr] = fails
+            delay = min(60.0, 2.0 * (2 ** min(fails - 1, 4)))
+            self._cloud_set_price_persist_next_try[corr] = now + delay
+            logger.warning(
+                "cloud_set_price_persist_failed",
+                correlationId=corr,
+                unitPriceRaw=unit_price_raw,
+                failures=fails,
+                retryInSeconds=delay,
+                error=str(exc),
+            )
+            return False
+        self._cloud_set_price_unit_persisted[corr] = unit_price_raw
+        self._cloud_set_price_persist_fail_count.pop(corr, None)
+        self._cloud_set_price_persist_next_try.pop(corr, None)
+        logger.info(
+            "cloud_set_price_persisted",
+            correlationId=corr,
+            unitPriceRaw=unit_price_raw,
+            path=str(path),
+        )
+        print(
+            f"[CLOUD-PRICE] persisted {unit_price_raw} → {path} "
+            "(survives controller restart)"
+        )
+        return True
 
     def _set_price_dc3_miss(
         self,
@@ -1926,7 +2004,6 @@ class ControllerLoop:
             consume_set_price_request_durable,
             has_set_price_outcome,
             read_set_price_request,
-            write_persisted_unit_price,
         )
 
         pending = read_set_price_request()
@@ -2117,7 +2194,19 @@ class ControllerLoop:
                 and not awaiting_dc3
             )
             if not settled_early:
-                # Still deferred or backing off — keep request for retry when eligible.
+                # Sibling still deferred — keep request, but persist once if any
+                # address already confirmed (do not rewrite every poll).
+                if applied:
+                    prices = list(pending.prices_raw) or [pending.unit_price_raw]
+                    nozzle_n = max(1, int(self.runtime.logical_nozzle_count or 1))
+                    if len(prices) == 1 and nozzle_n > 1:
+                        prices = prices * nozzle_n
+                    self._persist_cloud_unit_price_once(
+                        corr=corr,
+                        unit_price_raw=pending.unit_price_raw,
+                        prices=prices[:nozzle_n],
+                        now=now,
+                    )
                 return
             prices = list(pending.prices_raw) or [pending.unit_price_raw]
             nozzle_n = max(1, int(self.runtime.logical_nozzle_count or 1))
@@ -2343,28 +2432,31 @@ class ControllerLoop:
             and not awaiting_dc3
         )
         if any_ok or applied:
-            try:
-                path = write_persisted_unit_price(
-                    pending.unit_price_raw,
-                    tuple(prices[:nozzle_n]),
-                    source="cloud",
-                )
-                print(
-                    f"[CLOUD-PRICE] persisted {pending.unit_price_raw} → {path} "
-                    "(survives controller restart)"
-                )
-            except (OSError, ValueError) as exc:
-                logger.warning(
-                    "cloud_set_price_persist_failed",
-                    unitPriceRaw=pending.unit_price_raw,
-                    error=str(exc),
-                )
+            self._persist_cloud_unit_price_once(
+                corr=corr,
+                unit_price_raw=pending.unit_price_raw,
+                prices=prices[:nozzle_n],
+                now=now,
+            )
 
         if settled:
             # Finish when every address succeeded or gave up — stops retry storm.
             # Outcome must be durable before the request file is removed.
             applied_final = set(applied)
             gave_up_final = set(gave_up)
+            # Local unit-price.json must land before we publish the cloud outcome
+            # when any address confirmed — retain request for bounded persist retry.
+            if (
+                applied_final
+                and self._cloud_set_price_unit_persisted.get(corr) != pending.unit_price_raw
+            ):
+                logger.warning(
+                    "cloud_set_price_settle_waiting_local_persist",
+                    correlationId=corr,
+                    unitPriceRaw=pending.unit_price_raw,
+                    applied=sorted(applied_final),
+                )
+                return
             if applied_final and not gave_up_final:
                 exec_status = "PRICE_CONFIRMED"
                 accepted = True

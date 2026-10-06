@@ -109,25 +109,39 @@ def write_persisted_unit_price(
     *,
     source: str = "cloud",
 ) -> Path:
-    """Persist last applied unit price so controller restart does not revert to --price."""
+    """Persist last applied unit price so controller restart does not revert to --price.
+
+    Uses the same temp → fsync → replace → fsync-dir path as outcomes so a
+    crash mid-write cannot leave a half-applied price file.
+    """
     if isinstance(unit_price_raw, bool) or not isinstance(unit_price_raw, int) or unit_price_raw <= 0:
         raise ValueError("unit_price_raw must be a positive integer")
     prices = tuple(prices_raw) if prices_raw else (unit_price_raw,)
     for p in prices:
         if isinstance(p, bool) or not isinstance(p, int) or p <= 0:
             raise ValueError("prices_raw entries must be positive integers")
-    path = stored_price_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "unitPriceRaw": unit_price_raw,
         "pricesRaw": list(prices),
         "source": source,
         "updatedAt": datetime.now(UTC).isoformat(),
     }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    tmp.replace(path)
-    return path
+    return _atomic_write_json(stored_price_path(), payload)
+
+
+def persisted_unit_price_matches(
+    unit_price_raw: int,
+    prices_raw: tuple[int, ...] | list[int] | None = None,
+) -> bool:
+    """True when durable unit-price.json already holds this price vector."""
+    existing = read_persisted_unit_price()
+    if existing is None:
+        return False
+    prices = tuple(prices_raw) if prices_raw else (unit_price_raw,)
+    return (
+        existing.unit_price_raw == unit_price_raw
+        and tuple(existing.prices_raw) == prices
+    )
 
 
 def read_persisted_unit_price() -> PersistedUnitPrice | None:
