@@ -497,6 +497,7 @@ async def test_sent_unverified_upgrades_on_late_dc3_without_replay(
 ) -> None:
     from intelipump_fdc.cloud.set_price_request import (
         SetPriceOutcome,
+        list_set_price_pending_verifies,
         read_persisted_unit_price,
         write_persisted_unit_price,
         write_set_price_outcome,
@@ -533,7 +534,197 @@ async def test_sent_unverified_upgrades_on_late_dc3_without_replay(
     assert len(outcomes) == 1
     assert outcomes[0].execution_status == "PRICE_CONFIRMED"
     assert set(outcomes[0].applied_addresses) == {1, 2}
+    assert list_set_price_pending_verifies() == []
     assert read_persisted_unit_price().unit_price_raw == 1365
+
+
+@pytest.mark.asyncio
+async def test_late_verify_one_target_then_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Partial late DC3 upgrades one address; second address confirms overall."""
+    from intelipump_fdc.cloud.set_price_request import (
+        SetPricePendingVerify,
+        ack_set_price_outcome,
+        list_set_price_pending_verifies,
+        write_set_price_pending_verify,
+    )
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_set_price_pending_verify(
+        SetPricePendingVerify(
+            correlation_id="corr-partial",
+            command_id="cmd-corr-partial",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1370,
+            required_addresses=(1, 2),
+            verified_addresses=(),
+            emitted_verified_addresses=(),
+        )
+    )
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.unit_price_raw = 0
+        loop.sessions[addr].state.unit_price_obs_gen = 1
+    ok = _confirmed()
+    loop._run_owned_command = ok  # type: ignore[method-assign]
+
+    # Address 1 nozzle lift → matching DC3.
+    loop.sessions[1].state.unit_price_raw = 1370
+    loop.sessions[1].state.unit_price_obs_gen = 2
+    await loop._apply_pending_cloud_set_price()
+    assert ok.await_count == 0
+    partial = list_set_price_outcomes()
+    assert len(partial) == 1
+    assert partial[0].execution_status == "PRICE_PARTIAL"
+    assert set(partial[0].applied_addresses) == {1}
+    assert set(partial[0].unverified_addresses) == {2}
+    pending = list_set_price_pending_verifies()
+    assert len(pending) == 1
+    assert set(pending[0].verified_addresses) == {1}
+
+    # Cloud ACK deletes outcome; pending-verify must still upgrade later.
+    assert ack_set_price_outcome("corr-partial")
+    assert list_set_price_outcomes() == []
+
+    # Duplicate observation of addr 1 must not rewrite or bus-command.
+    await loop._apply_pending_cloud_set_price()
+    assert list_set_price_outcomes() == []
+    assert ok.await_count == 0
+
+    # Address 2 nozzle lift → overall confirm.
+    loop.sessions[2].state.unit_price_raw = 1370
+    loop.sessions[2].state.unit_price_obs_gen = 3
+    await loop._apply_pending_cloud_set_price()
+    assert ok.await_count == 0
+    final = list_set_price_outcomes()
+    assert len(final) == 1
+    assert final[0].execution_status == "PRICE_CONFIRMED"
+    assert set(final[0].applied_addresses) == {1, 2}
+    assert final[0].unverified_addresses == ()
+    assert list_set_price_pending_verifies() == []
+
+
+@pytest.mark.asyncio
+async def test_late_verify_survives_restart_without_bus_cmds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import (
+        SetPricePendingVerify,
+        list_set_price_pending_verifies,
+        write_set_price_pending_verify,
+    )
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_set_price_pending_verify(
+        SetPricePendingVerify(
+            correlation_id="corr-restart",
+            command_id="cmd-corr-restart",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1370,
+            required_addresses=(1, 2),
+            verified_addresses=(1,),
+            emitted_verified_addresses=(1,),
+            outcome_revision=1,
+        )
+    )
+    # Fresh controller process after restart.
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.unit_price_raw = 1370
+        loop.sessions[addr].state.unit_price_obs_gen = 8
+    ok = _confirmed()
+    loop._run_owned_command = ok  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+    assert ok.await_count == 0
+    assert _command_labels(ok) == []
+    outcomes = list_set_price_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].execution_status == "PRICE_CONFIRMED"
+    assert set(outcomes[0].applied_addresses) == {1, 2}
+    assert list_set_price_pending_verifies() == []
+
+
+@pytest.mark.asyncio
+async def test_late_verify_cloud_outcome_republish_uses_status_dedupe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SENT_UNVERIFIED then PRICE_CONFIRMED must both publish (distinct dedupe)."""
+    from intelipump_fdc.cloud.command_intake import CloudCommandIntake
+    from intelipump_fdc.cloud.mqtt.models import MqttPublishResult
+    from intelipump_fdc.cloud.set_price_request import (
+        SetPriceOutcome,
+        write_set_price_outcome,
+    )
+    from intelipump_fdc.cloud.topics import TopicBuilder
+    from unittest.mock import MagicMock
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    mqtt = MagicMock()
+    mqtt.is_connected = True
+    mqtt.publish = AsyncMock(
+        return_value=MqttPublishResult(topic="t", acknowledged=True, mid=1)
+    )
+    intake = CloudCommandIntake(
+        session_factory=MagicMock(),
+        mqtt=mqtt,
+        topics=TopicBuilder(environment="PRODUCTION"),
+        station_id="LAB-1",
+        device_id="pi-001",
+        environment="PRODUCTION",
+        simulated=False,
+        allow_lab_simulator_commands=False,
+    )
+    write_set_price_outcome(
+        SetPriceOutcome(
+            correlation_id="cca2e75a-5b6f-4085-b72b-2d4066fb73c2",
+            command_id="cmd-cca2",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1370,
+            execution_status="SENT_UNVERIFIED",
+            accepted=True,
+            applied_addresses=(),
+            gave_up_addresses=(),
+            deferred_addresses=(),
+            unverified_addresses=(1, 2),
+            detail="cd5_link_ack_dc3_idle_or_timeout",
+        )
+    )
+    assert await intake.publish_pending_set_price_outcomes() == 1
+    first_payload = mqtt.publish.await_args.args[1]
+    assert "SENT_UNVERIFIED" in first_payload
+    assert "cmd-result-final:cca2e75a-5b6f-4085-b72b-2d4066fb73c2:SENT_UNVERIFIED" in (
+        first_payload
+    )
+
+    write_set_price_outcome(
+        SetPriceOutcome(
+            correlation_id="cca2e75a-5b6f-4085-b72b-2d4066fb73c2",
+            command_id="cmd-cca2",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1370,
+            execution_status="PRICE_CONFIRMED",
+            accepted=True,
+            applied_addresses=(1, 2),
+            gave_up_addresses=(),
+            deferred_addresses=(),
+            unverified_addresses=(),
+            detail="dc3_late_match_after_sent_unverified",
+        )
+    )
+    assert await intake.publish_pending_set_price_outcomes() == 1
+    second_payload = mqtt.publish.await_args.args[1]
+    assert "PRICE_CONFIRMED" in second_payload
+    assert "cmd-result-final:cca2e75a-5b6f-4085-b72b-2d4066fb73c2:PRICE_CONFIRMED" in (
+        second_payload
+    )
+    assert mqtt.publish.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -542,7 +733,10 @@ async def test_superseding_price_blocks_late_unverified_upgrade(
 ) -> None:
     from intelipump_fdc.cloud.set_price_request import (
         SetPriceOutcome,
+        SetPricePendingVerify,
+        list_set_price_pending_verifies,
         write_set_price_outcome,
+        write_set_price_pending_verify,
     )
 
     monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
@@ -562,6 +756,16 @@ async def test_superseding_price_blocks_late_unverified_upgrade(
             detail="cd5_link_ack_dc3_idle_or_timeout",
         )
     )
+    write_set_price_pending_verify(
+        SetPricePendingVerify(
+            correlation_id="corr-old",
+            command_id="cmd-corr-old",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1365,
+            required_addresses=(1, 2),
+        )
+    )
     _write_price(tmp_path, monkeypatch, "corr-new", 1400)
     loop = _dual_addr_loop()
     for addr in (1, 2):
@@ -575,6 +779,7 @@ async def test_superseding_price_blocks_late_unverified_upgrade(
     old = [o for o in list_set_price_outcomes() if o.correlation_id == "corr-old"]
     assert len(old) == 1
     assert old[0].execution_status == "SENT_UNVERIFIED"
+    assert list_set_price_pending_verifies() == []
 
 
 @pytest.mark.asyncio

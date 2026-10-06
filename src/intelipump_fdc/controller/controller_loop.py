@@ -2019,9 +2019,11 @@ class ControllerLoop:
         """
         from intelipump_fdc.cloud.set_price_request import (
             SetPriceOutcome,
+            SetPricePendingVerify,
             consume_set_price_request_durable,
             has_set_price_outcome,
             write_set_price_outcome,
+            write_set_price_pending_verify,
         )
 
         corr = pending.correlation_id
@@ -2052,6 +2054,35 @@ class ControllerLoop:
                     error=str(exc),
                 )
                 return False
+        # Retain late-verification metadata after the request is removed so a
+        # later matching DC3 can upgrade SENT_UNVERIFIED / partial outcomes
+        # without resending CD5 (survives outcome MQTT ACK + restart).
+        if unverified:
+            try:
+                write_set_price_pending_verify(
+                    SetPricePendingVerify(
+                        correlation_id=corr,
+                        command_id=pending.command_id,
+                        station_id=None,
+                        pump_id=pending.pump_id,
+                        unit_price_raw=pending.unit_price_raw,
+                        required_addresses=tuple(
+                            sorted(set(applied_final) | unverified)
+                        ),
+                        verified_addresses=tuple(sorted(applied_final)),
+                        gave_up_addresses=tuple(sorted(gave_up_final)),
+                        emitted_verified_addresses=tuple(sorted(applied_final)),
+                        outcome_revision=0,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "cloud_set_price_pending_verify_write_failed",
+                    correlationId=corr,
+                    unitPriceRaw=pending.unit_price_raw,
+                    error=str(exc),
+                )
+                # Outcome is durable; late upgrade may still migrate from it.
         try:
             consumed = consume_set_price_request_durable()
         except OSError as exc:
@@ -2093,33 +2124,73 @@ class ControllerLoop:
         return True
 
     def _maybe_upgrade_unverified_set_price_outcomes(self) -> None:
-        """Promote SENT_UNVERIFIED → PRICE_CONFIRMED on later matching DC3.
+        """Promote SENT_UNVERIFIED targets on later matching DC3 (no bus cmds).
 
-        Only while the outcome file still exists (cloud ACK not yet consumed)
-        and no newer superseding SET_PRICE request is pending.
+        Uses durable pending-verify metadata that outlives request removal and
+        cloud ACK of the initial SENT_UNVERIFIED outcome. Each newly matched
+        address upgrades the publishable outcome (PARTIAL → CONFIRMED) without
+        resending CD5 / RESET / AUTHORIZE. Superseded by a newer SET_PRICE.
         """
         from intelipump_fdc.cloud.set_price_request import (
             SetPriceOutcome,
+            SetPricePendingVerify,
+            clear_set_price_pending_verify,
             list_set_price_outcomes,
+            list_set_price_pending_verifies,
+            pending_verify_from_outcome,
             read_set_price_request,
             write_set_price_outcome,
+            write_set_price_pending_verify,
         )
 
-        pending = read_set_price_request()
+        active = read_set_price_request()
+        # Migrate leftover SENT_UNVERIFIED outcomes into pending-verify (restart
+        # / older builds that only wrote the outcome file).
+        known = {p.correlation_id for p in list_set_price_pending_verifies()}
         for outcome in list_set_price_outcomes():
-            if outcome.execution_status != "SENT_UNVERIFIED":
+            if outcome.correlation_id in known:
                 continue
-            if pending is not None and pending.correlation_id != outcome.correlation_id:
+            if active is not None and active.correlation_id != outcome.correlation_id:
+                # Newer SET_PRICE superseded this correlation — do not revive.
+                continue
+            if outcome.execution_status not in {"SENT_UNVERIFIED", "PRICE_PARTIAL"}:
+                continue
+            if not outcome.unverified_addresses:
+                continue
+            migrated = pending_verify_from_outcome(outcome)
+            if migrated is None:
+                continue
+            try:
+                write_set_price_pending_verify(migrated)
+                known.add(migrated.correlation_id)
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "cloud_set_price_pending_verify_migrate_failed",
+                    correlationId=outcome.correlation_id,
+                    error=str(exc),
+                )
+
+        for pending in list_set_price_pending_verifies():
+            if active is not None and active.correlation_id != pending.correlation_id:
                 # Newer command superseded this verification window.
+                clear_set_price_pending_verify(pending.correlation_id)
                 continue
             if (
-                pending is not None
-                and pending.unit_price_raw != outcome.unit_price_raw
+                active is not None
+                and active.correlation_id == pending.correlation_id
+                and active.unit_price_raw != pending.unit_price_raw
             ):
                 continue
-            targets = set(outcome.unverified_addresses) or set(self.sessions)
-            matched: set[int] = set(outcome.applied_addresses)
-            for addr in targets:
+
+            required = set(pending.required_addresses)
+            verified = set(pending.verified_addresses)
+            open_addrs = required - verified
+            if not open_addrs:
+                clear_set_price_pending_verify(pending.correlation_id)
+                continue
+
+            newly: set[int] = set()
+            for addr in open_addrs:
                 session = self.sessions.get(addr)
                 if session is None:
                     continue
@@ -2127,45 +2198,92 @@ class ControllerLoop:
                 if (
                     isinstance(observed, int)
                     and not isinstance(observed, bool)
-                    and observed == outcome.unit_price_raw
+                    and observed == pending.unit_price_raw
                 ):
-                    matched.add(addr)
+                    newly.add(addr)
                     self._price_programmed.add(addr)
-            still_open = targets - matched
-            if still_open and not matched:
+
+            if not newly:
                 continue
+
+            verified |= newly
+            still_open = required - verified
+            emitted = set(pending.emitted_verified_addresses)
+            if verified == emitted:
+                # Duplicate observation of an already-emitted snapshot.
+                continue
+
             if still_open:
-                # Partial late confirm — keep SENT_UNVERIFIED until all resolve
-                # or leave as-is; only upgrade when every target matches.
-                continue
+                exec_status = "PRICE_PARTIAL"
+                detail = "dc3_late_partial_after_sent_unverified"
+            else:
+                exec_status = "PRICE_CONFIRMED"
+                detail = "dc3_late_match_after_sent_unverified"
+            revision = pending.outcome_revision + 1
             upgraded = SetPriceOutcome(
-                correlation_id=outcome.correlation_id,
-                command_id=outcome.command_id,
-                station_id=outcome.station_id,
-                pump_id=outcome.pump_id,
-                unit_price_raw=outcome.unit_price_raw,
-                execution_status="PRICE_CONFIRMED",
+                correlation_id=pending.correlation_id,
+                command_id=pending.command_id,
+                station_id=pending.station_id,
+                pump_id=pending.pump_id,
+                unit_price_raw=pending.unit_price_raw,
+                execution_status=exec_status,
                 accepted=True,
-                applied_addresses=tuple(sorted(matched)),
-                gave_up_addresses=outcome.gave_up_addresses,
+                applied_addresses=tuple(sorted(verified)),
+                gave_up_addresses=pending.gave_up_addresses,
                 deferred_addresses=(),
-                unverified_addresses=(),
-                detail="dc3_late_match_after_sent_unverified",
+                unverified_addresses=tuple(sorted(still_open)),
+                detail=detail,
             )
             try:
                 write_set_price_outcome(upgraded)
             except (OSError, ValueError) as exc:
                 logger.warning(
                     "cloud_set_price_unverified_upgrade_failed",
-                    correlationId=outcome.correlation_id,
+                    correlationId=pending.correlation_id,
                     error=str(exc),
                 )
                 continue
+
+            if still_open:
+                try:
+                    write_set_price_pending_verify(
+                        SetPricePendingVerify(
+                            correlation_id=pending.correlation_id,
+                            command_id=pending.command_id,
+                            station_id=pending.station_id,
+                            pump_id=pending.pump_id,
+                            unit_price_raw=pending.unit_price_raw,
+                            required_addresses=pending.required_addresses,
+                            verified_addresses=tuple(sorted(verified)),
+                            gave_up_addresses=pending.gave_up_addresses,
+                            emitted_verified_addresses=tuple(sorted(verified)),
+                            outcome_revision=revision,
+                            created_at=pending.created_at,
+                        )
+                    )
+                except (OSError, ValueError) as exc:
+                    logger.warning(
+                        "cloud_set_price_pending_verify_update_failed",
+                        correlationId=pending.correlation_id,
+                        error=str(exc),
+                    )
+            else:
+                clear_set_price_pending_verify(pending.correlation_id)
+
             logger.info(
                 "cloud_set_price_confirmed_via_late_dc3",
-                correlationId=outcome.correlation_id,
-                unitPriceRaw=outcome.unit_price_raw,
-                applied=sorted(matched),
+                correlationId=pending.correlation_id,
+                unitPriceRaw=pending.unit_price_raw,
+                applied=sorted(verified),
+                stillUnverified=sorted(still_open),
+                executionStatus=exec_status,
+                outcomeRevision=revision,
+                newlyVerified=sorted(newly),
+            )
+            print(
+                f"[CLOUD-PRICE] late DC3 verified {sorted(newly)} for "
+                f"{pending.unit_price_raw} corr={pending.correlation_id} "
+                f"→ {exec_status} (no CD5 resend)"
             )
 
     async def _apply_pending_cloud_set_price(self) -> None:

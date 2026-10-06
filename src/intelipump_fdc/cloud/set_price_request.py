@@ -569,3 +569,199 @@ def consume_set_price_outcome() -> SetPriceOutcome | None:
     ack_set_price_outcome(first.correlation_id)
     return first
 
+
+DEFAULT_PENDING_VERIFY_DIR_NAME = "set-price-pending-verify"
+
+
+def pending_verify_dir() -> Path:
+    """Durable late-verification metadata after the request file is removed."""
+    return request_dir() / DEFAULT_PENDING_VERIFY_DIR_NAME
+
+
+def _pending_verify_file_path(correlation_id: str) -> Path:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "-_" else "_"
+        for ch in (correlation_id or "").strip()
+    )
+    if not safe:
+        raise ValueError("correlation_id required for pending-verify file")
+    return pending_verify_dir() / f"{safe}.json"
+
+
+@dataclass(frozen=True, slots=True)
+class SetPricePendingVerify:
+    """Retained after SENT_UNVERIFIED so a later matching DC3 can upgrade.
+
+    Lives independently of the execution request and of the publishable
+    outcome file (which cloud-sync ACK-deletes after MQTT delivery).
+    """
+
+    correlation_id: str
+    command_id: str
+    station_id: str | None
+    pump_id: str | None
+    unit_price_raw: int
+    required_addresses: tuple[int, ...]
+    verified_addresses: tuple[int, ...] = ()
+    gave_up_addresses: tuple[int, ...] = ()
+    # Snapshot last written as a publishable outcome (idempotent re-emit).
+    emitted_verified_addresses: tuple[int, ...] = ()
+    outcome_revision: int = 0
+    created_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "correlationId": self.correlation_id,
+            "commandId": self.command_id,
+            "stationId": self.station_id,
+            "pumpId": self.pump_id,
+            "unitPriceRaw": self.unit_price_raw,
+            "requiredAddresses": list(self.required_addresses),
+            "verifiedAddresses": list(self.verified_addresses),
+            "gaveUpAddresses": list(self.gave_up_addresses),
+            "emittedVerifiedAddresses": list(self.emitted_verified_addresses),
+            "outcomeRevision": self.outcome_revision,
+            "createdAt": self.created_at or datetime.now(UTC).isoformat(),
+            "updatedAt": datetime.now(UTC).isoformat(),
+        }
+
+
+def _parse_pending_verify_dict(raw: dict[str, Any]) -> SetPricePendingVerify | None:
+    try:
+        unit = int(raw.get("unitPriceRaw") or 0)
+    except (TypeError, ValueError):
+        unit = 0
+    if unit <= 0:
+        return None
+    corr = str(raw.get("correlationId") or "").strip()
+    cmd = str(raw.get("commandId") or corr).strip()
+    if not corr:
+        return None
+
+    def _addrs(key: str) -> tuple[int, ...]:
+        val = raw.get(key) or []
+        if not isinstance(val, list):
+            return ()
+        out: list[int] = []
+        for item in val:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return tuple(sorted(set(out)))
+
+    try:
+        revision = int(raw.get("outcomeRevision") or 0)
+    except (TypeError, ValueError):
+        revision = 0
+    required = _addrs("requiredAddresses")
+    if not required:
+        # Legacy / incomplete — nothing left to verify.
+        return None
+    return SetPricePendingVerify(
+        correlation_id=corr,
+        command_id=cmd or corr,
+        station_id=str(raw["stationId"]) if raw.get("stationId") else None,
+        pump_id=str(raw["pumpId"]) if raw.get("pumpId") else None,
+        unit_price_raw=unit,
+        required_addresses=required,
+        verified_addresses=_addrs("verifiedAddresses"),
+        gave_up_addresses=_addrs("gaveUpAddresses"),
+        emitted_verified_addresses=_addrs("emittedVerifiedAddresses"),
+        outcome_revision=max(0, revision),
+        created_at=str(raw["createdAt"]) if raw.get("createdAt") else None,
+    )
+
+
+def write_set_price_pending_verify(pending: SetPricePendingVerify) -> Path:
+    """Persist late-verification metadata (survives request clear + outcome ACK)."""
+    return _atomic_write_json(
+        _pending_verify_file_path(pending.correlation_id), pending.to_dict()
+    )
+
+
+def read_set_price_pending_verify(correlation_id: str) -> SetPricePendingVerify | None:
+    try:
+        path = _pending_verify_file_path(correlation_id)
+    except ValueError:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return _parse_pending_verify_dict(raw)
+
+
+def list_set_price_pending_verifies() -> list[SetPricePendingVerify]:
+    directory = pending_verify_dir()
+    if not directory.is_dir():
+        return []
+    out: list[SetPricePendingVerify] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        parsed = _parse_pending_verify_dict(raw)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
+def clear_set_price_pending_verify(correlation_id: str) -> bool:
+    try:
+        path = _pending_verify_file_path(correlation_id)
+    except ValueError:
+        return False
+    if not path.is_file():
+        return False
+    with contextlib.suppress(OSError):
+        path.unlink()
+        return not path.is_file()
+    return False
+
+
+def supersede_set_price_pending_verifies(*, except_correlation_id: str | None = None) -> int:
+    """Drop late-verify records superseded by a newer SET_PRICE command."""
+    cleared = 0
+    for pending in list_set_price_pending_verifies():
+        if (
+            except_correlation_id
+            and pending.correlation_id.strip() == except_correlation_id.strip()
+        ):
+            continue
+        if clear_set_price_pending_verify(pending.correlation_id):
+            cleared += 1
+    return cleared
+
+
+def pending_verify_from_outcome(outcome: SetPriceOutcome) -> SetPricePendingVerify | None:
+    """Build late-verify metadata from a SENT_UNVERIFIED / partial outcome."""
+    open_addrs = tuple(sorted(set(outcome.unverified_addresses)))
+    applied = tuple(sorted(set(outcome.applied_addresses)))
+    if outcome.execution_status == "PRICE_CONFIRMED":
+        return None
+    if not open_addrs and outcome.execution_status != "SENT_UNVERIFIED":
+        return None
+    required = tuple(sorted(set(open_addrs) | set(applied)))
+    if not required:
+        return None
+    return SetPricePendingVerify(
+        correlation_id=outcome.correlation_id,
+        command_id=outcome.command_id,
+        station_id=outcome.station_id,
+        pump_id=outcome.pump_id,
+        unit_price_raw=outcome.unit_price_raw,
+        required_addresses=required,
+        verified_addresses=applied,
+        gave_up_addresses=tuple(sorted(set(outcome.gave_up_addresses))),
+        emitted_verified_addresses=applied,
+        outcome_revision=0,
+    )
+

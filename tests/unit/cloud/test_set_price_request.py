@@ -110,6 +110,46 @@ def test_outcomes_retain_multiple_correlations_without_overwrite(
     assert left[0].execution_status == "PRICE_FAILED"
 
 
+def test_pending_verify_survives_outcome_ack_and_supersede(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from intelipump_fdc.cloud.set_price_request import (
+        SetPricePendingVerify,
+        clear_set_price_pending_verify,
+        list_set_price_pending_verifies,
+        read_set_price_pending_verify,
+        supersede_set_price_pending_verifies,
+        write_set_price_pending_verify,
+    )
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_set_price_pending_verify(
+        SetPricePendingVerify(
+            correlation_id="corr-pv",
+            command_id="cmd-pv",
+            station_id=None,
+            pump_id="pump-1",
+            unit_price_raw=1370,
+            required_addresses=(1, 2),
+            verified_addresses=(1,),
+            emitted_verified_addresses=(1,),
+            outcome_revision=1,
+        )
+    )
+    got = read_set_price_pending_verify("corr-pv")
+    assert got is not None
+    assert got.unit_price_raw == 1370
+    assert set(got.verified_addresses) == {1}
+    write_set_price_outcome(_outcome("corr-pv", "pump-1", status="PRICE_PARTIAL"))
+    assert ack_set_price_outcome("corr-pv") is True
+    # Outcome gone; pending-verify retained.
+    assert list_set_price_outcomes() == []
+    assert read_set_price_pending_verify("corr-pv") is not None
+    assert supersede_set_price_pending_verifies(except_correlation_id="corr-new") == 1
+    assert list_set_price_pending_verifies() == []
+    assert clear_set_price_pending_verify("corr-pv") is False
+
+
 def test_legacy_single_outcome_file_migrates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

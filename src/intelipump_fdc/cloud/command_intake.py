@@ -174,7 +174,10 @@ class CloudCommandIntake:
                 station_id=station_id,
                 sequence=self._seq,
                 simulated=self._simulated,
-                deduplication_key=f"cmd-result-final:{outcome.correlation_id}",
+                deduplication_key=(
+                    f"cmd-result-final:{outcome.correlation_id}:"
+                    f"{outcome.execution_status}"
+                ),
                 payload=result_payload,
                 pump_id=pump_id,
                 correlation_id=outcome.correlation_id,
@@ -399,6 +402,15 @@ class CloudCommandIntake:
             else:
                 try:
                     unit_price, prices = parse_prices_from_payload(cmd.payload)
+                    from intelipump_fdc.cloud.set_price_request import (
+                        supersede_set_price_pending_verifies,
+                    )
+
+                    # A newer SET_PRICE supersedes late verification of older
+                    # SENT_UNVERIFIED correlations on this device.
+                    supersede_set_price_pending_verifies(
+                        except_correlation_id=cmd.correlationId
+                    )
                     path = write_set_price_request(
                         SetPriceRequest(
                             correlation_id=cmd.correlationId,
