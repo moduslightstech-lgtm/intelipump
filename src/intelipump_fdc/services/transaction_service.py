@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import structlog
+
 from intelipump_fdc.cloud.fill_throttle import FillPublishBook
 from intelipump_fdc.persistence.dto import TransactionRecord
 from intelipump_fdc.persistence.unit_of_work import UnitOfWork
@@ -10,6 +12,8 @@ from intelipump_fdc.services.transaction_models import (
     CompleteTransactionRequest,
     FillingUpdateRequest,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 class TransactionService:
@@ -181,7 +185,27 @@ class TransactionService:
                     raw_amount=tx.raw_amount,
                     is_final=True,
                 )
-            if req.publish_completion:
+            publish = bool(req.publish_completion)
+            if publish:
+                # 15s covers settle↔hang-up races without collapsing equal-value
+                # consecutive customers who share litres/amount minutes apart.
+                twin = await self._uow.transactions.find_recent_completed_same_totals(
+                    station_id=tx.station_id,
+                    pump_id=tx.pump_id,
+                    raw_volume=int(tx.raw_volume or 0),
+                    raw_amount=int(tx.raw_amount or 0),
+                    exclude_uuid=tx.transaction_uuid,
+                    within_seconds=15.0,
+                )
+                if twin is not None:
+                    publish = False
+                    logger.info(
+                        "tx_completed_publish_suppressed_same_totals",
+                        transaction_uuid=tx.transaction_uuid,
+                        kept_uuid=twin.transaction_uuid,
+                        source_completion_key=req.source_completion_key,
+                    )
+            if publish:
                 vol_dec = (
                     tx.volume_decimals if tx.volume_decimals is not None else 2
                 )

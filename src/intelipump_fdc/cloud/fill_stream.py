@@ -539,7 +539,7 @@ class LiveFillStream:
                     raw_volume=raw_volume,
                     raw_amount=raw_amount,
                     exclude_uuid=tx.transaction_uuid,
-                    within_seconds=120.0,
+                    within_seconds=15.0,
                 )
                 # Authoritative settle price is pump-observed on the TX row only.
                 # Never fill from unit-price.json (current command) or amount÷volume
@@ -566,6 +566,8 @@ class LiveFillStream:
                         price_decimals=settle_price_decimals,
                         completion_inferred=True,
                         completion_warnings=(reason,),
+                        # Short window: suppress MQTT twin of hang-up without
+                        # blocking a real equal-value sale minutes later.
                         publish_completion=already is None,
                         session_sequence=session_seq,
                     )

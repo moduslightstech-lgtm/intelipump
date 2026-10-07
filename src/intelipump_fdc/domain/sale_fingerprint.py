@@ -57,7 +57,13 @@ def stable_completion_key(
     transaction_uuid: str | None,
     fingerprint: str,
 ) -> str:
-    """Prefer sale UUID; fall back to fingerprint for retries of the same sale."""
+    """Prefer sale UUID; fall back to fingerprint for retries of the same sale.
+
+    Equal-value consecutive customers (same litres/amount/price) share a
+    fingerprint; UUID keeps their completion keys distinct. Cross-path doubles
+    (settle vs hang-up) are suppressed via ``find_recent_completed_same_totals``,
+    not by collapsing keys onto the fingerprint.
+    """
     if transaction_uuid:
         return f"complete:{transaction_uuid}"
     return f"complete-fp:{fingerprint}"

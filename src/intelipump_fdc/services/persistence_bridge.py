@@ -957,6 +957,42 @@ class PersistenceBridge:
                             nozzleId=nozzle_id,
                             fingerprint=fp,
                         )
+                    # Sidecar settle / prior hang-up may already have posted these
+                    # face totals under a different UUID. Do not mint+publish again.
+                    # Sidecar settle / prior hang-up may already have posted these
+                    # face totals under a different UUID. Short window only — do
+                    # not suppress a real equal-value consecutive customer.
+                    twin = await uow.transactions.find_recent_completed_same_totals(
+                        station_id=self._station_id,
+                        pump_id=pump_db,
+                        raw_volume=int(vol_raw),
+                        raw_amount=int(amt_raw),
+                        exclude_uuid=active_tx_s,
+                        within_seconds=15.0,
+                    )
+                    if twin is not None:
+                        logger.info(
+                            "duplicate_completion_suppressed_same_totals",
+                            stationId=self._station_id,
+                            pumpId=logical,
+                            nozzleId=nozzle_id,
+                            keptUuid=twin.transaction_uuid,
+                            skippedCandidate=active_tx_s,
+                            fingerprint=fp,
+                        )
+                        self._tx_by_address[address] = twin.transaction_uuid
+                        await uow.nozzle_baselines.upsert_baseline(
+                            station_id=self._station_id,
+                            pump_id=pump_db,
+                            dart_address=address,
+                            nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
+                            fingerprint=fp,
+                            raw_volume=int(vol_raw),
+                            raw_amount=int(amt_raw),
+                            transaction_uuid=twin.transaction_uuid,
+                            mark_published=True,
+                        )
+                        return
                     complete_uuid = await self._ensure_open_sale(
                         uow,
                         address=address,
