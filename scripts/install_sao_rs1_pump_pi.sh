@@ -119,17 +119,38 @@ if [[ "$PRODUCT" != "PMS" && "$PRODUCT" != "AGO" ]]; then
   echo "Invalid --product ${PRODUCT}; expected PMS or AGO." >&2
   exit 2
 fi
-if [[ -z "$PRICE" ]]; then
-  if [[ "$PRODUCT" == "AGO" ]]; then
-    PRICE=1875
-  else
-    PRICE=1400
-  fi
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPO_ROOT"
+
+# Never silently apply template default 1400/1875 over a live SAO unit.
+# Prefer: explicit --price → existing ExecStart --price → refuse.
+PRICE_EXPLICIT=0
+if [[ -n "${PRICE}" ]]; then
+  PRICE_EXPLICIT=1
+fi
+if [[ -z "$PRICE" && -f /etc/systemd/system/intelipump.service ]]; then
+  EXISTING_PRICE="$(
+    sed -n 's/.*--price \([0-9][0-9]*\).*/\1/p' /etc/systemd/system/intelipump.service | head -1 || true
+  )"
+  if [[ -n "$EXISTING_PRICE" ]]; then
+    PRICE="$EXISTING_PRICE"
+    echo "==> Preserving installed unit price --price ${PRICE} (pass --price to override)"
+  fi
+fi
+if [[ -z "$PRICE" ]]; then
+  echo "Refused: --price not set and no existing intelipump.service --price found." >&2
+  echo "SAO reinstall must not default to 1400/1875. Pass --price N (verified face/raw)." >&2
+  exit 2
+fi
+if ! [[ "$PRICE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid --price ${PRICE}; expected positive integer." >&2
+  exit 2
+fi
+if [[ "$PRICE_EXPLICIT" -eq 1 ]]; then
+  echo "==> Using explicit --price ${PRICE}"
+fi
 
 printf -v DEVICE_ID "InteliPump-SAO-RS1-pi-%03d" "$PUMP_NUM"
 PUMP_CODE="pump-${PUMP_NUM}"
@@ -140,6 +161,8 @@ MAP_SRC="${REPO_ROOT}/${MAP_REL}"
 if [[ "$PUMP_NUM" -eq 1 && -f "${REPO_ROOT}/config/channel_map.sao-rs1.json" && "$PRODUCT" == "PMS" ]]; then
   MAP_REL="config/channel_map.sao-rs1.json"
   MAP_SRC="${REPO_ROOT}/${MAP_REL}"
+elif [[ -f "$MAP_SRC" ]]; then
+  echo "==> Preserving existing channel map ${MAP_REL} (not rewriting identity/mappings)"
 else
   echo "==> Writing channel map ${MAP_REL} (product=${PRODUCT})"
   cat >"$MAP_SRC" <<EOF
