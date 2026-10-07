@@ -120,31 +120,19 @@ class PersistenceBridge:
         return None
 
     @staticmethod
-    def _infer_unit_price_from_totals(
+    def _estimated_unit_price_from_totals(
         raw_volume: int | None, raw_amount: int | None
     ) -> int | None:
-        """Infer ₦/L face price from minor-unit totals when DC3 wiped session price.
+        """Diagnostic amount÷volume estimate — never authoritative sale price.
 
-        SAO amount/volume are 2 dp minor units; face price is integer naira/L.
-        Require a tight match so random totals cannot invent a price.
+        Rounded volumes make genuine 1355 sales look like 1351 or 1358
+        (e.g. amount=100000/volume=74, amount=110000/volume=81).
         """
-        if (
-            not isinstance(raw_volume, int)
-            or not isinstance(raw_amount, int)
-            or isinstance(raw_volume, bool)
-            or isinstance(raw_amount, bool)
-            or raw_volume <= 0
-            or raw_amount <= 0
-        ):
-            return None
-        inferred = int(round(raw_amount / raw_volume))
-        if inferred <= 0:
-            return None
-        expected = raw_volume * inferred
-        tol = max(inferred, raw_volume, 1)
-        if abs(raw_amount - expected) > tol:
-            return None
-        return inferred
+        from intelipump_fdc.domain.sale_price_provenance import (
+            estimate_unit_price_from_totals,
+        )
+
+        return estimate_unit_price_from_totals(raw_volume, raw_amount)
 
     @staticmethod
     def _observed_price_decimals(detail_payload: dict[str, Any] | None) -> int | None:
@@ -842,11 +830,21 @@ class PersistenceBridge:
                     nozzle = detail_payload.get("selected_nozzle")
                     nozzle_id = nozzle if isinstance(nozzle, int) else None
                     price_raw = self._observed_unit_price_raw(detail_payload)
+                    estimated_price_raw = None
                     if price_raw is None:
-                        price_raw = self._infer_unit_price_from_totals(
+                        estimated_price_raw = self._estimated_unit_price_from_totals(
                             int(vol_raw) if isinstance(vol_raw, int) else None,
                             int(amt_raw) if isinstance(amt_raw, int) else None,
                         )
+                        if estimated_price_raw is not None:
+                            logger.info(
+                                "sale_price_estimated_from_totals_not_authoritative",
+                                stationId=self._station_id,
+                                dartAddress=address,
+                                estimatedUnitPriceRaw=estimated_price_raw,
+                                rawVolume=vol_raw,
+                                rawAmount=amt_raw,
+                            )
                     price_decimals = self._observed_price_decimals(detail_payload)
                     if price_decimals is None and price_raw is not None:
                         price_decimals = 0
@@ -998,6 +996,18 @@ class PersistenceBridge:
                                 "fingerprint": fp,
                                 "completion_inferred": completion_inferred,
                                 "warnings": list(warn_tuple),
+                                "price_source": (
+                                    "pump_observed"
+                                    if price_raw is not None
+                                    else None
+                                ),
+                                "price_uncertain": price_raw is None,
+                                "estimated_unit_price_raw": estimated_price_raw,
+                                "estimated_price_uncertain": (
+                                    True
+                                    if estimated_price_raw is not None
+                                    else None
+                                ),
                             },
                         )
                     # Cloud/MQTT publish deferred unless automatic_transaction_publishing

@@ -311,4 +311,64 @@ async def test_complete_publishes_face_naira_when_price_decimals_omitted(
     assert payload.get("price_decimals") == 0
     assert payload.get("pricePerLiter") == "1355.00"
     assert payload.get("pricePerLitre") == "1355.00"
+    assert payload.get("priceUncertain") is False
+    assert payload.get("priceSource") == "pump_observed"
+
+
+@pytest.mark.asyncio
+async def test_complete_without_observed_price_marks_uncertain_keeps_totals(
+    engine_factory: tuple,
+) -> None:
+    """Missing pump-observed price stays uncertain; amount/litres preserved.
+
+    Rounded-volume estimate (100000/74→1351) is diagnostic only — never
+    becomes pricePerLiter.
+    """
+    _engine, factory = engine_factory
+    pump_id = await _pump(factory)
+    async with unit_of_work(factory) as uow:
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="SAO-Redeemed-Station-1",
+                pump_db_id=pump_id,
+                transaction_uuid="tx-sao-price-uncertain",
+                nozzle_id=1,
+                raw_price=None,
+                price_decimals=None,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="PRODUCTION",
+                canonical_pump_id="pump-5",
+                canonical_nozzle_id="1",
+                source_identifier="pump-5",
+            )
+        )
+        await svc.complete(
+            CompleteTransactionRequest(
+                transaction_uuid="tx-sao-price-uncertain",
+                source_completion_key="done:tx-sao-price-uncertain",
+                raw_volume=74,
+                raw_amount=100000,
+                raw_price=None,
+                price_decimals=None,
+            )
+        )
+        sold = await uow.transactions.get_by_uuid("tx-sao-price-uncertain")
+        batch = await uow.sync_queue.claim_batch(limit=20)
+    assert sold is not None
+    assert sold.raw_volume == 74
+    assert sold.raw_amount == 100000
+    assert sold.raw_price is None
+    completed = [row for row in batch if row.event_type == "TRANSACTION_COMPLETED"]
+    assert completed
+    payload = completed[0].payload
+    assert payload.get("priceUncertain") is True
+    assert payload.get("pricePerLiter") is None
+    assert payload.get("raw_unit_price") is None
+    assert payload.get("volumeLitres") == "0.74"
+    assert payload.get("amount") == "1000.00"
+    assert payload.get("estimatedUnitPriceRaw") == 1351
+    assert payload.get("estimatedPriceUncertain") is True
 

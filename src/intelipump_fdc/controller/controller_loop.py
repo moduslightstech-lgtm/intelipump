@@ -1568,15 +1568,19 @@ class ControllerLoop:
                         ExchangeResultStatus.APPLICATION_CONFIRMED,
                     }:
                         self._price_programmed.add(addr)
-                        # Seed session face price immediately. Idle DC3 often
-                        # reports 0 after CD5; without this, hang-up sales store
-                        # raw_price=NULL → cloud price_per_liter=0.00.
-                        if (
-                            isinstance(self.runtime.startup_unit_price, int)
-                            and self.runtime.startup_unit_price > 0
-                        ):
-                            session.state.unit_price_raw = (
-                                self.runtime.startup_unit_price
+                        price = self.runtime.startup_unit_price
+                        if isinstance(price, int) and price > 0:
+                            self._note_command_price_lifecycle(
+                                session,
+                                unit_price_raw=price,
+                                link_acked=(
+                                    result.status
+                                    is ExchangeResultStatus.LINK_ACKNOWLEDGED
+                                ),
+                                application_confirmed=(
+                                    result.status
+                                    is ExchangeResultStatus.APPLICATION_CONFIRMED
+                                ),
                             )
 
         if flags.automatic_reset and addr not in self._startup_reset_done:
@@ -1655,6 +1659,37 @@ class ControllerLoop:
         return Path(
             os.environ.get("INTELIPUMP_AUTHORIZE_REQUEST_DIR", "/var/lib/intelipump")
         )
+
+    @staticmethod
+    def _note_command_price_lifecycle(
+        session: PumpSession,
+        *,
+        unit_price_raw: int,
+        link_acked: bool = False,
+        application_confirmed: bool = False,
+    ) -> None:
+        """Record command-path prices without making them sale-authoritative.
+
+        When the commanded price differs from the last pump-observed face,
+        clear ``unit_price_raw`` so a subsequent sale cannot inherit a stale
+        observation across a price-change lifecycle. Idle DC3 zeros never
+        clear a positive observation (handled in pump_session).
+        """
+        if not isinstance(unit_price_raw, int) or unit_price_raw <= 0:
+            return
+        session.state.requested_unit_price_raw = unit_price_raw
+        if link_acked:
+            session.state.link_acked_unit_price_raw = unit_price_raw
+        if application_confirmed:
+            session.state.application_confirmed_unit_price_raw = unit_price_raw
+        observed = session.state.unit_price_raw
+        if (
+            isinstance(observed, int)
+            and not isinstance(observed, bool)
+            and observed > 0
+            and observed != unit_price_raw
+        ):
+            session.state.unit_price_raw = None
 
     def _capture_completed_sale_snapshot(self, session: PumpSession) -> bool:
         """Record completed-sale amount/volume/identity before any RESET.
@@ -2815,11 +2850,16 @@ class ControllerLoop:
                         isinstance(pending.unit_price_raw, int)
                         and pending.unit_price_raw > 0
                     ):
-                        session.state.unit_price_raw = pending.unit_price_raw
+                        self._note_command_price_lifecycle(
+                            session,
+                            unit_price_raw=pending.unit_price_raw,
+                            application_confirmed=True,
+                        )
                     any_ok = True
                 elif result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED:
                     # Link ACK alone is NOT confirmed success — await matching
                     # DC3. Idle DC3 often reports 0; that must not resend CD5.
+                    # LINK_ACK must never become authoritative sale unit_price_raw.
                     awaiting_dc3.add(addr)
                     unverified.discard(addr)
                     self._cloud_set_price_dc3_baseline[f"{corr}:{addr}"] = int(
@@ -2830,13 +2870,15 @@ class ControllerLoop:
                     )
                     self._cloud_set_price_verify_reads[f"{corr}:{addr}"] = 0
                     self._price_programmed.add(addr)
-                    # Seed session so hang-up sales keep face price while DC3
-                    # verification is still pending (idle DC3 may report 0).
                     if (
                         isinstance(pending.unit_price_raw, int)
                         and pending.unit_price_raw > 0
                     ):
-                        session.state.unit_price_raw = pending.unit_price_raw
+                        self._note_command_price_lifecycle(
+                            session,
+                            unit_price_raw=pending.unit_price_raw,
+                            link_acked=True,
+                        )
                     logger.info(
                         "cloud_set_price_link_ack_awaiting_dc3",
                         address=addr,

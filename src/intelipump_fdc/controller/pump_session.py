@@ -1194,9 +1194,8 @@ class PumpSession:
                     ),
                     "filled_volume_raw": self.state.filled_volume_raw,
                     "filled_amount_raw": self.state.filled_amount_raw,
-                    # Hang-up sale publish must carry DC3/session face price.
-                    # Without this, TRANSACTION_COMPLETED omits unit price and
-                    # cloud stores 0.00 (Sales shows Unknown).
+                    # Pump-observed positive DC3 only. LINK_ACK / commanded price
+                    # must not appear here as authoritative sale price.
                     "filling_price_raw": self.state.unit_price_raw,
                     "unit_price_raw": self.state.unit_price_raw,
                     "raw_price": self.state.unit_price_raw,
@@ -1204,6 +1203,15 @@ class PumpSession:
                     if isinstance(self.state.unit_price_raw, int)
                     and self.state.unit_price_raw > 0
                     else None,
+                    "price_uncertain": not (
+                        isinstance(self.state.unit_price_raw, int)
+                        and self.state.unit_price_raw > 0
+                    ),
+                    "requested_unit_price_raw": self.state.requested_unit_price_raw,
+                    "link_acked_unit_price_raw": self.state.link_acked_unit_price_raw,
+                    "application_confirmed_unit_price_raw": (
+                        self.state.application_confirmed_unit_price_raw
+                    ),
                 },
             )
         )

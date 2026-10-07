@@ -199,16 +199,24 @@ class TransactionService:
                 raw_price = tx.raw_price
                 amount = round(raw_amt / (10**amt_dec), 2)
                 volume_litres = round(raw_vol / (10**vol_dec), 2)
-                price_per_litre = (
-                    round(int(raw_price) / (10**price_dec), 2)
-                    if isinstance(raw_price, int) and raw_price > 0
-                    else None
-                )
                 # Wire as decimal strings — envelope forbids float money keys.
                 amount_s = f"{amount:.2f}"
                 volume_s = f"{volume_litres:.2f}"
-                price_s = (
-                    f"{price_per_litre:.2f}" if price_per_litre is not None else None
+                from intelipump_fdc.domain.sale_price_provenance import (
+                    sale_price_mqtt_fields,
+                )
+
+                price_fields = sale_price_mqtt_fields(
+                    observed_raw=(
+                        int(raw_price)
+                        if isinstance(raw_price, int)
+                        and not isinstance(raw_price, bool)
+                        and raw_price > 0
+                        else None
+                    ),
+                    price_decimals=price_dec,
+                    raw_volume=raw_vol,
+                    raw_amount=raw_amt,
                 )
                 completed_iso = (
                     tx.completed_at.isoformat() if tx.completed_at else None
@@ -229,8 +237,6 @@ class TransactionService:
                         "nozzleId": mqtt_nozzle,
                         "sourceIdentifier": source,
                         "product": None,
-                        "raw_unit_price": tx.raw_price,
-                        "price_decimals": tx.price_decimals,
                         "raw_volume": tx.raw_volume,
                         "volume_decimals": vol_dec,
                         "raw_amount": tx.raw_amount,
@@ -239,8 +245,7 @@ class TransactionService:
                         "amountMinorUnits": raw_amt,
                         "volumeLitres": volume_s,
                         "volumeMinorUnits": raw_vol,
-                        "pricePerLitre": price_s,
-                        "pricePerLiter": price_s,
+                        **price_fields,
                         "started_at": (
                             tx.started_at.isoformat() if tx.started_at else None
                         ),

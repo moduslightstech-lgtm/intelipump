@@ -159,6 +159,7 @@ def test_filling_completed_state_changed_carries_session_unit_price() -> None:
     assert completed[0].get("filling_price_raw") == 1355
     assert completed[0].get("raw_price") == 1355
     assert completed[0].get("price_decimals") == 0
+    assert completed[0].get("price_uncertain") is False
 
 
 def test_repeated_nozzle_in_does_not_restart_timer() -> None:

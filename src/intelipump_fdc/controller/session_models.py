@@ -162,8 +162,16 @@ class PumpSessionState:
     logical_nozzle: int | None = None
     filled_volume_raw: int = 0
     filled_amount_raw: int = 0
+    # --- Unit-price provenance (per dart address / session) ---
+    # Requested via SET_PRICE / startup CD5 (command intent, not sale price).
+    requested_unit_price_raw: int | None = None
+    # LINK_ACK of CD5 — pump accepted the frame; not authoritative for sales.
+    link_acked_unit_price_raw: int | None = None
+    # APPLICATION_CONFIRMED of CD5 — still not sale price without DC3 face.
+    application_confirmed_unit_price_raw: int | None = None
+    # Pump-observed positive DC3 face price — ONLY field used for sale raw_price.
     unit_price_raw: int | None = None
-    # Bumped whenever a DC3 (or other frame) supplies filling_price_raw so
+    # Bumped whenever a DC3 supplies a positive filling_price_raw so
     # LINK_ACK confirmations can require a fresh observation after CD5.
     unit_price_obs_gen: int = 0
     last_valid_frame_time: float | None = None

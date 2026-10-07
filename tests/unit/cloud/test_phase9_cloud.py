@@ -566,6 +566,98 @@ async def test_live_fill_stream_does_not_settle_during_live_fill(
 
 
 @pytest.mark.asyncio
+async def test_live_fill_stream_does_not_fill_price_from_persisted_command(
+    db_factory: async_sessionmaker[AsyncSession],
+    topics: TopicBuilder,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old hang-up sale must not inherit a newer unit-price.json command price."""
+    from intelipump_fdc.cloud.set_price_request import write_persisted_unit_price
+
+    monkeypatch.setenv("INTELIPUMP_SET_PRICE_REQUEST_DIR", str(tmp_path))
+    write_persisted_unit_price(1400, (1400,), source="cloud")
+
+    mqtt = FakeMqttClient(host="no-persist-price")
+    await mqtt.connect()
+    started = datetime.now(UTC)
+    async with unit_of_work(db_factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id="InteliPump-US-Lab",
+            logical_pump_id="pump-5",
+            dart_address=5,
+        )
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="InteliPump-US-Lab",
+                pump_db_id=pump.id,
+                transaction_uuid="tx-old-no-price",
+                nozzle_id=1,
+                raw_price=None,
+                price_decimals=None,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="PRODUCTION",
+                canonical_pump_id="pump-5",
+                canonical_nozzle_id="1",
+                source_identifier="pump-5",
+            )
+        )
+        await svc.update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-old-no-price",
+                raw_volume=74,
+                raw_amount=100000,
+                event_key="fill:tx-old-no-price:74:100000",
+            )
+        )
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump.id,
+            context=PumpContext(
+                pump_id="pump-5",
+                dart_address=5,
+                current_state=PumpState.FILLING_COMPLETE,
+                previous_state=PumpState.FILLING,
+                active_transaction_id="tx-old-no-price",
+                communication_healthy=True,
+                state_version=1,
+            ),
+            observed_at=started,
+        )
+
+    stream = LiveFillStream(
+        session_factory=db_factory,
+        mqtt=mqtt,
+        topics=topics,
+        fill_book=FillPublishBook(),
+        device_id="InteliPump-SAO-RS1-pi-005",
+        station_id="InteliPump-US-Lab",
+        environment="PRODUCTION",
+        simulated=False,
+        settle_seconds=4.0,
+    )
+    # First tick seeds meter baseline; second tick after settle_seconds completes.
+    await stream.publish_active_fills(now=started)
+    await stream.publish_active_fills(now=started + timedelta(seconds=5))
+    async with unit_of_work(db_factory) as uow:
+        sold = await uow.transactions.get_by_uuid("tx-old-no-price")
+        assert sold is not None
+        assert sold.status == "COMPLETED"
+        assert sold.raw_volume == 74
+        assert sold.raw_amount == 100000
+        assert sold.raw_price is None  # not 1400 from unit-price.json
+        batch = await uow.sync_queue.claim_batch(limit=20)
+    completed = [row for row in batch if row.event_type == "TRANSACTION_COMPLETED"]
+    assert completed
+    payload = completed[0].payload
+    assert payload.get("priceUncertain") is True
+    assert payload.get("pricePerLiter") is None
+    assert payload.get("estimatedUnitPriceRaw") == 1351
+
+
+@pytest.mark.asyncio
 async def test_live_fill_stream_force_settles_stale_filling_snapshot(
     db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
 ) -> None:
