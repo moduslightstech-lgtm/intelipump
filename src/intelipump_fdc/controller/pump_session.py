@@ -729,8 +729,46 @@ class PumpSession:
         ):
             self.state.unit_price_raw = mapped.filling_price_raw
             self.state.unit_price_obs_gen = int(self.state.unit_price_obs_gen or 0) + 1
+            # AGO whole-naira DC2 often arrived before any observed price.
+            self._resync_amount_scale_with_price()
         self.state.sale_lifecycle = self.state.sale_evidence.lifecycle
         self.evaluate_synchronized()
+
+    def _resync_amount_scale_with_price(self) -> None:
+        """Scale session totals to 2-dp ledger once pump-observed price is known.
+
+        SAO AGO wire amounts are whole naira (8.00 L × ₦1875 → wire 15000).
+        Without this late rescale, MQTT divides by 100 and the dashboard
+        shows ₦150.00 with a correct ₦1875/L face price.
+        """
+        price = self.state.unit_price_raw
+        if not isinstance(price, int) or isinstance(price, bool) or price <= 0:
+            return
+        vol = int(self.state.filled_volume_raw or 0)
+        amt = int(self.state.filled_amount_raw or 0)
+        if vol > 0 and amt > 0:
+            coerced = coerce_amount_raw_to_2dp(
+                volume_raw=vol, amount_raw=amt, unit_price_raw=price
+            )
+            if coerced != amt:
+                logger.info(
+                    "session_amount_scaled_to_2dp",
+                    address=self.address,
+                    volumeRaw=vol,
+                    wireAmountRaw=amt,
+                    scaledAmountRaw=coerced,
+                    unitPriceRaw=price,
+                )
+                self.state.filled_amount_raw = coerced
+        ev = self.state.sale_evidence
+        peak_vol = int(ev.peak_volume_raw or vol or 0)
+        peak_amt = int(ev.peak_amount_raw or 0)
+        if peak_vol > 0 and peak_amt > 0:
+            coerced_peak = coerce_amount_raw_to_2dp(
+                volume_raw=peak_vol, amount_raw=peak_amt, unit_price_raw=price
+            )
+            if coerced_peak != peak_amt:
+                ev.peak_amount_raw = coerced_peak
 
     def _note_dc2_volume(self, raw_volume: int, *, at: datetime) -> None:
         if self._last_dc2_volume != raw_volume:
@@ -907,6 +945,7 @@ class PumpSession:
             and mapped.filling_price_raw > 0
         ):
             self.state.unit_price_raw = mapped.filling_price_raw
+            self._resync_amount_scale_with_price()
         if (
             mapped.completion_evidence_key
             and mapped.completion_evidence_key in self._applied_completion_keys
@@ -1148,6 +1187,8 @@ class PumpSession:
         context: PumpContext,
         completion_evidence_key: str | None,
     ) -> None:
+        # Hang-up publish must carry 2-dp ledger amount once face price is known.
+        self._resync_amount_scale_with_price()
         self.events.publish(
             ControllerEvent(
                 type=ControllerEventType.STATE_CHANGED,

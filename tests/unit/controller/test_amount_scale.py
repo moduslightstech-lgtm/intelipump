@@ -42,6 +42,27 @@ def test_scales_ago_live_ticks_whole_naira() -> None:
     )
 
 
+def test_scales_ago_8l_15000_wire_with_1875_price() -> None:
+    """Regression: dashboard showed ₦150 for an 8 L × ₦1875 AGO sale.
+
+    Wire whole-naira 15000 must become ledger 1500000 (₦15,000.00) once
+    pump-observed 1875 is known — including when price arrives after DC2.
+    """
+    assert (
+        coerce_amount_raw_to_2dp(
+            volume_raw=800, amount_raw=15000, unit_price_raw=1875
+        )
+        == 1500000
+    )
+    # Without price, leave wire unchanged (cannot invent scale).
+    assert (
+        coerce_amount_raw_to_2dp(
+            volume_raw=800, amount_raw=15000, unit_price_raw=None
+        )
+        == 15000
+    )
+
+
 def test_leaves_already_2dp_amount_unchanged() -> None:
     assert (
         coerce_amount_raw_to_2dp(

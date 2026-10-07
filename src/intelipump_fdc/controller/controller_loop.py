@@ -1709,6 +1709,7 @@ class ControllerLoop:
         }
         if not completed:
             return True
+        session._resync_amount_scale_with_price()
         vol = ev.peak_volume_raw or session.state.filled_volume_raw
         amt = ev.peak_amount_raw or session.state.filled_amount_raw
         if vol <= 0 or amt <= 0:

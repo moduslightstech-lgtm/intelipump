@@ -845,6 +845,29 @@ class PersistenceBridge:
                                 rawVolume=vol_raw,
                                 rawAmount=amt_raw,
                             )
+                    # Late pump-observed price: rescale AGO whole-naira wire amounts
+                    # (e.g. 8.00 L × ₦1875, wire 15000 → ledger 1500000).
+                    if (
+                        price_raw is not None
+                        and isinstance(vol_raw, int)
+                        and isinstance(amt_raw, int)
+                    ):
+                        scaled_amt = coerce_amount_raw_to_2dp(
+                            volume_raw=int(vol_raw),
+                            amount_raw=int(amt_raw),
+                            unit_price_raw=price_raw,
+                        )
+                        if scaled_amt != amt_raw:
+                            logger.info(
+                                "complete_amount_scaled_to_2dp",
+                                stationId=self._station_id,
+                                dartAddress=address,
+                                volumeRaw=vol_raw,
+                                wireAmountRaw=amt_raw,
+                                scaledAmountRaw=scaled_amt,
+                                unitPriceRaw=price_raw,
+                            )
+                            amt_raw = scaled_amt
                     price_decimals = self._observed_price_decimals(detail_payload)
                     if price_decimals is None and price_raw is not None:
                         price_decimals = 0

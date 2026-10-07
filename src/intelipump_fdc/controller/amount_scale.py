@@ -4,11 +4,15 @@ US Lab pumps report amount with 2 money decimals (₦500.00 → raw 50000).
 Some field pumps (e.g. SAO RS1 PMS) report with 1 money decimal
 (₦500.0 → raw 5000) while volume stays at 2 decimals (0.37 L → raw 37).
 The SAO AGO/diesel dispenser reports whole naira on the wire
-(₦1000 → raw 1000) for the same 2-dp volume convention.
+(₦15000 → raw 15000 for an 8.00 L × ₦1875 sale) for the same 2-dp volume
+convention — without ×100 the cloud shows ₦150.00 after /100.
 
 When unit price is known, volume × price predicts the 2-dp amount. If the
 wire amount is one or two decades short of that prediction, scale it up so
 SQLite, MQTT, and the dashboard stay on the same convention as US Lab.
+
+Call again when pump-observed price arrives late (after DC2 ticks): LINK_ACK
+must not seed sale price, so early DC2 often has no price for coercion.
 """
 
 from __future__ import annotations
