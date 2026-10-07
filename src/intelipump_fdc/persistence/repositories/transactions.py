@@ -197,6 +197,8 @@ class TransactionRepository:
         raw_volume: int,
         raw_amount: int,
         completed_at: datetime | None = None,
+        raw_price: int | None = None,
+        price_decimals: int | None = None,
     ) -> tuple[TransactionRecord, bool]:
         """Complete transaction once. Returns (record, newly_completed)."""
         existing = await self.get_by_completion_key(source_completion_key)
@@ -217,6 +219,11 @@ class TransactionRepository:
         row.source_completion_key = source_completion_key
         row.raw_volume = max(row.raw_volume, raw_volume)
         row.raw_amount = max(row.raw_amount, raw_amount)
+        # Prefer hang-up observed price when provided; keep earlier fill price otherwise.
+        if isinstance(raw_price, int) and not isinstance(raw_price, bool) and raw_price > 0:
+            row.raw_price = raw_price
+        if price_decimals is not None:
+            row.price_decimals = price_decimals
         row.completed_at = now
         row.updated_at = now
         try:

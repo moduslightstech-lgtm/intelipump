@@ -96,6 +96,46 @@ def test_dc1_filling_complete_cancels_timeout() -> None:
     assert s.machine.context.completion_inferred is False
 
 
+def test_filling_completed_state_changed_carries_session_unit_price() -> None:
+    """Hang-up SALE publish must include DC3/session face price for MQTT."""
+    bus = EventBus()
+    payloads: list[dict[str, object]] = []
+
+    def _cap(event: ControllerEvent) -> None:
+        if event.type is ControllerEventType.STATE_CHANGED:
+            payloads.append(dict(event.payload or {}))
+
+    bus.add_subscriber(_cap)
+    s = _session(events=bus)
+    s.state.unit_price_raw = 1355
+    s.state.filled_volume_raw = 295
+    s.state.filled_amount_raw = 400000
+    s.machine = PumpStateMachine(
+        _filling_ctx(
+            current_state=PumpState.FILLING_COMPLETE,
+            previous_state=PumpState.FILLING,
+            awaiting_filling_complete=True,
+            nozzle_out=False,
+        )
+    )
+    s._apply_mapped(
+        MappedWayneObservation(
+            event=PumpEvent.FILLING_COMPLETED,
+            observation=ObservationRef(source_frame_raw_hex="price-bb"),
+            raw_wayne_status=5,
+            awaiting_filling_complete=False,
+            completion_evidence_key="complete:price-bb:5",
+            filling_price_raw=1355,
+        )
+    )
+    completed = [p for p in payloads if p.get("event") == "FILLING_COMPLETED"]
+    assert completed
+    assert completed[0].get("unit_price_raw") == 1355
+    assert completed[0].get("filling_price_raw") == 1355
+    assert completed[0].get("raw_price") == 1355
+    assert completed[0].get("price_decimals") == 0
+
+
 def test_repeated_nozzle_in_does_not_restart_timer() -> None:
     s = _session()
     s.machine = PumpStateMachine(

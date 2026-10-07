@@ -541,12 +541,26 @@ class LiveFillStream:
                     exclude_uuid=tx.transaction_uuid,
                     within_seconds=120.0,
                 )
+                settle_price = (
+                    tx.raw_price
+                    if isinstance(tx.raw_price, int)
+                    and not isinstance(tx.raw_price, bool)
+                    and tx.raw_price > 0
+                    else None
+                )
+                settle_price_decimals = (
+                    tx.price_decimals
+                    if settle_price is not None and tx.price_decimals is not None
+                    else (0 if settle_price is not None else None)
+                )
                 _row, newly = await TransactionService(uow).complete(
                     CompleteTransactionRequest(
                         transaction_uuid=tx.transaction_uuid,
                         source_completion_key=f"sidecar-settle:{tx.transaction_uuid}",
                         raw_volume=raw_volume,
                         raw_amount=raw_amount,
+                        raw_price=settle_price,
+                        price_decimals=settle_price_decimals,
                         completion_inferred=True,
                         completion_warnings=(reason,),
                         publish_completion=already is None,

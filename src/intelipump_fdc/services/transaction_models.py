@@ -40,6 +40,10 @@ class CompleteTransactionRequest:
     source_completion_key: str
     raw_volume: int
     raw_amount: int
+    # Pump-observed face/raw unit price at hang-up (DC3 / DC2). Required for
+    # cloud Sales ₦/L — do not leave unset when Wayne reported a price.
+    raw_price: int | None = None
+    price_decimals: int | None = None
     source_frame_ref: str | None = None
     completed_at: datetime | None = None
     completion_inferred: bool = False
