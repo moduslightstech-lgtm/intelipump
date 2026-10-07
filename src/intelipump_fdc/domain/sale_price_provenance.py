@@ -1,9 +1,10 @@
-"""Sale unit-price provenance — keep command path separate from observation.
+"""Sale unit-price provenance — keep totals estimates out of sale price.
 
-Authoritative sale ``raw_price`` / ``pricePerLiter`` must be **pump-observed**
-(positive DC3 / session face evidence). LINK_ACK and application confirmation
-of SET_PRICE are command lifecycle signals only. Amount÷volume rounding is a
-diagnostic estimate and must never be stored as observed price.
+Authoritative sale ``raw_price`` / ``pricePerLiter`` comes from session
+``unit_price_raw``: positive DC3 when available, otherwise the provisional
+face seeded after CD5 link-ack / application-confirm (idle Wayne often
+reports DC3 filling price 0). Amount÷volume rounding is diagnostic only and
+must never be stored as observed price.
 """
 
 from __future__ import annotations

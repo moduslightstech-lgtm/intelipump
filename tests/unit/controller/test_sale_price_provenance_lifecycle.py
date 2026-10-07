@@ -1,4 +1,4 @@
-"""Sale-price provenance: LINK_ACK / command must not author sale raw_price."""
+"""Sale-price provenance: CD5 link-ack seeds face; amount÷volume never does."""
 
 from __future__ import annotations
 
@@ -79,10 +79,10 @@ def _write_price(
 
 
 @pytest.mark.asyncio
-async def test_link_ack_without_app_confirm_does_not_author_sale_price(
+async def test_link_ack_seeds_provisional_face_when_dc3_idle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """LINK_ACK alone must not become session unit_price_raw (sale price)."""
+    """LINK_ACK seeds unit_price_raw so hang-up sales are not price-Unknown."""
     _write_price(tmp_path, monkeypatch, "corr-link-only", 1355)
     loop = _dual_addr_loop()
     for addr in (1, 2):
@@ -105,20 +105,20 @@ async def test_link_ack_without_app_confirm_does_not_author_sale_price(
         assert st.link_acked_unit_price_raw == 1355
         assert st.requested_unit_price_raw == 1355
         assert st.application_confirmed_unit_price_raw is None
-        assert st.unit_price_raw is None  # not sale-authoritative
+        assert st.unit_price_raw == 1355  # provisional face for idle DC3
 
-    # Sale hang-up without positive DC3 → still no observed price.
+    # Sale hang-up without positive DC3 still has programmed face.
     session = loop.sessions[1]
     session.state.filled_volume_raw = 74
     session.state.filled_amount_raw = 100000
-    assert session.state.unit_price_raw is None
+    assert session.state.unit_price_raw == 1355
 
 
 @pytest.mark.asyncio
-async def test_link_ack_clears_stale_observed_across_price_change(
+async def test_link_ack_replaces_stale_observed_across_price_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Price-change lifecycle: old observed must not survive a different CD5."""
+    """Price-change lifecycle: old face is replaced by the new CD5 command."""
     _write_price(tmp_path, monkeypatch, "corr-chg", 1400)
     loop = _dual_addr_loop()
     for addr in (1, 2):
@@ -139,7 +139,7 @@ async def test_link_ack_clears_stale_observed_across_price_change(
     for addr in (1, 2):
         st = loop.sessions[addr].state
         assert st.link_acked_unit_price_raw == 1400
-        assert st.unit_price_raw is None
+        assert st.unit_price_raw == 1400
 
 
 @pytest.mark.asyncio
@@ -163,10 +163,11 @@ async def test_delayed_dc3_and_idle_zeros_scoped_per_address(
     )
     loop._run_owned_command = link  # type: ignore[method-assign]
     await loop._apply_pending_cloud_set_price()
-    assert loop.sessions[1].state.unit_price_raw is None
+    # LINK_ACK seeds provisional 1355 on both addresses.
+    assert loop.sessions[1].state.unit_price_raw == 1355
+    assert loop.sessions[2].state.unit_price_raw == 1355
 
-    # Addr1 gets matching positive DC3; addr2 stays idle zeros.
-    loop.sessions[1].state.unit_price_raw = 1355
+    # Addr1 keeps face; clear addr2 to simulate missing seed then idle zeros.
     loop.sessions[1].state.unit_price_obs_gen = 2
     loop.sessions[2].state.unit_price_raw = None
     loop.sessions[2].state.unit_price_obs_gen = 1

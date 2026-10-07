@@ -1706,12 +1706,15 @@ class ControllerLoop:
         link_acked: bool = False,
         application_confirmed: bool = False,
     ) -> None:
-        """Record command-path prices without making them sale-authoritative.
+        """Record CD5 lifecycle and keep a provisional sale face price.
 
-        When the commanded price differs from the last pump-observed face,
-        clear ``unit_price_raw`` so a subsequent sale cannot inherit a stale
-        observation across a price-change lifecycle. Idle DC3 zeros never
-        clear a positive observation (handled in pump_session).
+        Positive DC3 still overwrites ``unit_price_raw`` (pump_session). When
+        commanded differs from the last observation, clear the stale face so
+        sales cannot inherit the old price across a change. After link-ack or
+        application-confirm, seed the commanded face when observation is
+        missing: idle Wayne DC3 often reports 0 after CD5, and without this
+        hang-up sales publish ``raw_price=null`` → cloud Unit price Unknown.
+        Amount÷volume estimates remain non-authoritative elsewhere.
         """
         if not isinstance(unit_price_raw, int) or unit_price_raw <= 0:
             return
@@ -1728,6 +1731,14 @@ class ControllerLoop:
             and observed != unit_price_raw
         ):
             session.state.unit_price_raw = None
+            observed = None
+        if link_acked or application_confirmed:
+            if not (
+                isinstance(observed, int)
+                and not isinstance(observed, bool)
+                and observed > 0
+            ):
+                session.state.unit_price_raw = unit_price_raw
 
     def _capture_completed_sale_snapshot(self, session: PumpSession) -> bool:
         """Record completed-sale amount/volume/identity before any RESET.

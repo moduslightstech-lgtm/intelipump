@@ -1235,8 +1235,8 @@ class PumpSession:
                     ),
                     "filled_volume_raw": self.state.filled_volume_raw,
                     "filled_amount_raw": self.state.filled_amount_raw,
-                    # Pump-observed positive DC3 only. LINK_ACK / commanded price
-                    # must not appear here as authoritative sale price.
+                    # Session face: positive DC3 or provisional CD5 link-ack seed.
+                    # Never amount÷volume.
                     "filling_price_raw": self.state.unit_price_raw,
                     "unit_price_raw": self.state.unit_price_raw,
                     "raw_price": self.state.unit_price_raw,
