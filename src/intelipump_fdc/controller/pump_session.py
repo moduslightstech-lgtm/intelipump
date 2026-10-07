@@ -606,11 +606,30 @@ class PumpSession:
                         "amount_decimals": (
                             amount.get("decimals") if isinstance(amount, dict) else None
                         ),
+                        # Prefer DC2 face; else session provisional (CD5 link-ack
+                        # / prior positive DC3) so sidecar settle is not Unknown.
                         "raw_price": (
-                            price.get("raw_scaled") if isinstance(price, dict) else None
+                            price.get("raw_scaled")
+                            if isinstance(price, dict)
+                            and isinstance(price.get("raw_scaled"), int)
+                            and price.get("raw_scaled") > 0
+                            else (
+                                self.state.unit_price_raw
+                                if isinstance(self.state.unit_price_raw, int)
+                                and self.state.unit_price_raw > 0
+                                else None
+                            )
                         ),
                         "price_decimals": (
-                            price.get("decimals") if isinstance(price, dict) else None
+                            price.get("decimals")
+                            if isinstance(price, dict)
+                            and isinstance(price.get("decimals"), int)
+                            else (
+                                0
+                                if isinstance(self.state.unit_price_raw, int)
+                                and self.state.unit_price_raw > 0
+                                else None
+                            )
                         ),
                     },
                 )

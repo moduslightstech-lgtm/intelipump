@@ -234,6 +234,34 @@ class TransactionRepository:
             ) from exc
         return _tx(row), True
 
+    async def enrich_price_if_missing(
+        self,
+        transaction_uuid: str,
+        *,
+        raw_price: int,
+        price_decimals: int | None = 0,
+    ) -> TransactionRecord | None:
+        """Fill raw_price on an existing row when settle published without face."""
+        if not isinstance(raw_price, int) or isinstance(raw_price, bool) or raw_price <= 0:
+            return None
+        result = await self._session.execute(
+            select(TransactionRow).where(
+                TransactionRow.transaction_uuid == transaction_uuid
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        existing = row.raw_price
+        if isinstance(existing, int) and not isinstance(existing, bool) and existing > 0:
+            return _tx(row)
+        row.raw_price = raw_price
+        if price_decimals is not None:
+            row.price_decimals = price_decimals
+        row.updated_at = datetime.now(UTC)
+        await self._session.flush()
+        return _tx(row)
+
     async def abandon_as_duplicate(
         self,
         transaction_uuid: str,

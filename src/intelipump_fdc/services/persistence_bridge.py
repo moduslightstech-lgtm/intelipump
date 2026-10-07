@@ -119,6 +119,85 @@ class PersistenceBridge:
                 return value
         return None
 
+    async def _publish_price_enrichment(
+        self,
+        uow: Any,
+        *,
+        tx: Any,
+        raw_price: int,
+        price_decimals: int | None,
+    ) -> None:
+        """Re-queue TRANSACTION_COMPLETED so cloud can COALESCE face price.
+
+        Sidecar settle often publishes first with priceUncertain; hang-up then
+        must not mint a second UUID — but cloud still needs the face price.
+        """
+        from intelipump_fdc.domain.sale_price_provenance import sale_price_mqtt_fields
+
+        pump = await uow.pumps.get_by_id(tx.pump_id)
+        source = tx.source_identifier or (pump.logical_pump_id if pump else tx.pump_id)
+        mqtt_pump = tx.canonical_pump_id or source
+        mqtt_nozzle = tx.canonical_nozzle_id
+        vol_dec = tx.volume_decimals if tx.volume_decimals is not None else 2
+        amt_dec = tx.amount_decimals if tx.amount_decimals is not None else 2
+        price_dec = (
+            price_decimals
+            if price_decimals is not None
+            else (tx.price_decimals if tx.price_decimals is not None else 0)
+        )
+        raw_vol = int(tx.raw_volume or 0)
+        raw_amt = int(tx.raw_amount or 0)
+        amount_s = f"{round(raw_amt / (10**amt_dec), 2):.2f}"
+        volume_s = f"{round(raw_vol / (10**vol_dec), 2):.2f}"
+        price_fields = sale_price_mqtt_fields(
+            observed_raw=raw_price,
+            price_decimals=price_dec,
+            raw_volume=raw_vol,
+            raw_amount=raw_amt,
+        )
+        completed_iso = tx.completed_at.isoformat() if tx.completed_at else None
+        await uow.sync_queue.enqueue_checked(
+            entity_type="transaction",
+            entity_id=tx.transaction_uuid,
+            event_type="TRANSACTION_COMPLETED",
+            payload={
+                "transaction_uuid": tx.transaction_uuid,
+                "transactionId": tx.transaction_uuid,
+                "station_id": tx.station_id,
+                "stationId": tx.station_id,
+                "pump_id": mqtt_pump,
+                "pumpId": mqtt_pump,
+                "pump_db_id": tx.pump_id,
+                "nozzle_id": mqtt_nozzle if mqtt_nozzle is not None else tx.nozzle_id,
+                "nozzleId": mqtt_nozzle,
+                "sourceIdentifier": source,
+                "product": None,
+                "raw_volume": tx.raw_volume,
+                "volume_decimals": vol_dec,
+                "raw_amount": tx.raw_amount,
+                "amount_decimals": amt_dec,
+                "amount": amount_s,
+                "amountMinorUnits": raw_amt,
+                "volumeLitres": volume_s,
+                "volumeMinorUnits": raw_vol,
+                **price_fields,
+                "started_at": tx.started_at.isoformat() if tx.started_at else None,
+                "completed_at": completed_iso,
+                "completedAt": completed_iso,
+                "final_status": "COMPLETED",
+                "status": "COMPLETED",
+                "source_completion_key": tx.source_completion_key,
+                "completion_inferred": True,
+                "priceEnrichment": True,
+                "environment": tx.environment,
+                "simulated": tx.simulated,
+            },
+            deduplication_key=(
+                f"tx-completed:{tx.station_id}:price-enrich:"
+                f"{tx.transaction_uuid}:{raw_price}"
+            ),
+        )
+
     @staticmethod
     def _estimated_unit_price_from_totals(
         raw_volume: int | None, raw_amount: int | None
@@ -957,30 +1036,60 @@ class PersistenceBridge:
                             nozzleId=nozzle_id,
                             fingerprint=fp,
                         )
-                    # Sidecar settle / prior hang-up may already have posted these
-                    # face totals under a different UUID. Do not mint+publish again.
-                    # Sidecar settle / prior hang-up may already have posted these
-                    # face totals under a different UUID. Short window only — do
-                    # not suppress a real equal-value consecutive customer.
-                    twin = await uow.transactions.find_recent_completed_same_totals(
-                        station_id=self._station_id,
-                        pump_id=pump_db,
-                        raw_volume=int(vol_raw),
-                        raw_amount=int(amt_raw),
-                        exclude_uuid=active_tx_s,
-                        within_seconds=15.0,
+                    # Sidecar settle often COMPLETED the live UUID first (null
+                    # price). Hang-up must not mint a second COMPLETED — that is
+                    # the Unknown + ₦1355 twin pair on the dashboard.
+                    mapped_or_active = (
+                        self._tx_by_address.get(address) or active_tx_s
                     )
-                    if twin is not None:
+                    already_row = (
+                        await uow.transactions.get_by_uuid(mapped_or_active)
+                        if mapped_or_active
+                        else None
+                    )
+                    if (
+                        already_row is not None
+                        and already_row.status in {"COMPLETED", "COMPLETE"}
+                        and int(already_row.raw_volume or 0) == int(vol_raw)
+                        and int(already_row.raw_amount or 0) == int(amt_raw)
+                    ):
+                        kept = already_row
+                        if price_raw is not None:
+                            enriched = await uow.transactions.enrich_price_if_missing(
+                                already_row.transaction_uuid,
+                                raw_price=int(price_raw),
+                                price_decimals=price_decimals,
+                            )
+                            if enriched is not None:
+                                kept = enriched
+                            await self._publish_price_enrichment(
+                                uow,
+                                tx=kept,
+                                raw_price=int(price_raw),
+                                price_decimals=price_decimals,
+                            )
+                        if (
+                            active_tx_s
+                            and active_tx_s != kept.transaction_uuid
+                        ):
+                            await uow.transactions.abandon_as_duplicate(
+                                active_tx_s,
+                                kept_uuid=kept.transaction_uuid,
+                                reason="hangup_same_totals_already_completed",
+                            )
                         logger.info(
                             "duplicate_completion_suppressed_same_totals",
                             stationId=self._station_id,
                             pumpId=logical,
                             nozzleId=nozzle_id,
-                            keptUuid=twin.transaction_uuid,
+                            keptUuid=kept.transaction_uuid,
                             skippedCandidate=active_tx_s,
                             fingerprint=fp,
+                            reason="active_uuid_already_completed",
+                            enrichedPrice=price_raw is not None,
+                            priceEnrichmentQueued=price_raw is not None,
                         )
-                        self._tx_by_address[address] = twin.transaction_uuid
+                        self._tx_by_address[address] = kept.transaction_uuid
                         await uow.nozzle_baselines.upsert_baseline(
                             station_id=self._station_id,
                             pump_id=pump_db,
@@ -989,7 +1098,68 @@ class PersistenceBridge:
                             fingerprint=fp,
                             raw_volume=int(vol_raw),
                             raw_amount=int(amt_raw),
-                            transaction_uuid=twin.transaction_uuid,
+                            transaction_uuid=kept.transaction_uuid,
+                            mark_published=True,
+                        )
+                        return
+                    # Exclude twin search only while the candidate is still open;
+                    # excluding a just-settled UUID hid the twin and caused mint.
+                    open_for_exclude = await self._open_uuid(uow, mapped_or_active)
+                    twin = await uow.transactions.find_recent_completed_same_totals(
+                        station_id=self._station_id,
+                        pump_id=pump_db,
+                        raw_volume=int(vol_raw),
+                        raw_amount=int(amt_raw),
+                        exclude_uuid=open_for_exclude,
+                        within_seconds=15.0,
+                    )
+                    if twin is not None:
+                        kept = twin
+                        if price_raw is not None:
+                            enriched = await uow.transactions.enrich_price_if_missing(
+                                twin.transaction_uuid,
+                                raw_price=int(price_raw),
+                                price_decimals=price_decimals,
+                            )
+                            if enriched is not None:
+                                kept = enriched
+                            await self._publish_price_enrichment(
+                                uow,
+                                tx=kept,
+                                raw_price=int(price_raw),
+                                price_decimals=price_decimals,
+                            )
+                        if (
+                            active_tx_s
+                            and active_tx_s != kept.transaction_uuid
+                        ):
+                            await uow.transactions.abandon_as_duplicate(
+                                active_tx_s,
+                                kept_uuid=kept.transaction_uuid,
+                                reason="hangup_same_totals_twin",
+                            )
+                        logger.info(
+                            "duplicate_completion_suppressed_same_totals",
+                            stationId=self._station_id,
+                            pumpId=logical,
+                            nozzleId=nozzle_id,
+                            keptUuid=kept.transaction_uuid,
+                            skippedCandidate=active_tx_s,
+                            fingerprint=fp,
+                            reason="recent_same_totals_twin",
+                            enrichedPrice=price_raw is not None,
+                            priceEnrichmentQueued=price_raw is not None,
+                        )
+                        self._tx_by_address[address] = kept.transaction_uuid
+                        await uow.nozzle_baselines.upsert_baseline(
+                            station_id=self._station_id,
+                            pump_id=pump_db,
+                            dart_address=address,
+                            nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
+                            fingerprint=fp,
+                            raw_volume=int(vol_raw),
+                            raw_amount=int(amt_raw),
+                            transaction_uuid=kept.transaction_uuid,
                             mark_published=True,
                         )
                         return
