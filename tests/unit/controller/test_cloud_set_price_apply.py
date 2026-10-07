@@ -74,7 +74,7 @@ def _completed_sale(
     *,
     nozzle: NozzlePosition = NozzlePosition.IN,
     volume: int = 2500,
-    amount: int = 33875,
+    amount: int = 3387500,  # 25.00 L × ₦1355 → 2-dp ledger
     unit_price: int = 1355,
     persisted: bool = True,
 ) -> None:
@@ -216,6 +216,30 @@ async def test_set_price_retry_after_filling_completed_becomes_eligible(
     assert outcome is not None
     assert outcome.execution_status == "PRICE_CONFIRMED"
     assert outcome.pump_id == "pump-4"
+
+
+@pytest.mark.asyncio
+async def test_sibling_filling_defers_cd5_on_idle_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Do not CD5 addr=2 while addr=1 is FILLING — pump often never ACKs."""
+    _write_price(tmp_path, monkeypatch, "corr-sibling", 1355, pump="pump-3")
+    loop = _dual_addr_loop()
+    _fresh_in(loop.sessions[2], status=ObservedStatus.RESET)
+    loop.sessions[1].state.observed_status = ObservedStatus.FILLING
+    loop.sessions[1].state.nozzle_position = NozzlePosition.OUT
+    now = time.monotonic()
+    loop.sessions[1].state.last_nozio_time = now
+    loop.sessions[1].state.last_status_time = now
+
+    ok = _confirmed()
+    loop._run_owned_command = ok  # type: ignore[method-assign]
+    await loop._apply_pending_cloud_set_price()
+
+    assert ok.await_count == 0
+    assert read_set_price_request() is not None
+    assert 2 not in loop._cloud_set_price_applied.get("corr-sibling", set())
+    assert loop._set_price_defer_reason(2, loop.sessions[2]) == "sibling_busy"
 
 
 @pytest.mark.asyncio
@@ -832,7 +856,7 @@ async def test_idle_filling_completed_fresh_in_resets_then_confirms_without_rest
     _fresh_in(loop.sessions[2], status=ObservedStatus.RESET)
     loop._last_completed_sale[1] = {
         "volume_raw": 2500,
-        "amount_raw": 33875,
+        "amount_raw": 3387500,
         "unit_price_raw": 1355,
     }
 
@@ -853,7 +877,7 @@ async def test_idle_filling_completed_fresh_in_resets_then_confirms_without_rest
     assert outcome.execution_status == "PRICE_CONFIRMED"
     assert outcome.correlation_id == "e3b51024-7154-4e28-acbc-23b29bb7101b"
     assert loop._last_completed_sale[1]["volume_raw"] == 2500
-    assert loop._last_completed_sale[1]["amount_raw"] == 33875
+    assert loop._last_completed_sale[1]["amount_raw"] == 3387500
     assert loop._last_completed_sale[1]["unit_price_raw"] == 1355
 
 
@@ -933,7 +957,7 @@ async def test_sale_persistence_failure_retains_sale_and_pending_request(
         if c.args[0].address == 1
     )
     assert loop.sessions[1].state.filled_volume_raw == 2500
-    assert loop.sessions[1].state.filled_amount_raw == 33875
+    assert loop.sessions[1].state.filled_amount_raw == 3387500
     assert loop.sessions[1].state.unit_price_raw == 1355
     assert 1 not in loop._last_completed_sale
     assert read_set_price_request() is not None

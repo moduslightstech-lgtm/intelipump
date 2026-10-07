@@ -1765,6 +1765,26 @@ class ControllerLoop:
             or status_age > self._set_price_status_fresh_s
         )
 
+    def _set_price_sibling_busy_reason(self, addr: int) -> str | None:
+        """Wayne dual-hose: CD5 on one side often gets no ACK while the other is live.
+
+        SAO one-Pi-per-pump owns dart 1+2 on the same dispenser. Logs show
+        CD5 TIMED_OUT on addr=2 while addr=1 was FILLING — RESET/status still
+        succeed. Do not block on a sibling hang-up with nozzle still OUT; that
+        path must still allow CD5 on the idle hose after hang-up capture.
+        """
+        for other, session in self.sessions.items():
+            if other == addr:
+                continue
+            status = session.state.observed_status
+            if status in {
+                ObservedStatus.AUTHORIZED,
+                ObservedStatus.FILLING,
+                ObservedStatus.SUSPENDED,
+            }:
+                return "sibling_busy"
+        return None
+
     def _set_price_defer_reason(self, addr: int, session: PumpSession) -> str | None:
         """Why this dart address must wait before RESET/CD5 (None = eligible).
 
@@ -1774,6 +1794,9 @@ class ControllerLoop:
         stale — observation ages must be refreshed via RETURN_STATUS DATA, not
         poll ACK alone, before CD5.
         """
+        sibling = self._set_price_sibling_busy_reason(addr)
+        if sibling is not None:
+            return sibling
         status = session.state.observed_status
         if status in {
             ObservedStatus.AUTHORIZED,
