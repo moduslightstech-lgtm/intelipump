@@ -102,6 +102,34 @@ class PersistenceBridge:
                 return None
         return None
 
+    @staticmethod
+    def _observed_unit_price_raw(detail_payload: dict[str, Any] | None) -> int | None:
+        """Prefer pump-observed face price from the completing event payload."""
+        if not isinstance(detail_payload, dict):
+            return None
+        for key in (
+            "filling_price_raw",
+            "raw_price",
+            "unit_price_raw",
+            "unitPriceRaw",
+            "rawUnitPrice",
+        ):
+            value = detail_payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return None
+
+    @staticmethod
+    def _observed_price_decimals(detail_payload: dict[str, Any] | None) -> int | None:
+        if not isinstance(detail_payload, dict):
+            return None
+        for key in ("price_decimals", "priceDecimals"):
+            value = detail_payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+        # Face-naira SAO path: raw 1355 means ₦1355/L when decimals omitted.
+        return 0 if PersistenceBridge._observed_unit_price_raw(detail_payload) else None
+
     def attach(self) -> None:
         self._worker.register_handler("state_changed", self._handle_state_changed)
         self._worker.register_handler("app_decoded", self._handle_app_decoded)
@@ -786,30 +814,47 @@ class PersistenceBridge:
                 if not awaiting or authoritative_complete:
                     nozzle = detail_payload.get("selected_nozzle")
                     nozzle_id = nozzle if isinstance(nozzle, int) else None
-                    price_raw = detail_payload.get("filling_price_raw")
+                    price_raw = self._observed_unit_price_raw(detail_payload)
+                    price_decimals = self._observed_price_decimals(detail_payload)
                     fp = sale_fingerprint(
                         station_id=self._station_id,
                         dart_address=address,
                         nozzle_id=nozzle_id,
                         raw_volume=int(vol_raw),
                         raw_amount=int(amt_raw),
-                        raw_price=price_raw if isinstance(price_raw, int) else None,
+                        raw_price=price_raw,
                     )
                     baseline = await uow.nozzle_baselines.get(
                         station_id=self._station_id,
                         dart_address=address,
                         nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
                     )
-                    # Only suppress when there is no open/in-progress sale UUID.
-                    # A real IDLE→FILLING→COMPLETE lifecycle always has an
-                    # active candidate or mapped open row.
+                    # Retained-display suppress: only when explicitly marked
+                    # startup_baseline / may_publish_sale=false, or fingerprint
+                    # matches with no open sale AND no filling observed this boot.
+                    # Never discard a legitimate equal-value sale after a real fill.
                     open_mapped = await self._open_uuid(
                         uow, self._tx_by_address.get(address) or active_tx_s
+                    )
+                    startup_mark = bool(
+                        detail_payload.get("startup_baseline")
+                        or detail_payload.get("may_publish_sale") is False
+                    )
+                    filling_seen = bool(
+                        detail_payload.get("filling_seen_this_boot")
+                        or detail_payload.get("filling_observed")
                     )
                     if (
                         open_mapped is None
                         and uow.nozzle_baselines.is_already_observed(baseline, fp)
+                        and (startup_mark or not filling_seen)
                     ):
+                        if not startup_mark and not filling_seen:
+                            # Ambiguous restart face — do not invent a sale,
+                            # but make uncertainty visible.
+                            self._worker.note_capture_uncertainty(
+                                reason="restart_retained_face_unconfirmed"
+                            )
                         logger.info(
                             "duplicate_transaction_ignored",
                             event_name="duplicate_transaction_ignored",
@@ -818,11 +863,16 @@ class PersistenceBridge:
                             nozzleId=nozzle_id,
                             fingerprint=fp,
                             source="startup_baseline",
+                            captureUncertainty=not startup_mark,
                         )
                         await uow.audit.append(
                             actor="controller",
                             source="state_machine",
-                            action="STARTUP_BASELINE_SUPPRESSED",
+                            action=(
+                                "CAPTURE_UNCERTAINTY_RETAINED_FACE"
+                                if not startup_mark
+                                else "STARTUP_BASELINE_SUPPRESSED"
+                            ),
                             station_id=self._station_id,
                             pump_id=pump_db,
                             previous_state=str(prev_state_s) if prev_state_s else None,
@@ -833,9 +883,25 @@ class PersistenceBridge:
                                 "raw_volume": vol_raw,
                                 "raw_amount": amt_raw,
                                 "source": "startup_baseline",
+                                "startup_baseline": startup_mark,
+                                "filling_seen": filling_seen,
                             },
                         )
                         return
+                    # Equal-value after a real fill: open_mapped or filling_seen
+                    # → proceed; mint UUID via _ensure_open_sale.
+                    if (
+                        open_mapped is None
+                        and filling_seen
+                        and uow.nozzle_baselines.is_already_observed(baseline, fp)
+                    ):
+                        logger.info(
+                            "equal_value_sale_after_restart_accepted",
+                            stationId=self._station_id,
+                            pumpId=logical,
+                            nozzleId=nozzle_id,
+                            fingerprint=fp,
+                        )
                     complete_uuid = await self._ensure_open_sale(
                         uow,
                         address=address,
@@ -858,6 +924,8 @@ class PersistenceBridge:
                             source_completion_key=key,
                             raw_volume=vol_raw,
                             raw_amount=amt_raw,
+                            raw_price=price_raw,
+                            price_decimals=price_decimals,
                             source_frame_ref=detail_payload.get("source_frame_ref"),
                             completion_inferred=completion_inferred,
                             completion_warnings=warn_tuple,

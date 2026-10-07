@@ -1,82 +1,53 @@
-# Sales reliability — requirement matrix (Stage 1+)
+# Sales reliability — requirement matrix (Stage 1+ continuation)
 
-**Branches:** `intelipump-fdc` / `DigitalTwin` @ `prod_feature`  
-**Rule:** documentation or a successful function return alone is **not** evidence.
-
-Legend: **DONE** = code + automated test asserting identities/totals/behavior | **PARTIAL** = code exists, evidence incomplete | **OPEN** | **BLOCKED** = needs physical pump / SAO ops
+**Branches:** `intelipump-fdc` @ `21e6b708…` (+ uncommitted Stage-1+ handoff work) · `DigitalTwin` @ `0e2dd6fa…` (+ uncommitted float/conflict/LAB config)  
+**Images pushed:** `kacytunde/intelipump-{api,consumer,dashboard}:lab-stage1-0e2dd6f`  
+**Rule:** docs or a bare function return ≠ evidence.
 
 | # | Requirement | Status | Evidence |
 | --- | --- | --- | --- |
-| 1 | One real completed session → one recorded sale | PARTIAL | Gates + LAB IT assert 3 sales / 3 ids; physical face match **BLOCKED** |
-| 2 | Retries/frames/reconnect/restart do not duplicate | DONE | Startup baseline tests; LAB IT duplicate replay + concurrent race → 1 row/id |
-| 3 | Durable capture before clearing evidence | PARTIAL | Write-ahead + CRITICAL; crash window A documented (`docs/safety/audit-and-durability.md`) |
-| 4 | Gaps/uncertainty visible | PARTIAL | Health pending/awaiting; `integrity_conflict`; reconcile CLI |
-| 5 | Dashboard totals traceable to transactions | DONE | `test_dashboard_completed_filter` + export arithmetic tests |
-| 6 | Historical records intact | DONE | No auto-delete/merge; preflight SQL read-only |
-| 7 | Stable sale identity (UUID session) | DONE | `complete:{uuid}` + equal-value fingerprint share / distinct keys test |
-| 8 | Identity survives persist/MQTT/restart/ACK | DONE | Outbox + `test_pi_restart_preserves_awaiting_app_ack`; LAB consumer restart |
-| 9 | Scope by station/device/address/nozzle | DONE | Station-scoped unique index + nozzle baselines |
-| 10 | Never dedupe solely by amount/time/MQTT mid | DONE | Consumer hangup + UI `saleDuplicates` tests (equal completed kept) |
-| 11 | Two equal-value consecutive sales distinct | DONE | Fingerprint test + UI test + LAB IT amounts `[5000,5000]` two ids |
-| 12 | Retained display / repeated finals no new sale | DONE | `test_startup_baseline_*` |
-| 13 | Lift-return without flow → no sale | DONE | `has_positive_delivery` gate tests |
-| 14 | Keep previous-sale values separate from new session | PARTIAL | New UUID after COMPLETED; residual fingerprint risk documented |
-| 15 | Final-data ordering / late frames / preset | PARTIAL | Awaiting FILLING_COMPLETED paths; physical late-frame **BLOCKED** |
-| 16 | Immutable final amount/volume/price | DONE | Completed finals frozen on conflict |
-| 17 | Flag uncertainty when recovery ambiguous | DONE | `integrity_conflict` unit tests |
-| 18 | Persist before clear evidence | PARTIAL | Async write-ahead; session clear while outbox in flight still possible |
-| 19 | Close queue-admit→durable write window or document | DONE | Documented unavoidable; flush-incomplete ≠ success tests |
-| 20 | Separate recovery state from upload outbox | DONE | transactions + sync_queue + baselines |
-| 21 | Retain until application ACK (not PUBACK) | DONE | `require_application_sale_ack` + AWAITING_APP_ACK recovery tests (default off) |
-| 22 | Validate ACK identity/scope | DONE | Wrong-device topic/payload ignored; wrong-sale unmatched |
-| 23 | Recover pending after restart/reconnect | DONE | Awaiting preserved across worker recreate; LAB outbox replay |
-| 24 | Disk failure: retain evidence, surface fault | DONE | Retained sales + non-zero flush exit |
-| 25 | Persistence I/O off serial loop | DONE | PersistenceWorker async |
-| 26 | Bounded resources without silent CRITICAL drop | DONE | Queue-full refuse / spill |
-| 27 | Metrics: pending, age, failures, awaiting ACK | PARTIAL | Health pending/delivered/failed/awaiting_app_ack_count |
-| 28 | Durable reconciliation ledger after upload | DONE | DELIVERED retained; reconcile CLI |
-| 29 | PG uniqueness on sale identity | DONE | Alembic 021 + LAB IT concurrent ingest |
-| 30 | Atomic sale+ingest before ACK | PARTIAL | Sale commit before SALE_COMMITTED; mqtt_messages not same TX |
-| 31 | Identical replay → success ACK, no second row | DONE | `test_sale_committed_replay` + LAB duplicate → 3 rows only |
-| 32 | Same identity conflicting finals → visible conflict | DONE | `test_sale_integrity_conflict` + ACK amount conflict leaves awaiting |
-| 33 | Equal-value different identities preserved | DONE | Consumer + UI + LAB IT |
-| 34 | No process-memory-only dedupe | DONE | PG unique + SQLite unique |
-| 35 | Preflight before uniqueness tighten | DONE | `preflight_sale_dedupe_collisions.sql` |
-| 36 | Never auto-delete/merge historical | DONE | Audits report-only |
-| 37 | Old SAO payload compatibility | DONE | Boluwaji / Phase9 tests |
-| 38 | Dashboard: no progress-as-sale | DONE | Completed+amount clause on dashboard aggregations |
-| 39 | Exact money/volume arithmetic | PARTIAL | Numeric in PG; API float at edge; Decimal export-sum tests |
-| 40 | Africa/Lagos inclusive start / exclusive-style end | DONE | `test_lagos_day_window_*` + sales day-start tests |
-| 41 | Occurrence vs receipt time policy | DONE | coalesce(completed, device, received); receipt for late flags |
-| 42 | Shift boundaries | PARTIAL | business_day_cutoff in recon; dashboard midnight |
-| 43 | Totals reconcile to export | PARTIAL | Reconcile CLI + arithmetic guards; full CSV↔summary IT open |
-| 44 | Report time + completeness warnings | PARTIAL | Reconcile warnings; dashboard incomplete |
-| 45 | Price change must not rewrite earlier totals | DONE | Completed finals frozen |
-| 46 | Reconciliation role restrictions | DONE | `require_reconciliation_access` |
-| 47 | Pi↔cloud reconcile tooling | DONE | `intelipump-sale-reconcile` |
-| 48 | LAB isolation | DONE | `verify-lab-isolation.sh` static OK; compose intelipump-lab |
-| 49 | LAB-only owned auto-auth | DONE | Env gated; not enabled in prod configs here |
-| 50 | No SAO deploy / prod mutation | DONE | Policy followed this stage |
-| 51 | Automated + integration fault tests | DONE | Unit + ephemeral LAB PG+MQTT IT (outage/restart) |
-| 52 | LAB acceptance checklist | PARTIAL | Docs ready; physical totals **BLOCKED** |
+| 1 | One completed session → one recorded sale | PARTIAL | Software IT; **physical BLOCKED** |
+| 2 | Retries/reconnect/restart no duplicate | DONE | Baseline + LAB IT + handoff recover |
+| 3 | Durable capture before clearing evidence | DONE | Handoff-first write-ahead; RESET gated until durable |
+| 4 | Gaps/uncertainty visible | DONE | `capture_uncertainty` + audit on ambiguous restart face |
+| 5 | Dashboard totals ↔ transactions | DONE | Completed filter + Decimal summary strings |
+| 6 | Historical intact | DONE | No auto-delete |
+| 7–9 | Stable scoped identity | DONE | UUID keys + station unique index |
+| 10–11 | Equal-value consecutive distinct | DONE | Fingerprint share / UUID differ; filling_seen gate |
+| 12 | Retained display no new sale | DONE | Startup baseline |
+| 13 | Lift-return no flow | DONE | Positive-delivery gate |
+| 14 | Prev sale ≠ new session | DONE | Equal-value after fill accepted; baseline only for startup mark |
+| 15 | Late frames / preset | PARTIAL | Code paths; **physical BLOCKED** |
+| 16–17 | Immutable finals / conflict flag | DONE | Price + mapping + amount/volume conflicts |
+| 18 | Persist before clear | DONE | RESET blocked while `handoff_pending` |
+| 19 | Queue→durable window | PARTIAL | Narrowed to mid-write only; see gap note |
+| 20 | Recovery ≠ outbox | DONE | |
+| 21–23 | App ACK retain/validate/recover | DONE | Unit recovery tests; LAB enable pending secrets |
+| 24–26 | Disk fault / off serial / CRITICAL bound | DONE | |
+| 27 | Metrics | PARTIAL | +handoff_pending / capture_uncertainty |
+| 28–37 | Ledger / PG unique / SAO compat / preflight | DONE | |
+| 38 | No progress-as-sale | DONE | |
+| 39 | Exact money arithmetic | DONE | `sales_summary` decimal strings; CSV Decimal |
+| 40–41 | Lagos / occurrence time | DONE | |
+| 42–44 | Shift / export reconcile / warnings | PARTIAL | CLI + arithmetic; full soak open |
+| 45–50 | Price freeze / RBAC / reconcile / LAB isolation / no SAO | DONE | |
+| 51 | Automated + IT fault tests | DONE | Process-termination + LAB IT |
+| 52 | LAB physical acceptance | **BLOCKED** | Procedure ready; needs face/totalizer evidence |
 
-## Crash windows (remaining)
+## Remaining crash gap (exact)
 
-| Window | Status |
-| --- | --- |
-| CRITICAL accept → durable spill | **Open / documented** — hard crash can lose sale |
-| MQTT PUBACK → consumer PG commit | Closed when `require_application_sale_ack=true` |
-| Consumer PG commit → Pi SALE_COMMITTED | Sale in cloud; Pi awaiting; identical replay recovers |
-| Consumer PG down → local outbox | Covered by LAB IT deferred_local → replay |
+**Condition:** process hard-killed **after** CRITICAL handoff task is scheduled and **before** `PersistRecoveryStore.upsert` fsync completes, **and** RESET somehow cleared the face (should be gated; if gate bypassed or power-loss zeroes display).  
+**Then:** no JSONL pending, no queue job, restart may only see retained face → `CAPTURE_UNCERTAINTY_RETAINED_FACE` (not silent invent).  
+**Not a gap:** after durable handoff → `recover_pending` restores identity/totals.
 
-## Stage priorities (this continuation)
+## Partial / blocked list (operator view)
 
-1. Equal-value + retained-display across restart — **tested**  
-2. Durability / crash-window docs + ledger retention — **documented + ACK path**  
-3. Application-ACK recovery — **unit PASS** (lost ACK, wrong device/sale, conflict, replay, Pi restart)  
-4. PG uniqueness / concurrent — **LAB IT PASS**  
-5. Report arithmetic / Lagos / export — **backend tests PASS**  
-6. Frontend lockfile + tests/build — **PASS** (`npm ci`, vitest 22, vite build)  
-7. Isolated LAB MQTT+PG IT — **PASS** (3 ids, ₦11370, 8.30 L)
+**PARTIAL:** 1 (physical), 15 (physical late-frame), 19 (mid-write residual), 27 (metrics polish), 42–44 (shift/export soak), LAB live stack (secrets not set).  
+**BLOCKED:** 52 physical acceptance; face/totalizer independent evidence required.
 
-Physical pump acceptance remains **BLOCKED** on independently recorded face/totalizer evidence.
+## LAB config status
+
+- `.env.lab` present; `IMAGE_TAG=lab-stage1-0e2dd6f`; `MQTT_PUBLISH_SALE_ACKS=true`
+- `lab-up` **blocked** until real LAB MQTT/Postgres/JWT secrets replace `CHANGE_ME_*`
+- Production containers not touched
+- Pi `require_application_sale_ack` not enabled (no Pi access this session)

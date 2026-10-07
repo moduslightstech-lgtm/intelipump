@@ -4,25 +4,27 @@ CRITICAL jobs (sale completion, audit) are never silently discarded:
 bounded in-memory retries, write-ahead durable spill, in-process requeue
 when the memory queue was full, and an explicit degraded health signal.
 
-Sale write-ahead (off serial loop)
----------------------------------
-``submit`` returns without fsync. After a CRITICAL job is accepted into the
-memory queue, exactly one tracked durable write task is scheduled via
-``asyncio.to_thread``. The worker awaits that same task before running the
-sale handler, so durability lands before side effects.
+Sale write-ahead (off serial loop) — durable handoff first
+---------------------------------------------------------
+CRITICAL completions schedule exactly one tracked durable write via
+``asyncio.to_thread`` **before** memory-queue accept. ``submit`` still
+returns without blocking the serial/poll loop on fsync. The job is
+``put_nowait`` only after that write succeeds (or on the rare sync
+queue-full spill path). The worker awaits the same tracked task before
+running the sale handler.
 
 Completed write tasks (success or failure) stay in ``_pending_writes`` until
 ``_await_durable_write`` consumes them, so a fast failure cannot be mistaken
 for "no write scheduled / success".
 
-Crash window (explicit)
+Crash window (narrowed)
 -----------------------
-From successful ``put_nowait`` until the tracked write task completes, a hard
-process crash can lose the sale from the recovery store (it exists only in the
-in-memory queue). The window closes when the write finishes — before the
-handler runs. Queue-full CRITICAL spills fsync synchronously on the submit
-path and have no such window. Late writes after ``mark_done`` are suppressed
-via a per-identity epoch so a stalled thread cannot recreate a done record.
+While handoff is in flight (write scheduled, not yet durable), the sale is
+not yet on the recovery store and not yet on the memory queue. Evidence must
+remain held (RESET gated via ``is_handoff_pending``) until durable. After
+durable handoff, a hard crash before SQLite is recoverable via
+``recover_pending``. Queue-full CRITICAL spills fsync synchronously on the
+submit path. Late writes after ``mark_done`` are suppressed via epoch.
 
 If the final durable spill fails after attempts are exhausted, the sale is
 retained in-memory (degraded health) for retry when storage returns — never
@@ -62,8 +64,9 @@ class PersistFlushIncompleteError(Exception):
     Those jobs are **not** safely on durable storage for process exit. Raising
     this error must never be treated as a successful / safe durability shutdown.
 
-    The unavoidable hard-crash window (async write-ahead after queue accept,
-    before the tracked write completes) is separate and cannot be closed by flush.
+    The remaining hard-crash window (handoff scheduled, write not yet durable,
+    while RESET is still gated) cannot be closed by flush alone; restart must
+    surface capture uncertainty if the face was cleared anyway.
     """
 
     def __init__(
@@ -174,6 +177,11 @@ class PersistenceWorker:
         self._degraded_reason: str | None = None
         self._inflight_identities: set[str] = set()
         self._requeue_task: asyncio.Task[None] | None = None
+        # Write scheduled but not yet durable / queued (RESET must wait).
+        self._handoff_pending: set[str] = set()
+        self._handoff_durable: set[str] = set()
+        self._handoff_listeners: list[Callable[[str, bool], None]] = []
+        self._capture_uncertainty = 0
         # Tracked durable write per sale — kept until worker consumes the result.
         self._pending_writes: dict[str, asyncio.Task[None]] = {}
         # Bumped on mark_done / invalidate so a late to_thread upsert cannot recreate.
@@ -207,6 +215,40 @@ class PersistenceWorker:
     @property
     def critical_durable_spills(self) -> int:
         return self._critical_durable_spills
+
+    @property
+    def handoff_pending_count(self) -> int:
+        return len(self._handoff_pending)
+
+    @property
+    def capture_uncertainty_count(self) -> int:
+        return self._capture_uncertainty
+
+    def is_handoff_pending(self, identity_key: str | None) -> bool:
+        if not identity_key:
+            return False
+        return identity_key in self._handoff_pending
+
+    def is_handoff_durable(self, identity_key: str | None) -> bool:
+        if not identity_key:
+            return False
+        return identity_key in self._handoff_durable
+
+    def on_handoff(self, listener: Callable[[str, bool], None]) -> None:
+        """Notify ``listener(identity_key, durable_ok)`` when handoff settles."""
+        self._handoff_listeners.append(listener)
+
+    def note_capture_uncertainty(self, *, reason: str) -> None:
+        self._capture_uncertainty += 1
+        self._mark_degraded(f"capture_uncertainty:{reason}")
+        logger.warning("capture_uncertainty reason=%s count=%s", reason, self._capture_uncertainty)
+
+    def _notify_handoff(self, identity_key: str, *, durable_ok: bool) -> None:
+        for listener in list(self._handoff_listeners):
+            try:
+                listener(identity_key, durable_ok)
+            except Exception:  # noqa: BLE001 — never break persist path
+                logger.exception("handoff listener failed identity=%s", identity_key)
 
     @property
     def retained_sale_count(self) -> int:
@@ -398,36 +440,54 @@ class PersistenceWorker:
             if write_ahead is not None
             else (priority is PersistPriority.CRITICAL and key is not None and attempt == 0)
         )
-        try:
-            self._queue.put_nowait(job)
-            if key is not None:
-                self._inflight_identities.add(key)
-        except asyncio.QueueFull as exc:
-            if priority is PersistPriority.CRITICAL:
-                if key is not None and self._recovery_store is not None:
-                    # Must land on disk before return — rare path; sync fsync OK.
-                    self._recovery_store.upsert(
-                        identity_key=key,
-                        kind=kind,
-                        payload=payload,
-                        attempt=attempt,
-                        last_error="queue_full",
-                    )
-                    self._critical_durable_spills += 1
-                    self._mark_degraded("critical_queue_full_spilled_to_durable")
-                    logger.error(
-                        "critical persistence queue full; spilled to durable store "
-                        "identity=%s kind=%s (will requeue in-process)",
-                        key,
-                        kind,
-                    )
+        # Durable handoff first for CRITICAL write-ahead: schedule disk spill,
+        # then enqueue only after success. Serial loop never awaits fsync.
+        if (
+            do_write_ahead
+            and key is not None
+            and self._recovery_store is not None
+            and priority is PersistPriority.CRITICAL
+        ):
+            self._handoff_pending.add(key)
+            self._handoff_durable.discard(key)
+            task = self._schedule_durable_upsert(
+                identity_key=key,
+                kind=kind,
+                payload=payload,
+                attempt=attempt,
+            )
+            if task is None:
+                # No running loop — sync write already completed in schedule.
+                self._handoff_pending.discard(key)
+                self._handoff_durable.add(key)
+                self._notify_handoff(key, durable_ok=True)
+                self._enqueue_job(job, key=key)
+                return
+
+            def _after_handoff(done: asyncio.Task[None]) -> None:
+                try:
+                    exc = done.exception()
+                except asyncio.CancelledError:
                     return
-                raise PersistenceQueueFullError(
-                    "critical persistence queue full; refusing to drop"
-                ) from exc
-            self._dropped_normal += 1
+                if exc is not None:
+                    logger.error(
+                        "durable handoff failed identity=%s; retaining sale; "
+                        "holding evidence gate",
+                        key,
+                    )
+                    handler = job.handler or self._handlers.get(job.kind)
+                    self._retain_undurable_sale(job, handler, str(exc))
+                    self._notify_handoff(key, durable_ok=False)
+                    return
+                self._handoff_pending.discard(key)
+                self._handoff_durable.add(key)
+                self._notify_handoff(key, durable_ok=True)
+                self._enqueue_job(job, key=key)
+
+            task.add_done_callback(_after_handoff)
             return
-        # Schedule only after accept — one tracked write; never fsync on serial loop.
+
+        self._enqueue_job(job, key=key)
         if do_write_ahead and key is not None:
             self._schedule_durable_upsert(
                 identity_key=key,
@@ -435,6 +495,40 @@ class PersistenceWorker:
                 payload=payload,
                 attempt=attempt,
             )
+
+    def _enqueue_job(self, job: PersistJob, *, key: str | None) -> None:
+        try:
+            self._queue.put_nowait(job)
+            if key is not None:
+                self._inflight_identities.add(key)
+        except asyncio.QueueFull as exc:
+            if job.priority == int(PersistPriority.CRITICAL):
+                if key is not None and self._recovery_store is not None:
+                    # Already durable (handoff-first) or sync spill now.
+                    if key not in self._handoff_durable:
+                        self._recovery_store.upsert(
+                            identity_key=key,
+                            kind=job.kind,
+                            payload=job.payload,
+                            attempt=job.attempt,
+                            last_error="queue_full",
+                        )
+                        self._handoff_durable.add(key)
+                        self._handoff_pending.discard(key)
+                    self._critical_durable_spills += 1
+                    self._mark_degraded("critical_queue_full_spilled_to_durable")
+                    logger.error(
+                        "critical persistence queue full; spilled to durable store "
+                        "identity=%s kind=%s (will requeue in-process)",
+                        key,
+                        job.kind,
+                    )
+                    return
+                raise PersistenceQueueFullError(
+                    "critical persistence queue full; refusing to drop"
+                ) from exc
+            self._dropped_normal += 1
+            return
 
     def _schedule_durable_upsert(
         self,
@@ -501,6 +595,7 @@ class PersistenceWorker:
     def _invalidate_durable_write(self, identity_key: str) -> None:
         """Bump epoch so any in-flight/stale upsert cannot recreate after done."""
         self._write_epoch[identity_key] = self._write_epoch.get(identity_key, 0) + 1
+        self._handoff_pending.discard(identity_key)
 
     async def _await_durable_write(self, job: PersistJob) -> None:
         """Block the worker (not the serial loop) until write-ahead has settled.

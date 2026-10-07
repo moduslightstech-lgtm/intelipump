@@ -1,0 +1,2 @@
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no intelipump@100.80.6.21
+intelipump@100.80.6.21's password: 

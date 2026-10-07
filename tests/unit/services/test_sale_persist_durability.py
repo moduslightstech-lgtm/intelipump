@@ -126,6 +126,10 @@ async def test_spilled_critical_requeues_while_worker_still_busy(tmp_path: Path)
         handler=gated,
         priority=PersistPriority.CRITICAL,
     )
+    for _ in range(50):
+        if worker.critical_durable_spills >= 1:
+            break
+        await asyncio.sleep(0.05)
     assert worker.critical_durable_spills >= 1
     assert any("busy-d" in p.identity_key for p in store.list_pending())
     assert "busy-a" in entered
@@ -186,6 +190,10 @@ async def test_queue_full_critical_requeues_without_restart(tmp_path: Path) -> N
         handler=blocker,
         priority=PersistPriority.CRITICAL,
     )
+    for _ in range(50):
+        if worker.critical_durable_spills >= 1 and store.pending_count() >= 1:
+            break
+        await asyncio.sleep(0.05)
     assert store.pending_count() >= 1
     assert worker.critical_durable_spills >= 1
     assert worker.is_degraded is True

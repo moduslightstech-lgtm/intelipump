@@ -265,3 +265,50 @@ async def test_transaction_started_queue_includes_pump_id(engine_factory: tuple)
     assert payload.get("raw_volume") == 0
     assert payload.get("raw_amount") == 0
 
+
+@pytest.mark.asyncio
+async def test_complete_publishes_face_naira_when_price_decimals_omitted(
+    engine_factory: tuple,
+) -> None:
+    """SAO face naira (1355) must not scale to 13.55 when price_decimals is None."""
+    _engine, factory = engine_factory
+    pump_id = await _pump(factory)
+    async with unit_of_work(factory) as uow:
+        svc = TransactionService(uow)
+        await svc.begin(
+            BeginTransactionRequest(
+                station_id="SAO-Redeemed-Station-1",
+                pump_db_id=pump_id,
+                transaction_uuid="tx-sao-price-1355",
+                nozzle_id=1,
+                raw_price=None,
+                price_decimals=None,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="PRODUCTION",
+                canonical_pump_id="pump-5",
+                canonical_nozzle_id="1",
+                source_identifier="pump-5",
+            )
+        )
+        # Price arrives at hang-up (DC3/session), not always on begin.
+        await svc.complete(
+            CompleteTransactionRequest(
+                transaction_uuid="tx-sao-price-1355",
+                source_completion_key="done:tx-sao-price-1355",
+                raw_volume=74,
+                raw_amount=100000,
+                raw_price=1355,
+                price_decimals=0,
+            )
+        )
+        batch = await uow.sync_queue.claim_batch(limit=20)
+    completed = [row for row in batch if row.event_type == "TRANSACTION_COMPLETED"]
+    assert completed
+    payload = completed[0].payload
+    assert payload.get("raw_unit_price") == 1355
+    assert payload.get("price_decimals") == 0
+    assert payload.get("pricePerLiter") == "1355.00"
+    assert payload.get("pricePerLitre") == "1355.00"
+

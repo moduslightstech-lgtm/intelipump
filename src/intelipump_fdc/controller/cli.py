@@ -383,6 +383,23 @@ def run(argv: list[str] | None = None) -> None:
                 simulated=bool(settings.api.simulated),
             )
             apply_recovered_contexts(loop_ctrl, persistence.recovery.pump_contexts)
+            # Gate RESET until durable sale handoff (write-ahead) completes.
+
+            def _on_handoff(_identity_key: str, durable_ok: bool) -> None:
+                if durable_ok and persistence.worker.handoff_pending_count == 0:
+                    for a in list(loop_ctrl._sale_handoff_pending):
+                        loop_ctrl.mark_sale_handoff_durable(a)
+
+            def _blocker(addr: int) -> bool:
+                if addr not in loop_ctrl._sale_handoff_pending:
+                    return False
+                if persistence.worker.handoff_pending_count == 0:
+                    loop_ctrl.mark_sale_handoff_durable(addr)
+                    return False
+                return True
+
+            persistence.worker.on_handoff(_on_handoff)
+            loop_ctrl.set_sale_handoff_blocker(_blocker)
             liveness.database_health = "ok"
             if args.show_recovery_report:
                 print("--- recovery report ---")

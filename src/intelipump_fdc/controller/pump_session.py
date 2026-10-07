@@ -892,6 +892,10 @@ class PumpSession:
         *,
         dispensed_volume_raw: int | None = None,
     ) -> None:
+        # Keep face unit price on the session even when callers skip
+        # _update_observed_from_mapped (e.g. synthetic hang-up completes).
+        if mapped.filling_price_raw is not None:
+            self.state.unit_price_raw = mapped.filling_price_raw
         if (
             mapped.completion_evidence_key
             and mapped.completion_evidence_key in self._applied_completion_keys
@@ -1157,6 +1161,8 @@ class PumpSession:
                     "has_unresolved_transaction": context.has_unresolved_transaction,
                     "warnings": list(context.warnings[-8:]),
                     "sale_lifecycle": self.state.sale_lifecycle.value,
+                    "filling_seen_this_boot": self._filling_seen_this_boot,
+                    "filling_observed": self.state.sale_evidence.filling_observed,
                     "may_publish_sale": (
                         completion_evidence_key is not None
                         and (
@@ -1177,6 +1183,16 @@ class PumpSession:
                     ),
                     "filled_volume_raw": self.state.filled_volume_raw,
                     "filled_amount_raw": self.state.filled_amount_raw,
+                    # Hang-up sale publish must carry DC3/session face price.
+                    # Without this, TRANSACTION_COMPLETED omits unit price and
+                    # cloud stores 0.00 (Sales shows Unknown).
+                    "filling_price_raw": self.state.unit_price_raw,
+                    "unit_price_raw": self.state.unit_price_raw,
+                    "raw_price": self.state.unit_price_raw,
+                    "price_decimals": 0
+                    if isinstance(self.state.unit_price_raw, int)
+                    and self.state.unit_price_raw > 0
+                    else None,
                 },
             )
         )

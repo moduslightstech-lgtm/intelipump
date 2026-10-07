@@ -152,6 +152,8 @@ class TransactionService:
             raw_volume=req.raw_volume,
             raw_amount=req.raw_amount,
             completed_at=req.completed_at,
+            raw_price=req.raw_price,
+            price_decimals=req.price_decimals,
         )
         if newly:
             await self._uow.transactions.add_event(
@@ -186,8 +188,11 @@ class TransactionService:
                 amt_dec = (
                     tx.amount_decimals if tx.amount_decimals is not None else 2
                 )
+                # SAO/Wayne face naira uses decimals=0 (1355 = ₦1355/L). LAB Phase 9
+                # always sets price_decimals explicitly (usually 2). Default 0 so an
+                # omitted field never silently scales 1355 → 13.55.
                 price_dec = (
-                    tx.price_decimals if tx.price_decimals is not None else 2
+                    tx.price_decimals if tx.price_decimals is not None else 0
                 )
                 raw_vol = int(tx.raw_volume or 0)
                 raw_amt = int(tx.raw_amount or 0)

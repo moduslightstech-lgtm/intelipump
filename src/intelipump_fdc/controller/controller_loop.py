@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
 import structlog
 
@@ -167,6 +168,10 @@ class ControllerLoop:
         self._last_completed_sale: dict[int, dict[str, int | None]] = {}
         self._sale_display_held: set[int] = set()
         self._sale_display_hold_since: dict[int, float] = {}
+        # Addresses whose completed-sale durable handoff is still in flight.
+        self._sale_handoff_pending: set[int] = set()
+        # Optional: PersistenceWorker.is_handoff_pending by identity, set by CLI.
+        self._sale_handoff_blocker: Callable[[int], bool] | None = None
         self._startup_price_attempted: set[int] = set()
         self._startup_reset_attempted: set[int] = set()
         self._bus_silent_warned: set[int] = set()
@@ -1324,7 +1329,21 @@ class ControllerLoop:
                 )
                 if life in {SaleLifecycle.FILLING_COMPLETED, SaleLifecycle.CLOSED}:
                     self._capture_completed_sale_snapshot(session)
+                    # Hold RESET until durable persist handoff completes.
+                    self._sale_handoff_pending.add(addr)
             self._last_sale[addr] = life
+
+    def set_sale_handoff_blocker(self, blocker: Callable[[int], bool] | None) -> None:
+        """Block RESET while ``blocker(addr)`` is True (durable handoff pending)."""
+        self._sale_handoff_blocker = blocker
+
+    def mark_sale_handoff_durable(self, addr: int) -> None:
+        self._sale_handoff_pending.discard(addr)
+
+    def _sale_reset_blocked_by_handoff(self, addr: int) -> bool:
+        if self._sale_handoff_blocker is not None and self._sale_handoff_blocker(addr):
+            return True
+        return addr in self._sale_handoff_pending
 
     def _should_hold_sale_display(self, session: PumpSession) -> bool:
         """Keep FILLING_COMPLETED totals on the pump after hang-up.
@@ -1373,6 +1392,13 @@ class ControllerLoop:
     async def _reset_after_sale_display_hold(self, session: PumpSession) -> None:
         """Clear retained face while hung up so the next lift is authorize-fast."""
         addr = session.address
+        if self._sale_reset_blocked_by_handoff(addr):
+            logger.info(
+                "sale_reset_deferred_awaiting_durable_handoff",
+                address=addr,
+                detail="RESET held until persist recovery write-ahead completes",
+            )
+            return
         reset = await self._run_owned_command(
             session,
             encode_cd1_command(PumpControlCommand.RESET),
@@ -2606,6 +2632,16 @@ class ControllerLoop:
                     or addr in self._sale_display_held
                 )
                 if needs_clear:
+                    if self._sale_reset_blocked_by_handoff(addr):
+                        self._log_set_price_deferred(
+                            "sale_handoff_pending",
+                            correlation_id=corr,
+                            unit_price_raw=pending.unit_price_raw,
+                            address=addr,
+                            session=session,
+                            pump_id=pending.pump_id,
+                        )
+                        continue
                     if not self._capture_completed_sale_snapshot(session):
                         self._log_set_price_deferred(
                             "sale_unpersisted",
@@ -2955,6 +2991,12 @@ class ControllerLoop:
         latest = self._last_dc2.get(addr)
         face_nonzero = bool(latest and (latest[0] > 0 or latest[1] > 0))
         if session.state.observed_status is not ObservedStatus.RESET or face_nonzero:
+            if self._sale_reset_blocked_by_handoff(addr):
+                logger.info(
+                    "pre_auth_reset_deferred_awaiting_durable_handoff",
+                    address=addr,
+                )
+                return
             reset = await self._run_owned_command(
                 session,
                 encode_cd1_command(PumpControlCommand.RESET),
