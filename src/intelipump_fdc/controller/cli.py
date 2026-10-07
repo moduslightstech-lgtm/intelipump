@@ -384,19 +384,31 @@ def run(argv: list[str] | None = None) -> None:
             )
             apply_recovered_contexts(loop_ctrl, persistence.recovery.pump_contexts)
             # Gate RESET until durable sale handoff (write-ahead) completes.
+            # Per-sale / per-address: one identity must not release another's gate,
+            # and an unrelated address must not stay blocked after its own handoff.
 
-            def _on_handoff(_identity_key: str, durable_ok: bool) -> None:
-                if durable_ok and persistence.worker.handoff_pending_count == 0:
-                    for a in list(loop_ctrl._sale_handoff_pending):
-                        loop_ctrl.mark_sale_handoff_durable(a)
+            from intelipump_fdc.services.persistence_worker import identity_address
+
+            def _on_handoff(identity_key: str, durable_ok: bool) -> None:
+                addr = identity_address(identity_key)
+                if addr is None:
+                    return
+                if durable_ok:
+                    loop_ctrl.mark_sale_handoff_durable(
+                        addr, identity_key=identity_key
+                    )
+                else:
+                    # Failed handoff: keep address gated; bind identity for later.
+                    loop_ctrl.note_sale_handoff_identity(addr, identity_key)
 
             def _blocker(addr: int) -> bool:
                 if addr not in loop_ctrl._sale_handoff_pending:
                     return False
-                if persistence.worker.handoff_pending_count == 0:
-                    loop_ctrl.mark_sale_handoff_durable(addr)
-                    return False
-                return True
+                if persistence.worker.is_address_handoff_pending(addr):
+                    return True
+                # No incomplete handoff for this address — safe to release.
+                loop_ctrl.mark_sale_handoff_durable(addr)
+                return False
 
             persistence.worker.on_handoff(_on_handoff)
             loop_ctrl.set_sale_handoff_blocker(_blocker)

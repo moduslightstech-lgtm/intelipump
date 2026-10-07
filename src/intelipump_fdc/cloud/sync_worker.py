@@ -197,13 +197,27 @@ class SyncWorker:
 
         Conflicting amount/volume on an otherwise matching identity leaves the
         row awaiting and returns 0 (visible via unmatched / conflict logs).
+
+        Missing or unrelated ``eventType`` values are rejected before any
+        delivered mark. ``volumeLiters=0`` / ``volume_liters=0`` are preserved
+        (never treated as missing via ``or`` fallback).
         """
-        event = str(payload.get("eventType") or "").upper()
-        if event and event not in {"SALE_COMMITTED", "SALE_ACK", "TX_COMMITTED"}:
+        _ACK_EVENTS = {"SALE_COMMITTED", "SALE_ACK", "TX_COMMITTED"}
+        event = str(payload.get("eventType") or payload.get("event_type") or "").upper()
+        if event and event not in _ACK_EVENTS:
             nested = payload.get("payload")
             if isinstance(nested, dict):
                 payload = nested
-                event = str(payload.get("eventType") or "").upper()
+                event = str(
+                    payload.get("eventType") or payload.get("event_type") or ""
+                ).upper()
+        if event not in _ACK_EVENTS:
+            logger.warning(
+                "sale_application_ack_rejected",
+                reason="missing_or_unrelated_event_type",
+                eventType=event or None,
+            )
+            return 0
         dedupe = str(
             payload.get("deduplicationKey")
             or payload.get("deduplication_key")
@@ -216,7 +230,13 @@ class SyncWorker:
             or ""
         ).strip()
         ack_amount = payload.get("amount")
-        ack_volume = payload.get("volumeLiters") or payload.get("volume_liters")
+        # Preserve explicit zero — do not use ``or`` (0 is a valid volume).
+        if "volumeLiters" in payload:
+            ack_volume = payload.get("volumeLiters")
+        elif "volume_liters" in payload:
+            ack_volume = payload.get("volume_liters")
+        else:
+            ack_volume = None
         matched = 0
         async with unit_of_work(self.session_factory) as uow:
             if dedupe or tx_id:

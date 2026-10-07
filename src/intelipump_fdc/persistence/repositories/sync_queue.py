@@ -180,15 +180,16 @@ class SyncQueueRepository:
                 if payload.get("amount") is not None
                 else nested.get("amount")
             )
-            stored_volume = (
-                payload.get("volume")
-                if payload.get("volume") is not None
-                else payload.get("volume_liters")
-                if payload.get("volume_liters") is not None
-                else nested.get("volume")
-                if nested.get("volume") is not None
-                else nested.get("volume_liters")
-            )
+            stored_volume = None
+            for src in (payload, nested):
+                if not isinstance(src, dict):
+                    continue
+                for key in ("volumeLiters", "volume_liters", "volume"):
+                    if key in src and src.get(key) is not None:
+                        stored_volume = src.get(key)
+                        break
+                if stored_volume is not None:
+                    break
             if amount is not None and stored_amount is not None:
                 try:
                     if abs(float(amount) - float(stored_amount)) > 1e-6:

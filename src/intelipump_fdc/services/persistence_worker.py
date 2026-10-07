@@ -108,14 +108,30 @@ class PersistFlushIncompleteError(Exception):
 
 
 # Bounded shutdown flush policy:
-# 1) Await queue join, pending write-ahead, and one final retained spill — each
-#    bounded by the remaining flush deadline (timeout_s from stop start).
-# 2) Snapshot undurable CRITICAL state (timeouts / retained / inflight) BEFORE
-#    cancelling worker tasks; then cancel; then raise PersistFlushIncompleteError
-#    if anything was undurable (including retained_spill_timeout).
-# 3) No unbounded retry loop at shutdown.
-# Hard crash caveat: async write-ahead after put_nowait until write completes
-# remains an unavoidable memory-only loss window (not closed by flush).
+# 1) Within one deadline, drain: pending durable writes → handoff callbacks
+#    (enqueue) → retained spill → queue join / handler completion. Repeat until
+#    idle or the deadline expires. Do not cancel in-flight writes on a partial
+#    wait timeout (that would drop identity keys and mis-report durability).
+# 2) Snapshot undurable CRITICAL state (timeouts / retained / inflight /
+#    handoff-pending) BEFORE cancelling worker tasks; then cancel; then raise
+#    PersistFlushIncompleteError if anything was undurable.
+# 3) Distinguish safely-durable backlog (on recovery store, awaiting handler)
+#    from undurable work (handoff not yet spilled / retained memory-only).
+# Hard crash caveat: write scheduled but not yet durable remains an unavoidable
+# memory-only loss window (RESET stays gated via handoff_pending).
+
+
+def identity_address(identity_key: str | None) -> int | None:
+    """Parse dart address from ``kind:addr:tx:event`` persist identity keys."""
+    if not identity_key:
+        return None
+    parts = identity_key.split(":")
+    if len(parts) < 3:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
 
 
 class PersistPriority(IntEnum):
@@ -229,6 +245,12 @@ class PersistenceWorker:
             return False
         return identity_key in self._handoff_pending
 
+    def is_address_handoff_pending(self, address: int) -> bool:
+        """True if any incomplete durable handoff is tied to this dart address."""
+        return any(
+            identity_address(key) == address for key in self._handoff_pending
+        )
+
     def is_handoff_durable(self, identity_key: str | None) -> bool:
         if not identity_key:
             return False
@@ -309,40 +331,29 @@ class PersistenceWorker:
                 return max(0.0, deadline - loop.time())
 
             reasons: list[str] = []
-            try:
-                await asyncio.wait_for(self._queue.join(), timeout=_remaining())
-            except TimeoutError:
-                reasons.append("queue_join_timeout")
-            if not await self._flush_pending_writes(timeout_s=_remaining()):
-                reasons.append("pending_write_timeout")
-            # Final retained spill bounded by whatever deadline remains.
-            if self._retained_sales:
-                rem = _remaining()
-                if rem <= 0:
-                    reasons.append("retained_spill_timeout")
-                else:
-                    try:
-                        await asyncio.wait_for(
-                            self._retry_retained_sales(), timeout=rem
-                        )
-                    except TimeoutError:
-                        reasons.append("retained_spill_timeout")
-                    except PersistRecoveryError:
-                        # Spill failed but may have left sales retained — snapshot below.
-                        pass
+            await self._drain_flush(deadline=deadline, reasons=reasons)
+
             # Snapshot undurable CRITICAL state BEFORE cancelling tasks.
             retained_keys = tuple(self._retained_sales.keys())
             inflight_keys = tuple(sorted(self._inflight_identities))
             pending_write_keys = tuple(
                 sorted(k for k, t in self._pending_writes.items() if not t.done())
             )
+            handoff_keys = tuple(sorted(self._handoff_pending))
             identity_keys = tuple(
-                dict.fromkeys((*retained_keys, *inflight_keys, *pending_write_keys))
+                dict.fromkeys(
+                    (*retained_keys, *inflight_keys, *pending_write_keys, *handoff_keys)
+                )
             )
             if retained_keys and "retained_undurable" not in reasons:
                 # Still memory-only after spill attempt / timeout.
                 if "retained_spill_timeout" not in reasons:
                     reasons.append("retained_undurable")
+            # Handoff still open with no durable spill → undurable crash window.
+            if handoff_keys and "pending_write_timeout" not in reasons:
+                if any(k not in self._handoff_durable for k in handoff_keys):
+                    if "handoff_undurable" not in reasons:
+                        reasons.append("handoff_undurable")
             queue_depth = self.depth
             pending_writes = self.pending_durable_writes
             incomplete = bool(
@@ -350,6 +361,7 @@ class PersistenceWorker:
                 or retained_keys
                 or queue_depth > 0
                 or pending_writes > 0
+                or handoff_keys
             )
             if incomplete:
                 if not reasons:
@@ -381,19 +393,113 @@ class PersistenceWorker:
         if flush_error is not None:
             raise flush_error
 
+    def _flush_idle(self) -> bool:
+        """True when no durable-handoff / retained / queue work remains."""
+        if self.pending_durable_writes > 0:
+            return False
+        if self._handoff_pending:
+            return False
+        if self._retained_sales:
+            return False
+        if self.depth > 0:
+            return False
+        # Unfinished join work: unfinished tasks_done accounting.
+        if not self._queue.empty():
+            return False
+        return True
+
+    async def _drain_flush(
+        self, *, deadline: float, reasons: list[str]
+    ) -> None:
+        """Coordinate writes, handoff enqueue, retained spill, and handlers.
+
+        Bounded by ``deadline`` (monotonic). Does not cancel in-flight durable
+        writes on a partial timeout — cancel happens only after snapshot in
+        ``stop``.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _remaining() -> float:
+            return max(0.0, deadline - loop.time())
+
+        # Cap iterations so a pathological callback loop cannot spin forever
+        # inside a long timeout_s.
+        for _ in range(64):
+            rem = _remaining()
+            if rem <= 0:
+                if not self._flush_idle():
+                    if self.pending_durable_writes > 0 or self._handoff_pending:
+                        if "pending_write_timeout" not in reasons:
+                            reasons.append("pending_write_timeout")
+                    elif self._retained_sales:
+                        if "retained_spill_timeout" not in reasons:
+                            reasons.append("retained_spill_timeout")
+                    elif self.depth > 0:
+                        if "queue_join_timeout" not in reasons:
+                            reasons.append("queue_join_timeout")
+                return
+
+            # 1) Await in-flight durable writes (do not cancel on timeout).
+            if self.pending_durable_writes > 0:
+                if not await self._flush_pending_writes(timeout_s=rem):
+                    if "pending_write_timeout" not in reasons:
+                        reasons.append("pending_write_timeout")
+                    return
+
+            # 2) Let handoff done-callbacks enqueue jobs after write success.
+            await asyncio.sleep(0)
+
+            # 3) Spill retained (storage-recovery) sales while time remains.
+            if self._retained_sales:
+                rem = _remaining()
+                if rem <= 0:
+                    if "retained_spill_timeout" not in reasons:
+                        reasons.append("retained_spill_timeout")
+                    return
+                try:
+                    await asyncio.wait_for(
+                        self._retry_retained_sales(), timeout=rem
+                    )
+                except TimeoutError:
+                    if "retained_spill_timeout" not in reasons:
+                        reasons.append("retained_spill_timeout")
+                    return
+                except PersistRecoveryError:
+                    # Spill failed; retained stays for snapshot.
+                    pass
+                await asyncio.sleep(0)
+
+            # 4) Drain memory queue / handlers (safely-durable backlog).
+            rem = _remaining()
+            if rem <= 0:
+                if self.depth > 0 and "queue_join_timeout" not in reasons:
+                    reasons.append("queue_join_timeout")
+                return
+            try:
+                await asyncio.wait_for(self._queue.join(), timeout=rem)
+            except TimeoutError:
+                if "queue_join_timeout" not in reasons:
+                    reasons.append("queue_join_timeout")
+                return
+
+            # 5) Callbacks from just-finished handlers may schedule more work.
+            await asyncio.sleep(0)
+            if self._flush_idle():
+                return
+            # More handoff / retained / queue work appeared — continue loop.
+
     async def _flush_pending_writes(self, *, timeout_s: float) -> bool:
-        """Await in-flight write-ahead tasks. Returns False if timed out."""
+        """Await in-flight write-ahead tasks. Returns False if timed out.
+
+        Uses ``asyncio.wait`` so a timeout does **not** cancel the durable
+        write tasks (``wait_for(gather)`` would cancel them and drop identity
+        keys from the incomplete-flush snapshot).
+        """
         pending = [t for t in self._pending_writes.values() if not t.done()]
         if not pending:
             return True
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*pending, return_exceptions=True),
-                timeout=timeout_s,
-            )
-        except TimeoutError:
-            return False
-        return True
+        _done, still = await asyncio.wait(pending, timeout=max(0.0, timeout_s))
+        return not still
 
     async def _requeue_while_busy(self) -> None:
         """Pull durable spills / retained sales into the memory queue."""
@@ -448,6 +554,24 @@ class PersistenceWorker:
             and self._recovery_store is not None
             and priority is PersistPriority.CRITICAL
         ):
+            # One durable identity → one handoff / one effective completion.
+            # Repeated submissions while a write is blocked, after durable spill,
+            # or while retained must not attach another callback or enqueue twice.
+            # Leave a finished failed write in ``_pending_writes`` until the
+            # worker consumes it via ``_await_durable_write`` (fast-failure
+            # regression) — do not pop it here.
+            existing_write = self._pending_writes.get(key)
+            if (
+                key in self._inflight_identities
+                or key in self._retained_sales
+                or key in self._handoff_durable
+                or (
+                    key in self._handoff_pending
+                    and existing_write is not None
+                    and not existing_write.done()
+                )
+            ):
+                return
             self._handoff_pending.add(key)
             self._handoff_durable.discard(key)
             task = self._schedule_durable_upsert(
@@ -596,6 +720,15 @@ class PersistenceWorker:
         """Bump epoch so any in-flight/stale upsert cannot recreate after done."""
         self._write_epoch[identity_key] = self._write_epoch.get(identity_key, 0) + 1
         self._handoff_pending.discard(identity_key)
+        self._handoff_durable.discard(identity_key)
+        # Bound epoch map growth — only the current counter is needed.
+        if len(self._write_epoch) > 256:
+            keep = set(self._pending_writes) | self._handoff_pending | set(
+                self._retained_sales
+            )
+            self._write_epoch = {
+                k: v for k, v in self._write_epoch.items() if k in keep or k == identity_key
+            }
 
     async def _await_durable_write(self, job: PersistJob) -> None:
         """Block the worker (not the serial loop) until write-ahead has settled.
@@ -731,6 +864,12 @@ class PersistenceWorker:
                     continue
                 self._retained_sales.pop(key, None)
                 self._critical_durable_spills += 1
+                # Confirmed durable spill: settle handoff gate so RESET/price
+                # can resume for this address. Notify before enqueue so listeners
+                # see durable_ok while identity is still attributable.
+                self._handoff_pending.discard(key)
+                self._handoff_durable.add(key)
+                self._notify_handoff(key, durable_ok=True)
                 # Fresh attempts once durable again.
                 try:
                     self.submit(

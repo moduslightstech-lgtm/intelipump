@@ -170,6 +170,8 @@ class ControllerLoop:
         self._sale_display_hold_since: dict[int, float] = {}
         # Addresses whose completed-sale durable handoff is still in flight.
         self._sale_handoff_pending: set[int] = set()
+        # addr → persist identity currently gating RESET (per-sale association).
+        self._sale_handoff_identity: dict[int, str] = {}
         # Optional: PersistenceWorker.is_handoff_pending by identity, set by CLI.
         self._sale_handoff_blocker: Callable[[int], bool] | None = None
         self._startup_price_attempted: set[int] = set()
@@ -1337,8 +1339,27 @@ class ControllerLoop:
         """Block RESET while ``blocker(addr)`` is True (durable handoff pending)."""
         self._sale_handoff_blocker = blocker
 
-    def mark_sale_handoff_durable(self, addr: int) -> None:
+    def note_sale_handoff_identity(self, addr: int, identity_key: str) -> None:
+        """Bind the persist identity that currently gates RESET for ``addr``."""
+        self._sale_handoff_pending.add(addr)
+        self._sale_handoff_identity[addr] = identity_key
+
+    def mark_sale_handoff_durable(
+        self, addr: int, *, identity_key: str | None = None
+    ) -> None:
+        """Release RESET gate for ``addr``.
+
+        When ``identity_key`` is provided, only release if it matches the bound
+        sale (or no identity is bound yet). A different sale must not clear
+        another sale's gate.
+        """
+        if identity_key is not None:
+            bound = self._sale_handoff_identity.get(addr)
+            if bound is not None and bound != identity_key:
+                return
+            self._sale_handoff_identity[addr] = identity_key
         self._sale_handoff_pending.discard(addr)
+        self._sale_handoff_identity.pop(addr, None)
 
     def _sale_reset_blocked_by_handoff(self, addr: int) -> bool:
         if self._sale_handoff_blocker is not None and self._sale_handoff_blocker(addr):
