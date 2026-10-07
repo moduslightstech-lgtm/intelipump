@@ -958,3 +958,42 @@ async def test_recover_cd2_assumes_after_one_poll() -> None:
     assert result.detail == "cd2_assumed_after_poll"
     assert elapsed < 0.5
     await ctrl.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_cd5_assumes_after_one_poll() -> None:
+    """Cloud SET_PRICE: Wayne often skips CD5 link ACK; do not false-TIMED_OUT."""
+    ctrl, _pump = create_memory_transport_pair()
+    await ctrl.open()
+    runtime = ControllerRuntime(
+        transport=ctrl,
+        safety=_lab_safety(),
+        config=PollSchedulerConfig(addresses=(1,), response_timeout_ms=50),
+    )
+    loop = ControllerLoop(runtime)
+    session = loop.sessions[1]
+    item = OutboundDataItem.create(
+        address=1,
+        application_payload=bytes((0x05, 0x03, 0x00, 0x13, 0x55)),
+        command_type=PumpCommand.SET_PRICE,
+        simulator_only=True,
+        idempotency=IdempotencyClass.NON_IDEMPOTENT,
+        max_retries=0,
+    )
+    t0 = time.monotonic()
+    result = await loop._recover_command_after_timeout(
+        session, item, seq=0, not_before=time.monotonic() - 1.0
+    )
+    elapsed = time.monotonic() - t0
+    assert result is not None
+    assert result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED
+    assert result.detail == "cd5_assumed_after_poll"
+    assert elapsed < 0.5
+    await ctrl.close()
+
+
+def test_outbound_data_uses_command_response_timeout() -> None:
+    """DATA ACK wait must use command_response_timeout_ms (not poll 120ms)."""
+    cfg = PollSchedulerConfig(addresses=(1,))
+    assert cfg.command_response_timeout_ms == 500
+    assert cfg.command_response_timeout_ms > cfg.response_timeout_ms

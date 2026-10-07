@@ -234,6 +234,36 @@ class TransactionRepository:
             ) from exc
         return _tx(row), True
 
+    async def abandon_as_duplicate(
+        self,
+        transaction_uuid: str,
+        *,
+        kept_uuid: str,
+        reason: str = "duplicate_same_totals",
+    ) -> TransactionRecord | None:
+        """Close an ACTIVE orphan without publishing — twin sale already COMPLETED."""
+        result = await self._session.execute(
+            select(TransactionRow).where(
+                TransactionRow.transaction_uuid == transaction_uuid
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        if row.status in {"COMPLETED", "COMPLETE", "VOID", "CANCELLED"}:
+            return _tx(row)
+        now = datetime.now(UTC)
+        row.status = "CANCELLED"
+        row.closed_at = now
+        row.updated_at = now
+        # Include this uuid so two orphans abandoned for the same kept sale
+        # do not collide on uq_transactions_completion_key.
+        row.source_completion_key = (
+            f"abandoned-dup:{transaction_uuid}:kept:{kept_uuid}:{reason}"
+        )[:256]
+        await self._session.flush()
+        return _tx(row)
+
     async def add_event(
         self,
         *,

@@ -489,7 +489,8 @@ async def test_live_fill_stream_does_not_publish_duplicate_after_hangup(
         assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
         leftover = await uow.transactions.get_by_uuid("tx-live-dup")
         assert leftover is not None
-        assert leftover.status == "COMPLETED"
+        # Orphan ACTIVE abandoned when hang-up already posted same totals.
+        assert leftover.status == "CANCELLED"
         pending = await uow.sync_queue.pending_count()
     # Hang-up already posted these totals — do not queue a second COMPLETED.
     assert pending == before

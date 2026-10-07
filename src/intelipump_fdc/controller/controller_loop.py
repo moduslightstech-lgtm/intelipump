@@ -852,7 +852,7 @@ class ControllerLoop:
         Poll after ACK timeout to pick up DC1 / a late matching ACK.
         """
         print(
-            f"[OWNED-LAB addr={session.address}] polling after "
+            f"[CMD addr={session.address}] polling after "
             f"{item.command_type.value} (no link ACK yet)"
         )
         await self._drain_pending_data(session)
@@ -917,9 +917,17 @@ class ControllerLoop:
                 )
             return None
 
-        # CD2: this head often skips ACK. One quiet poll is enough — do not
-        # spend application_confirm_max_polls before assuming success.
-        if self._is_cd2_payload(item.application_payload):
+        # CD2 / CD5: this head often skips ACK and answers on the next POLL.
+        # One quiet poll is enough — do not burn application_confirm_max_polls
+        # (and falsely TIMED_OUT cloud SET_PRICE) waiting for a link ACK.
+        if self._is_cd2_payload(item.application_payload) or self._is_set_price_item(
+            item
+        ):
+            assumed_detail = (
+                "cd2_assumed_after_poll"
+                if self._is_cd2_payload(item.application_payload)
+                else "cd5_assumed_after_poll"
+            )
             if self._command_ack_seen(session, seq, not_before=not_before):
                 print(f"RX ACK addr={session.address} seq={seq} (late)")
                 return ExchangeResult(
@@ -951,7 +959,7 @@ class ControllerLoop:
                 address=session.address,
                 sequence=seq,
                 correlation_id=item.correlation_id,
-                detail="cd2_assumed_after_poll",
+                detail=assumed_detail,
                 write_start_mono=not_before,
             )
 
@@ -1025,7 +1033,14 @@ class ControllerLoop:
         session.note_command_tx(tx_mono=write_complete)
         expected_ack = build_ack(session.wire_address, seq)
         ack_floor = ack_not_before if ack_not_before is not None else write_start
-        timeout_ms = self.runtime.config.response_timeout_ms
+        # DATA commands need the longer ACK window; poll EOT uses response_timeout_ms.
+        timeout_ms = int(
+            getattr(
+                self.runtime.config,
+                "command_response_timeout_ms",
+                self.runtime.config.response_timeout_ms,
+            )
+        )
         deadline = write_complete + (timeout_ms / 1000.0)
         preserved = 0
 
@@ -1106,7 +1121,7 @@ class ControllerLoop:
                 preserved += 1
                 if ack is not None:
                     await self._write_frame(ack, address=session.address, note="ACK")
-                return self._command_status_met(
+                met = self._command_status_met(
                     session,
                     item,
                     command_tx_mono=write_complete,
@@ -1114,6 +1129,23 @@ class ControllerLoop:
                     sequence=seq,
                     preserved=preserved,
                 )
+                if met is not None:
+                    return met
+                # Wayne often answers CD5 with DATA (no link ACK). Treat fresh
+                # post-TX DATA as link acceptance so cloud SET_PRICE does not
+                # false-TIMED_OUT while the pump already applied the price.
+                if self._is_set_price_item(item):
+                    return ExchangeResult(
+                        status=ExchangeResultStatus.LINK_ACKNOWLEDGED,
+                        address=session.address,
+                        sequence=seq,
+                        correlation_id=item.correlation_id,
+                        command_tx_mono=write_complete,
+                        write_start_mono=write_start,
+                        detail="data_after_set_price",
+                        preserved_event_count=preserved,
+                    )
+                return None
 
             if frame.control_type is ControlType.EOT:
                 session.handle_response_frame(
@@ -1168,6 +1200,12 @@ class ControllerLoop:
 
     def _is_cd2_payload(self, payload: bytes) -> bool:
         return len(payload) >= 2 and payload[0] == 0x02
+
+    def _is_set_price_item(self, item: OutboundDataItem) -> bool:
+        if item.command_type is PumpCommand.SET_PRICE:
+            return True
+        payload = item.application_payload
+        return len(payload) >= 1 and payload[0] == 0x05
 
     def _observation_satisfies_command(
         self, session: PumpSession, item: OutboundDataItem

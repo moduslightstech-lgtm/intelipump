@@ -556,29 +556,39 @@ class LiveFillStream:
                     if settle_price is not None and tx.price_decimals is not None
                     else (0 if settle_price is not None else None)
                 )
-                _row, newly = await TransactionService(uow).complete(
-                    CompleteTransactionRequest(
-                        transaction_uuid=tx.transaction_uuid,
-                        source_completion_key=f"sidecar-settle:{tx.transaction_uuid}",
-                        raw_volume=raw_volume,
-                        raw_amount=raw_amount,
-                        raw_price=settle_price,
-                        price_decimals=settle_price_decimals,
-                        completion_inferred=True,
-                        completion_warnings=(reason,),
-                        # Short window: suppress MQTT twin of hang-up without
-                        # blocking a real equal-value sale minutes later.
-                        publish_completion=already is None,
-                        session_sequence=session_seq,
+                if already is not None:
+                    # Do not create a second COMPLETED row (settle↔settle or
+                    # settle↔hang-up). Abandon this orphan ACTIVE instead.
+                    await uow.transactions.abandon_as_duplicate(
+                        tx.transaction_uuid,
+                        kept_uuid=already.transaction_uuid,
+                        reason="sidecar_settle_same_totals",
                     )
-                )
-                published = bool(newly and already is None)
-                if newly and already is not None:
                     logger.info(
-                        "live_fill_settle_suppressed_duplicate",
+                        "live_fill_settle_abandoned_duplicate",
                         transaction_uuid=tx.transaction_uuid,
                         kept_uuid=already.transaction_uuid,
                     )
+                    newly = False
+                    published = False
+                else:
+                    _row, newly = await TransactionService(uow).complete(
+                        CompleteTransactionRequest(
+                            transaction_uuid=tx.transaction_uuid,
+                            source_completion_key=(
+                                f"sidecar-settle:{tx.transaction_uuid}"
+                            ),
+                            raw_volume=raw_volume,
+                            raw_amount=raw_amount,
+                            raw_price=settle_price,
+                            price_decimals=settle_price_decimals,
+                            completion_inferred=True,
+                            completion_warnings=(reason,),
+                            publish_completion=True,
+                            session_sequence=session_seq,
+                        )
+                    )
+                    published = bool(newly)
         except Exception as exc:
             logger.warning(
                 "live_fill_finalize_failed",
