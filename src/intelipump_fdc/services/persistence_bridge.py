@@ -120,6 +120,33 @@ class PersistenceBridge:
         return None
 
     @staticmethod
+    def _infer_unit_price_from_totals(
+        raw_volume: int | None, raw_amount: int | None
+    ) -> int | None:
+        """Infer ₦/L face price from minor-unit totals when DC3 wiped session price.
+
+        SAO amount/volume are 2 dp minor units; face price is integer naira/L.
+        Require a tight match so random totals cannot invent a price.
+        """
+        if (
+            not isinstance(raw_volume, int)
+            or not isinstance(raw_amount, int)
+            or isinstance(raw_volume, bool)
+            or isinstance(raw_amount, bool)
+            or raw_volume <= 0
+            or raw_amount <= 0
+        ):
+            return None
+        inferred = int(round(raw_amount / raw_volume))
+        if inferred <= 0:
+            return None
+        expected = raw_volume * inferred
+        tol = max(inferred, raw_volume, 1)
+        if abs(raw_amount - expected) > tol:
+            return None
+        return inferred
+
+    @staticmethod
     def _observed_price_decimals(detail_payload: dict[str, Any] | None) -> int | None:
         if not isinstance(detail_payload, dict):
             return None
@@ -815,7 +842,14 @@ class PersistenceBridge:
                     nozzle = detail_payload.get("selected_nozzle")
                     nozzle_id = nozzle if isinstance(nozzle, int) else None
                     price_raw = self._observed_unit_price_raw(detail_payload)
+                    if price_raw is None:
+                        price_raw = self._infer_unit_price_from_totals(
+                            int(vol_raw) if isinstance(vol_raw, int) else None,
+                            int(amt_raw) if isinstance(amt_raw, int) else None,
+                        )
                     price_decimals = self._observed_price_decimals(detail_payload)
+                    if price_decimals is None and price_raw is not None:
+                        price_decimals = 0
                     fp = sale_fingerprint(
                         station_id=self._station_id,
                         dart_address=address,

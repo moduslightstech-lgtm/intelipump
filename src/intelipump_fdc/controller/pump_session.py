@@ -720,7 +720,13 @@ class PumpSession:
                 self.state.logical_nozzle = mapped.logical_nozzle_raw
             elif mapped.selected_nozzle is not None:
                 self.state.logical_nozzle = mapped.selected_nozzle
-        if mapped.filling_price_raw is not None:
+        # Idle Wayne often emits DC3 with filling price 0 after CD5. That must
+        # not wipe a known positive face price or sale complete publishes 0/None.
+        if (
+            isinstance(mapped.filling_price_raw, int)
+            and not isinstance(mapped.filling_price_raw, bool)
+            and mapped.filling_price_raw > 0
+        ):
             self.state.unit_price_raw = mapped.filling_price_raw
             self.state.unit_price_obs_gen = int(self.state.unit_price_obs_gen or 0) + 1
         self.state.sale_lifecycle = self.state.sale_evidence.lifecycle
@@ -894,7 +900,12 @@ class PumpSession:
     ) -> None:
         # Keep face unit price on the session even when callers skip
         # _update_observed_from_mapped (e.g. synthetic hang-up completes).
-        if mapped.filling_price_raw is not None:
+        # Ignore non-positive DC3 prices (idle Wayne after CD5).
+        if (
+            isinstance(mapped.filling_price_raw, int)
+            and not isinstance(mapped.filling_price_raw, bool)
+            and mapped.filling_price_raw > 0
+        ):
             self.state.unit_price_raw = mapped.filling_price_raw
         if (
             mapped.completion_evidence_key

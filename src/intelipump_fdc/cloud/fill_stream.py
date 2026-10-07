@@ -548,6 +548,28 @@ class LiveFillStream:
                     and tx.raw_price > 0
                     else None
                 )
+                if settle_price is None:
+                    try:
+                        from intelipump_fdc.cloud.set_price_request import (
+                            read_persisted_unit_price,
+                        )
+
+                        persisted = read_persisted_unit_price()
+                    except Exception:  # noqa: BLE001 — settle must not fail on I/O
+                        persisted = None
+                    if (
+                        persisted is not None
+                        and isinstance(persisted.unit_price_raw, int)
+                        and persisted.unit_price_raw > 0
+                    ):
+                        settle_price = persisted.unit_price_raw
+                if settle_price is None and raw_volume > 0 and raw_amount > 0:
+                    inferred = int(round(raw_amount / raw_volume))
+                    if inferred > 0:
+                        expected = raw_volume * inferred
+                        tol = max(inferred, raw_volume, 1)
+                        if abs(raw_amount - expected) <= tol:
+                            settle_price = inferred
                 settle_price_decimals = (
                     tx.price_decimals
                     if settle_price is not None and tx.price_decimals is not None

@@ -1568,6 +1568,16 @@ class ControllerLoop:
                         ExchangeResultStatus.APPLICATION_CONFIRMED,
                     }:
                         self._price_programmed.add(addr)
+                        # Seed session face price immediately. Idle DC3 often
+                        # reports 0 after CD5; without this, hang-up sales store
+                        # raw_price=NULL → cloud price_per_liter=0.00.
+                        if (
+                            isinstance(self.runtime.startup_unit_price, int)
+                            and self.runtime.startup_unit_price > 0
+                        ):
+                            session.state.unit_price_raw = (
+                                self.runtime.startup_unit_price
+                            )
 
         if flags.automatic_reset and addr not in self._startup_reset_done:
             if session.should_skip_reset():
@@ -2801,6 +2811,11 @@ class ControllerLoop:
                     self._cloud_set_price_dc3_deadline.pop(f"{corr}:{addr}", None)
                     self._cloud_set_price_fail_count.pop(retry_key, None)
                     self._cloud_set_price_next_try.pop(retry_key, None)
+                    if (
+                        isinstance(pending.unit_price_raw, int)
+                        and pending.unit_price_raw > 0
+                    ):
+                        session.state.unit_price_raw = pending.unit_price_raw
                     any_ok = True
                 elif result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED:
                     # Link ACK alone is NOT confirmed success — await matching
@@ -2815,6 +2830,13 @@ class ControllerLoop:
                     )
                     self._cloud_set_price_verify_reads[f"{corr}:{addr}"] = 0
                     self._price_programmed.add(addr)
+                    # Seed session so hang-up sales keep face price while DC3
+                    # verification is still pending (idle DC3 may report 0).
+                    if (
+                        isinstance(pending.unit_price_raw, int)
+                        and pending.unit_price_raw > 0
+                    ):
+                        session.state.unit_price_raw = pending.unit_price_raw
                     logger.info(
                         "cloud_set_price_link_ack_awaiting_dc3",
                         address=addr,

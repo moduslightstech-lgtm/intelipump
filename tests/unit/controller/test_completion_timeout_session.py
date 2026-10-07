@@ -96,6 +96,31 @@ def test_dc1_filling_complete_cancels_timeout() -> None:
     assert s.machine.context.completion_inferred is False
 
 
+def test_dc3_zero_price_does_not_wipe_known_face_price() -> None:
+    """Idle Wayne DC3 price=0 after CD5 must not clear session face price."""
+    s = _session()
+    s.state.unit_price_raw = 1355
+    s._update_observed_from_mapped(
+        MappedWayneObservation(
+            event=PumpEvent.NOZZLE_STATUS_OBSERVED,
+            observation=ObservationRef(source_frame_raw_hex="dc3-zero"),
+            nozzle_out=False,
+            filling_price_raw=0,
+        ),
+        capture_mono=0.0,
+    )
+    assert s.state.unit_price_raw == 1355
+    s._apply_mapped(
+        MappedWayneObservation(
+            event=PumpEvent.NOZZLE_STATUS_OBSERVED,
+            observation=ObservationRef(source_frame_raw_hex="dc3-zero-2"),
+            nozzle_out=False,
+            filling_price_raw=0,
+        )
+    )
+    assert s.state.unit_price_raw == 1355
+
+
 def test_filling_completed_state_changed_carries_session_unit_price() -> None:
     """Hang-up SALE publish must include DC3/session face price for MQTT."""
     bus = EventBus()
