@@ -108,3 +108,30 @@ async def test_verify_zero_accepts_fresh_zero_dc2() -> None:
 
     ok = await loop._verify_zero_meter_before_auth(session)
     assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_verify_zero_recovers_after_genuine_reset_zero() -> None:
+    """Persistent non-zero blocks first; a later fresh zero must not leave the pump stuck."""
+    loop = await _loop()
+    session = loop.sessions[1]
+    loop._last_dc2.pop(1, None)
+    n = {"i": 0}
+
+    async def _nonzero_then_zero(_s, **_kw):
+        n["i"] += 1
+        if n["i"] == 1:
+            loop._last_dc2[1] = (47, 55225)
+        else:
+            loop._last_dc2[1] = (0, 0)
+        return "eot"
+
+    loop._write_frame = AsyncMock(return_value=(0.0, True))  # type: ignore[method-assign]
+    loop._read_poll_session = AsyncMock(side_effect=_nonzero_then_zero)  # type: ignore[method-assign]
+    loop._report_observed_changes = lambda _s: None  # type: ignore[method-assign]
+    loop._bus_delays_enabled = lambda: False  # type: ignore[method-assign]
+
+    ok = await loop._verify_zero_meter_before_auth(session)
+    assert ok is True
+    assert session.state.filled_volume_raw == 0
+    assert session.state.filled_amount_raw == 0
