@@ -1,7 +1,7 @@
 # SAO Oct-8 Pi canary (Stage 2)
 
-**Pin:** build/install from `prod_feature` at `git rev-parse HEAD` (base feature commit `955aea1` + review follow-ups).  
-Deploy only after cloud Stage 1 (`028_sale_identity_decisions` + pinned consumer image) is live.
+**Pin (install this SHA):** `7ad5209063321b8dc30c4e341e3ccad67f495e62` on `prod_feature` (feature base `955aea1` + review tests).  
+Deploy only after cloud Stage 1 at consumer image `prod_feature-3510426f6ee5` (`CLOUD_SHA=3510426f6ee5126531c76749d3c810c5c6e4e192`) is live.
 
 ## What changed
 
