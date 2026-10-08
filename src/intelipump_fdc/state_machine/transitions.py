@@ -20,6 +20,10 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     (PumpState.DISCOVERING, PumpEvent.AUTHORIZATION_CONFIRMED): PumpState.AUTHORIZED,
     (PumpState.DISCOVERING, PumpEvent.FILLING_STARTED): PumpState.FILLING,
     (PumpState.DISCOVERING, PumpEvent.NOZZLE_LIFTED): PumpState.NOZZLE_UP,
+    # Hang-up while SM lagged ObservedStatus (SQLite/SM can stay DISCOVERING
+    # even after console AUTHORIZED→FILLING). Without this edge, sale_evidence
+    # prints FILLING_COMPLETED but PersistenceBridge never finalizes.
+    (PumpState.DISCOVERING, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
     (PumpState.NOT_PROGRAMMED, PumpEvent.RESET_OBSERVED): PumpState.RESET,
     (PumpState.NOT_PROGRAMMED, PumpEvent.READY_OBSERVED): PumpState.READY,
     # Documented Wayne CD5 price-accept path (DC1 0 → 5): not READY.

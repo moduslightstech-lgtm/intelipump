@@ -1186,11 +1186,46 @@ class PumpSession:
             and not was_awaiting
             and mapped.event is PumpEvent.NOZZLE_RETURNED
         )
-        if mapped.completion_evidence_key and result.accepted and (
-            not result.noop or finalized
+        # Sale evidence already accepted a positive hang-up, but SM rejected
+        # (historically DISCOVERING + FILLING_COMPLETED). Force a complete
+        # publish so PersistenceBridge can write COMPLETED + outbox.
+        force_complete_publish = False
+        if (
+            not finalized
+            and mapped.event is PumpEvent.FILLING_COMPLETED
+            and mapped.completion_evidence_key is not None
+            and not result.accepted
+            and self.state.sale_evidence.lifecycle is SaleLifecycle.FILLING_COMPLETED
+            and self.state.sale_evidence.has_positive_delivery
+            and not self.state.sale_evidence.aborted
+        ):
+            force_complete_publish = True
+            after = PumpState.FILLING_COMPLETE
+            after_ctx = after_ctx.with_updates(
+                current_state=PumpState.FILLING_COMPLETE,
+                previous_state=before,
+                awaiting_filling_complete=False,
+                completion_inferred=True,
+                dispensed_volume_raw=sm_volume
+                if isinstance(sm_volume, int)
+                else after_ctx.dispensed_volume_raw,
+            )
+            self.machine._context = after_ctx  # noqa: SLF001 — recover hung sale
+            self.state.last_state = after
+            logger.warning(
+                "forced_filling_complete_after_sm_reject",
+                address=self.address,
+                previousState=before.value,
+                reason=result.reason,
+                volumeMinorUnits=int(self.state.filled_volume_raw or 0),
+                amountMinorUnits=int(self.state.filled_amount_raw or 0),
+            )
+        if mapped.completion_evidence_key and (
+            (result.accepted and (not result.noop or finalized))
+            or force_complete_publish
         ):
             self._applied_completion_keys.add(mapped.completion_evidence_key)
-        if before is not after or finalized or hangup_await:
+        if before is not after or finalized or hangup_await or force_complete_publish:
             self._publish_state_changed(
                 before=before,
                 after=after,
