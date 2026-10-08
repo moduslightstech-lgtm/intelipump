@@ -1,6 +1,7 @@
 # Cloud-first deploy, one-Pi canary, application-ACK activation
 
 **Branches:** `intelipump-fdc` + `DigitalTwin` → `prod_feature`  
+**Pins:** Pi `95e5d5e` · Cloud tip including `ab2b8c5` + live-telemetry separation (`030_live_dispensing_telemetry`) — see `DigitalTwin/docs/sales/release-pins-oct8-session-ack.md`.  
 **Rule:** Do **not** enable `require_application_sale_ack` on SAO until cloud ACK is verified and one attended Pi canary passes. Broker PUBACK ≠ cloud commit.
 
 Physical acceptance is **not** complete until: one observed dispense → one Pi identity → one cloud COMPLETED → one dashboard row, matching amount/litres and delivery status.
