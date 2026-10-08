@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Pump-1 Pi recon — Oct 8 2026 05:00–09:20 Africa/Lagos (under-count dig).
+"""Pump-1 Pi recon — Oct 8 2026 05:00–09:22 Africa/Lagos (under-count dig).
 
 Run on intelipump-1:
   python3 scripts/recon_oct8_pump1_pi.py
   python3 scripts/recon_oct8_pump1_pi.py --db /var/lib/intelipump/intelipump.db
 
 Manager target 508.457 L; cloud/dashboard was ~486.45 L (short). Paste stdout.
+Half-open window [05:00, 09:22) WAT — same as Sales UI To=09:22 AM.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from zoneinfo import ZoneInfo
 DB = Path("/var/lib/intelipump/intelipump.db")
 LAGOS = ZoneInfo("Africa/Lagos")
 START = datetime(2026, 10, 8, 5, 0, 0, tzinfo=LAGOS)
-END = datetime(2026, 10, 8, 9, 20, 0, tzinfo=LAGOS)
+END = datetime(2026, 10, 8, 9, 22, 0, tzinfo=LAGOS)
 MGR_LITRES = 508.457
 # From droplet recon_oct8_pump1_pump3.sql comment / dashboard P1 window.
 CLOUD_LITRES = 486.45
