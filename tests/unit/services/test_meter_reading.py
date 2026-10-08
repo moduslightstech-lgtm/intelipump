@@ -23,14 +23,37 @@ def test_read_meter_command_exists_and_is_idempotent():
 
 def test_decide_default_unsupported():
     status, code, msg = meter_svc.decide_read_meter(
-        settings=MeterReadingSettings(auto_cd101=False),
+        settings=MeterReadingSettings(auto_cd101=False, hardware_cd101=False),
         current_state=PumpState.READY,
         pending_count=0,
         rate_limited=False,
     )
     assert status == "UNSUPPORTED"
     assert code == "METER_READ_UNSUPPORTED"
-    assert "manual" in msg.lower() or "unverified" in msg.lower()
+    assert "manual" in msg.lower() or "hardware" in msg.lower()
+
+
+def test_decide_hardware_cd101_pending():
+    status, code, _ = meter_svc.decide_read_meter(
+        settings=MeterReadingSettings(hardware_cd101=True),
+        current_state=PumpState.READY,
+        pending_count=0,
+        rate_limited=False,
+    )
+    assert status == "PENDING_CONTROLLER"
+    assert code == "METER_READ_QUEUED_HARDWARE"
+
+
+def test_dart_address_for_nozzle():
+    from intelipump_fdc.cloud.channel_map import ChannelMapping
+
+    maps = {
+        1: ChannelMapping(1, "pump-3", "nozzle-1", None, "PMS", "pump-3-n1"),
+        2: ChannelMapping(2, "pump-3", "nozzle-2", None, "PMS", "pump-3-n2"),
+    }
+    assert meter_svc.dart_address_for_nozzle(maps, "nozzle-1") == 1
+    assert meter_svc.dart_address_for_nozzle(maps, "nozzle-2") == 2
+    assert meter_svc.liters_from_raw_scaled(565215773, 3) == 565215.773
 
 
 def test_decide_rate_limit_and_dispensing():

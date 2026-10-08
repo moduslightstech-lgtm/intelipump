@@ -132,6 +132,31 @@ def build_cd101_outbound_payload(*, counter_select: int = 1) -> bytes:
     return build_cd101_request(counter_select=counter_select).application_payload
 
 
+def dart_address_for_nozzle(
+    channel_mappings: dict[int, Any] | None,
+    nozzle_id: str,
+) -> int | None:
+    """Resolve DART logical address from channel map nozzle_id."""
+    if not channel_mappings:
+        return None
+    want = (nozzle_id or "").strip()
+    for addr, meta in channel_mappings.items():
+        nozzle = None
+        if hasattr(meta, "nozzle_id"):
+            nozzle = getattr(meta, "nozzle_id")
+        elif isinstance(meta, dict):
+            nozzle = meta.get("nozzle_id") or meta.get("nozzleId")
+        if str(nozzle or "").strip() == want:
+            return int(addr)
+    return None
+
+
+def liters_from_raw_scaled(raw: int | None, decimals: int | None) -> float | None:
+    if raw is None or decimals is None:
+        return None
+    return int(raw) / (10 ** int(decimals))
+
+
 def decide_read_meter(
     *,
     settings: MeterReadingSettings,
@@ -141,7 +166,7 @@ def decide_read_meter(
 ) -> tuple[str, str, str]:
     """Return (execution_status, error_code, message).
 
-    Never invents a cumulative value. Auto-CD101 only when explicitly gated.
+    Never invents a cumulative value. Hardware CD101 (file bridge) or LAB auto.
     """
     if rate_limited:
         return (
@@ -161,16 +186,22 @@ def decide_read_meter(
             "METER_READ_DEFERRED_DISPENSING",
             "Meter read deferred while pump appears to be dispensing.",
         )
+    if settings.hardware_cd101:
+        return (
+            "PENDING_CONTROLLER",
+            "METER_READ_QUEUED_HARDWARE",
+            "Hardware CD101 queued via sole-controller file bridge (read-only).",
+        )
     if not settings.auto_cd101:
         return (
             "UNSUPPORTED",
             "METER_READ_UNSUPPORTED",
-            "Automatic CD101 meter capture is unverified on this controller; "
-            "use manual cumulative readings. Never invents a zero.",
+            "Automatic CD101 meter capture is not enabled on this controller; "
+            "use manual cumulative readings or enable HARDWARE_CD101. "
+            "Never invents a zero.",
         )
     return (
         "PENDING_CONTROLLER",
         "METER_READ_QUEUED",
-        "Experimental auto-CD101 queued on existing outbound path "
-        "(physical validation still required).",
+        "Experimental LAB auto-CD101 queued on existing outbound path.",
     )

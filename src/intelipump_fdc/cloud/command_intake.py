@@ -39,6 +39,11 @@ from intelipump_fdc.simulator.encoding import encode_cd1_command
 from intelipump_fdc.state_machine.guards import evaluate_command_eligibility
 from intelipump_fdc.state_machine.models import PumpContext
 from intelipump_fdc.cloud.mqtt.errors import MqttError, MqttNotConnectedError, MqttPublishError
+from intelipump_fdc.cloud.meter_result_publisher import MeterResultPublisher
+from intelipump_fdc.controller.meter_read_request import (
+    MeterReadRequest,
+    write_meter_read_request,
+)
 from intelipump_fdc.core.config import MeterReadingSettings
 from intelipump_fdc.services import meter_reading as meter_svc
 
@@ -79,6 +84,7 @@ class CloudCommandIntake:
         controller_loop: ControllerLoop | None = None,
         allow_production_remote_set_price: bool = False,
         meter_reading_settings: MeterReadingSettings | None = None,
+        channel_mappings: dict[int, Any] | None = None,
     ) -> None:
         self._factory = session_factory
         self._mqtt = mqtt
@@ -91,6 +97,13 @@ class CloudCommandIntake:
         self._loop = controller_loop
         self._allow_production_set_price = bool(allow_production_remote_set_price)
         self._meter_settings = meter_reading_settings or MeterReadingSettings()
+        self._channel_mappings = channel_mappings or {}
+        self._meter_results = MeterResultPublisher(
+            session_factory=session_factory,
+            station_id=station_id,
+            device_id=device_id,
+            meter_settings=self._meter_settings,
+        )
         self._seen: set[str] = set()
         self.active = False
         self._seq = 0
@@ -122,6 +135,10 @@ class CloudCommandIntake:
                 await self.publish_pending_set_price_outcomes()
             except Exception:
                 logger.exception("set_price_outcome_publish_failed")
+            try:
+                await self._meter_results.publish_new_results()
+            except Exception:
+                logger.exception("meter_result_publish_failed")
             await asyncio.sleep(1.0)
 
     async def publish_pending_set_price_outcomes(self) -> int:
@@ -488,9 +505,66 @@ class CloudCommandIntake:
                 pump_id=cmd.pumpId,
                 nozzle_id=nozzle_id,
             )
-            # Experimental CD101 enqueue is LAB + existing outbound only.
-            # Production never opens a competing serial path or invents totals.
-            if execution_status == "PENDING_CONTROLLER":
+            # Hardware path: file bridge to sole controller (no second serial).
+            # LAB auto_cd101: optional virtual outbound enqueue.
+            if execution_status == "PENDING_CONTROLLER" and self._meter_settings.hardware_cd101:
+                allowed_dev = (self._meter_settings.allowed_device_id or "").strip()
+                if allowed_dev and allowed_dev != self._device_id.strip():
+                    execution_status = "UNSUPPORTED"
+                    meter_error_code = "METER_DEVICE_NOT_ALLOWLISTED"
+                    meter_message = "HARDWARE_CD101 device allowlist mismatch"
+                else:
+                    if dart_address is None:
+                        dart_address = meter_svc.dart_address_for_nozzle(
+                            self._channel_mappings, nozzle_id
+                        )
+                    if dart_address is None and ctx is not None:
+                        dart_address = int(ctx.dart_address)
+                    allowed_addrs = self._meter_settings.allowed_address_set()
+                    if dart_address is None:
+                        execution_status = "UNSUPPORTED"
+                        meter_error_code = "METER_ADDRESS_UNRESOLVED"
+                        meter_message = (
+                            "Could not resolve DART address for nozzle; "
+                            "pass dartAddress or fix channel map"
+                        )
+                    elif allowed_addrs and int(dart_address) not in allowed_addrs:
+                        execution_status = "UNSUPPORTED"
+                        meter_error_code = "METER_ADDRESS_NOT_ALLOWLISTED"
+                        meter_message = f"address {dart_address} not allowlisted"
+                    else:
+                        try:
+                            write_meter_read_request(
+                                MeterReadRequest(
+                                    correlation_id=cmd.correlationId,
+                                    dart_address=int(dart_address),
+                                    counter_select=int(
+                                        self._meter_settings.counter_select
+                                    ),
+                                    requested_by=cmd.requestedBy,
+                                    nozzle_hint=nozzle_id,
+                                    notes="dashboard-read-now",
+                                )
+                            )
+                            executed = False
+                            resulting_state = current_state
+                            meter_error_code = "METER_READ_QUEUED_HARDWARE"
+                            meter_message = (
+                                "READ_METER accepted; CD101 pending on controller "
+                                "outbound (file bridge)"
+                            )
+                            logger.info(
+                                "meter_read_request_file_written",
+                                correlationId=cmd.correlationId,
+                                pumpId=cmd.pumpId,
+                                nozzleId=nozzle_id,
+                                address=dart_address,
+                            )
+                        except OSError as exc:
+                            execution_status = "ENQUEUE_FAILED"
+                            meter_error_code = "METER_REQUEST_WRITE_FAILED"
+                            meter_message = str(exc)
+            elif execution_status == "PENDING_CONTROLLER":
                 can_lab_enqueue = (
                     self_env == "LAB"
                     and self._allow_lab
@@ -502,8 +576,9 @@ class CloudCommandIntake:
                     execution_status = "UNSUPPORTED"
                     meter_error_code = "METER_READ_UNSUPPORTED"
                     meter_message = (
-                        "AUTO_CD101 is set but live/production serial meter capture "
-                        "is not enabled; reporting unsupported (no invented zero)."
+                        "CD101 meter capture not enabled "
+                        "(set HARDWARE_CD101 or LAB AUTO_CD101); "
+                        "reporting unsupported (no invented zero)."
                     )
                 else:
                     item = OutboundDataItem.create(

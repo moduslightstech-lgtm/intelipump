@@ -240,6 +240,7 @@ class CloudRuntime:
                     )
                 ),
                 meter_reading_settings=self.settings.meter_reading,
+                channel_mappings=channel_mappings,
             )
 
         try:
