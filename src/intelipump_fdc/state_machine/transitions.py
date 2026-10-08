@@ -19,11 +19,14 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     # Accept these so persistence can open an ACTIVE sale (never auto-authorize).
     (PumpState.DISCOVERING, PumpEvent.AUTHORIZATION_CONFIRMED): PumpState.AUTHORIZED,
     (PumpState.DISCOVERING, PumpEvent.FILLING_STARTED): PumpState.FILLING,
+    # Live DC2 while SM still DISCOVERING (ObservedStatus ahead of SM).
+    (PumpState.DISCOVERING, PumpEvent.FILLING_UPDATED): PumpState.FILLING,
     (PumpState.DISCOVERING, PumpEvent.NOZZLE_LIFTED): PumpState.NOZZLE_UP,
     # Hang-up while SM lagged ObservedStatus (SQLite/SM can stay DISCOVERING
     # even after console AUTHORIZED→FILLING). Without this edge, sale_evidence
     # prints FILLING_COMPLETED but PersistenceBridge never finalizes.
     (PumpState.DISCOVERING, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
+    (PumpState.DISCOVERING, PumpEvent.NOZZLE_RETURNED): PumpState.FILLING_COMPLETE,
     (PumpState.NOT_PROGRAMMED, PumpEvent.RESET_OBSERVED): PumpState.RESET,
     (PumpState.NOT_PROGRAMMED, PumpEvent.READY_OBSERVED): PumpState.READY,
     # Documented Wayne CD5 price-accept path (DC1 0 → 5): not READY.
@@ -42,8 +45,9 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     (PumpState.NOZZLE_UP, PumpEvent.NOZZLE_RETURNED): PumpState.RESET,
     (PumpState.NOZZLE_UP, PumpEvent.FILLING_STARTED): PumpState.FILLING,
     (PumpState.AUTHORIZED, PumpEvent.FILLING_STARTED): PumpState.FILLING,
-    # Cancel auth with no dispense; READY only if readiness edge follows.
-    (PumpState.AUTHORIZED, PumpEvent.NOZZLE_RETURNED): PumpState.RESET,
+    # Hang-up (with or without DC2 yet): enter FILLING_COMPLETE await path.
+    # Zero-delivery cancel is suppressed by sale_evidence (no paid sale).
+    (PumpState.AUTHORIZED, PumpEvent.NOZZLE_RETURNED): PumpState.FILLING_COMPLETE,
     (PumpState.AUTHORIZED, PumpEvent.NOZZLE_LIFTED): PumpState.AUTHORIZED,
     # Wayne can jump DC1 AUTHORIZED → FILLING_COMPLETED (skip STATUS=4 FILLING)
     # while DC2 already carried face volume. Without this edge, hang-up is

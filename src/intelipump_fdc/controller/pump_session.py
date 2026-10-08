@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -21,6 +22,14 @@ from intelipump_fdc.controller.session_models import (
     ObservedStatus,
     PumpSessionState,
 )
+
+# Brief holster bounce: require NOZIO IN stable before publishing COMPLETED.
+_NOZIO_STABLE_IN = timedelta(milliseconds=1500)
+# Sub-second / few-second "fills" that hang up then re-lift are usually one
+# physical delivery split by a bounce (ghost ₦122 then ₦1000). Hold publish
+# long enough for a re-lift to suppress the micro COMPLETED.
+_MICRO_FILL_MAX_AGE = timedelta(seconds=3)
+_MICRO_COMPLETE_RELIFT_HOLD = timedelta(seconds=20)
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
 from intelipump_fdc.protocol.dart.application.constants import MessageDirection
@@ -53,6 +62,18 @@ logger = structlog.get_logger(__name__)
 # Cleared when a valid EOT/DATA proves the link is healthy again.
 # Historical counters (timeout_count, etc.) are never decremented.
 _TRANSIENT_COMMUNICATION_ERRORS = frozenset({"response_timeout"})
+
+
+@dataclass(slots=True)
+class _HeldCompletion:
+    """Deferred FILLING_COMPLETED publish awaiting stable hang-up / re-lift."""
+
+    evidence_key: str
+    held_at: datetime
+    reason: str
+    volume_raw: int
+    amount_raw: int
+    filling_started_at: datetime | None
 
 
 class PumpSession:
@@ -100,10 +121,195 @@ class PumpSession:
         # True only after FILLING is observed in this process (not retained COMPLETED).
         self._filling_seen_this_boot = False
         self._startup_baseline_fingerprint: str | None = None
+        self._filling_started_at: datetime | None = None
+        self._noz_in_edge_at: datetime | None = None
+        self._held_completion: _HeldCompletion | None = None
 
     @property
     def address(self) -> int:
         return self.state.address
+
+    def _note_filling_started(self, *, at: datetime | None = None) -> None:
+        if self._filling_started_at is None:
+            self._filling_started_at = at or datetime.now(UTC)
+
+    def _completion_hold_reason(self, *, now: datetime) -> str | None:
+        """Return hold reason if FILLING_COMPLETED publish should be deferred."""
+        started = self._filling_started_at
+        # Prefer micro-fill hold over brief NOZIO debounce so ghost splits
+        # (₦122 then re-lift to ₦1000) stay suppressed for the full window.
+        if started is not None and now - started < _MICRO_FILL_MAX_AGE:
+            return "micro_fill_relift_window"
+        noz_in_at = self._noz_in_edge_at
+        if noz_in_at is not None and now - noz_in_at < _NOZIO_STABLE_IN:
+            return "noz_in_unstable"
+        return None
+
+    def _arm_completion_hold(
+        self,
+        mapped: MappedWayneObservation,
+        *,
+        reason: str,
+        now: datetime,
+    ) -> MappedWayneObservation:
+        key = mapped.completion_evidence_key or (
+            f"held-complete:{self.address}:{now.isoformat()}"
+        )
+        self._held_completion = _HeldCompletion(
+            evidence_key=key,
+            held_at=now,
+            reason=reason,
+            volume_raw=int(self.state.filled_volume_raw or 0),
+            amount_raw=int(self.state.filled_amount_raw or 0),
+            filling_started_at=self._filling_started_at,
+        )
+        # Keep evidence peaks but do not surface FILLING_COMPLETED yet (no SALE
+        # console line / no PersistenceBridge finalize until hold resolves).
+        self.state.sale_evidence.lifecycle = SaleLifecycle.FILLING
+        self.state.sale_evidence.filling_completed_observed = False
+        self.state.sale_lifecycle = SaleLifecycle.FILLING
+        logger.info(
+            "completion_publish_held",
+            address=self.address,
+            reason=reason,
+            evidenceKey=key,
+            volumeMinorUnits=self._held_completion.volume_raw,
+            amountMinorUnits=self._held_completion.amount_raw,
+            fillingAgeMs=(
+                int((now - started).total_seconds() * 1000)
+                if (started := self._filling_started_at) is not None
+                else None
+            ),
+            nozInAgeMs=(
+                int((now - noz_at).total_seconds() * 1000)
+                if (noz_at := self._noz_in_edge_at) is not None
+                else None
+            ),
+        )
+        return MappedWayneObservation(
+            event=mapped.event,
+            observation=mapped.observation,
+            raw_wayne_status=mapped.raw_wayne_status,
+            selected_nozzle=mapped.selected_nozzle,
+            logical_nozzle_raw=mapped.logical_nozzle_raw,
+            nozzle_out=mapped.nozzle_out,
+            nozio_raw=mapped.nozio_raw,
+            filling_price_raw=mapped.filling_price_raw,
+            completion_evidence_key=None,
+            awaiting_filling_complete=True,
+            completion_inferred=mapped.completion_inferred,
+            allow_implicit_authorize_to_filling=(
+                mapped.allow_implicit_authorize_to_filling
+            ),
+            filling_inferred_from_dc2=mapped.filling_inferred_from_dc2,
+            inferences=(
+                *mapped.inferences,
+                f"INFERENCE: completion publish held ({reason}).",
+            ),
+            warnings=(*mapped.warnings, f"completion_held:{reason}"),
+        )
+
+    def _suppress_held_completion(self, *, reason: str) -> None:
+        held = self._held_completion
+        if held is None:
+            return
+        logger.info(
+            "micro_completion_suppressed_on_relift",
+            address=self.address,
+            reason=reason,
+            holdReason=held.reason,
+            evidenceKey=held.evidence_key,
+            volumeMinorUnits=held.volume_raw,
+            amountMinorUnits=held.amount_raw,
+            heldForMs=int(
+                (datetime.now(UTC) - held.held_at).total_seconds() * 1000
+            ),
+        )
+        self._held_completion = None
+        # Resume live filling under the same peaks until Wayne RESET clears face.
+        self.state.sale_evidence.lifecycle = SaleLifecycle.FILLING
+        self.state.sale_evidence.filling_completed_observed = False
+        self.state.sale_lifecycle = SaleLifecycle.FILLING
+        ctx = self.machine.context
+        if ctx.current_state is PumpState.FILLING_COMPLETE:
+            after_ctx = ctx.with_updates(
+                current_state=PumpState.FILLING,
+                previous_state=PumpState.FILLING_COMPLETE,
+                awaiting_filling_complete=False,
+                completion_inferred=False,
+            )
+            self.machine._context = after_ctx  # noqa: SLF001
+            self.state.last_state = PumpState.FILLING
+
+    def _confirm_held_completion(self, *, now: datetime) -> None:
+        held = self._held_completion
+        if held is None:
+            return
+        if held.evidence_key in self._applied_completion_keys:
+            self._held_completion = None
+            return
+        self.state.filled_volume_raw = max(
+            int(self.state.filled_volume_raw or 0), held.volume_raw
+        )
+        self.state.filled_amount_raw = max(
+            int(self.state.filled_amount_raw or 0), held.amount_raw
+        )
+        self.state.sale_evidence.note_dc2(
+            volume_raw=held.volume_raw, amount_raw=held.amount_raw
+        )
+        self.state.sale_evidence.filling_observed = True
+        self.state.sale_evidence.filling_completed_observed = True
+        self.state.sale_evidence.lifecycle = SaleLifecycle.FILLING_COMPLETED
+        self.state.sale_lifecycle = SaleLifecycle.FILLING_COMPLETED
+        before = self.machine.context.current_state
+        after_ctx = self.machine.context.with_updates(
+            current_state=PumpState.FILLING_COMPLETE,
+            previous_state=before,
+            awaiting_filling_complete=False,
+            completion_inferred=False,
+            dispensed_volume_raw=held.volume_raw,
+            nozzle_out=False,
+        )
+        self.machine._context = after_ctx  # noqa: SLF001
+        self.state.last_state = PumpState.FILLING_COMPLETE
+        self._applied_completion_keys.add(held.evidence_key)
+        self._held_completion = None
+        self._filling_started_at = None
+        logger.info(
+            "completion_publish_released_after_hold",
+            address=self.address,
+            reason=held.reason,
+            evidenceKey=held.evidence_key,
+            volumeMinorUnits=held.volume_raw,
+            amountMinorUnits=held.amount_raw,
+            heldForMs=int((now - held.held_at).total_seconds() * 1000),
+        )
+        self._publish_state_changed(
+            before=before,
+            after=PumpState.FILLING_COMPLETE,
+            event_name=PumpEvent.FILLING_COMPLETED.value,
+            context=after_ctx,
+            completion_evidence_key=held.evidence_key,
+        )
+
+    def _tick_completion_hold(self, *, now: datetime) -> None:
+        held = self._held_completion
+        if held is None:
+            return
+        nozzle_out = (
+            self.state.nozzle_position is NozzlePosition.OUT
+            or self.machine.context.nozzle_out is True
+        )
+        if nozzle_out:
+            self._suppress_held_completion(reason="noz_out_during_hold")
+            return
+        noz_in_at = self._noz_in_edge_at or held.held_at
+        if now - noz_in_at < _NOZIO_STABLE_IN:
+            return
+        if held.reason == "micro_fill_relift_window":
+            if now - held.held_at < _MICRO_COMPLETE_RELIFT_HOLD:
+                return
+        self._confirm_held_completion(now=now)
 
     def seed_recovered_context(self, context: PumpContext) -> None:
         """Apply recovery snapshot; require live reconcile before healthy claims."""
@@ -135,6 +341,7 @@ class PumpSession:
     def tick_awaiting_completion(self, *, now: datetime | None = None) -> None:
         """Evaluate hang-up completion timeout (poll-loop driven; idempotent)."""
         now = now or datetime.now(UTC)
+        self._tick_completion_hold(now=now)
         ctx = self.machine.context
         if not ctx.awaiting_filling_complete:
             self._await_started_at = None
@@ -653,15 +860,21 @@ class PumpSession:
                 amount_raw=raw_amount if isinstance(raw_amount, int) else None,
             )
             ctx = self.machine.context
-            mapped = map_wayne_observation(
-                tx,
-                context=MapperContext.from_pump_context(
-                    ctx,
-                    resolve_as_dc1=True,
-                    resolve_as_dc3=True,
-                    bus_direction=MessageDirection.SLAVE_TO_MASTER,
-                ),
+            # Prefer live session peaks when SM dispensed_volume lags (DISCOVERING).
+            live_dispense = max(
+                int(ctx.dispensed_volume_raw or 0),
+                int(self.state.filled_volume_raw or 0),
+                int(raw_volume) if isinstance(raw_volume, int) else 0,
             )
+            map_ctx = MapperContext.from_pump_context(
+                ctx,
+                resolve_as_dc1=True,
+                resolve_as_dc3=True,
+                bus_direction=MessageDirection.SLAVE_TO_MASTER,
+            )
+            if live_dispense > int(map_ctx.dispensed_volume_raw or 0):
+                map_ctx = replace(map_ctx, dispensed_volume_raw=live_dispense)
+            mapped = map_wayne_observation(tx, context=map_ctx)
             self._update_observed_from_mapped(mapped, capture_mono=obs_mono)
             if self._needs_restart_reconcile:
                 self._reconcile_then_apply(
@@ -700,6 +913,7 @@ class PumpSession:
                 self.state.last_status_time = capture_mono
                 if status is WaynePumpStatus.FILLING:
                     self._filling_seen_this_boot = True
+                    self._note_filling_started()
                     self.state.sale_evidence.note_filling()
                     self.state.sale_lifecycle = SaleLifecycle.FILLING
                 elif status is WaynePumpStatus.AUTHORIZED:
@@ -720,6 +934,8 @@ class PumpSession:
                         self.state.sale_evidence.reset_attempt()
                         self.state.filled_volume_raw = 0
                         self.state.filled_amount_raw = 0
+                        self._filling_started_at = None
+                        self._held_completion = None
             except ValueError:
                 pass
         if mapped.nozzle_out is not None:
@@ -731,9 +947,13 @@ class PumpSession:
             elif prev is not new_pos:
                 self.state.nozzle_position = new_pos
                 if new_pos is NozzlePosition.OUT:
+                    self._noz_in_edge_at = None
+                    if self._held_completion is not None:
+                        self._suppress_held_completion(reason="noz_out_edge")
                     self.state.sale_evidence.note_nozzle_out()
                     self.state.sale_lifecycle = SaleLifecycle.NOZZLE_LIFTED
                 elif new_pos is NozzlePosition.IN:
+                    self._noz_in_edge_at = datetime.now(UTC)
                     ev = self.state.sale_evidence
                     if ev.lifecycle in {
                         SaleLifecycle.NOZZLE_LIFTED,
@@ -982,6 +1202,7 @@ class PumpSession:
             PumpEvent.FILLING_UPDATED,
         }:
             self._filling_seen_this_boot = True
+            self._note_filling_started()
             self.state.sale_evidence.note_filling()
             # New FILLING_STARTED must not keep max() peaks from a prior sale
             # face. Do not wipe meter progress that already arrived while
@@ -997,6 +1218,7 @@ class PumpSession:
                     self.state.filled_volume_raw = 0
                     self.state.filled_amount_raw = 0
                     self.state.sale_evidence.reset_attempt()
+                    self._filling_started_at = datetime.now(UTC)
                 self.state.sale_evidence.note_filling()
                 self.state.sale_lifecycle = SaleLifecycle.FILLING
         # Gate sale finalize: FILLING_COMPLETED without valid evidence → no sale.
@@ -1010,18 +1232,24 @@ class PumpSession:
             # Credit filling from a real FILLING observation this boot — never
             # from a retained FILLING_COMPLETE face after restart. Also credit
             # when Wayne skipped DC1 FILLING but DC2 already shows delivery
-            # while still AUTHORIZED / NOZZLE_UP (SAO pump-2 hang-up case).
+            # while still AUTHORIZED / NOZZLE_UP / DISCOVERING (SM lag).
             if (
                 self._filling_seen_this_boot
                 or ctx0.current_state is PumpState.FILLING
                 or ctx0.previous_state is PumpState.FILLING
                 or (
                     ctx0.current_state
-                    in {PumpState.AUTHORIZED, PumpState.NOZZLE_UP}
+                    in {
+                        PumpState.AUTHORIZED,
+                        PumpState.NOZZLE_UP,
+                        PumpState.DISCOVERING,
+                    }
                     and (live_vol > 0 or live_amt > 0)
                 )
             ):
                 self.state.sale_evidence.filling_observed = True
+                # Do not stamp _filling_started_at here — that would make every
+                # hang-up look like a micro-fill and hold legitimate sales.
                 if not self._filling_seen_this_boot and (live_vol > 0 or live_amt > 0):
                     self._filling_seen_this_boot = True
             stale_sm = ctx0.dispensed_volume_raw
@@ -1144,6 +1372,14 @@ class PumpSession:
                         inferences=mapped.inferences,
                         warnings=(*mapped.warnings, f"sale_suppressed:{reason}"),
                     )
+            elif (
+                mapped.completion_evidence_key is not None
+                and (hold_reason := self._completion_hold_reason(now=datetime.now(UTC)))
+            ):
+                # Holster bounce / micro-session: defer PersistenceBridge finalize.
+                mapped = self._arm_completion_hold(
+                    mapped, reason=hold_reason, now=datetime.now(UTC)
+                )
         before_ctx = self.machine.context
         before = before_ctx.current_state
         was_awaiting = before_ctx.awaiting_filling_complete

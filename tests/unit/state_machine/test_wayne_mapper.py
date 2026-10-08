@@ -105,6 +105,38 @@ def test_dc3_nozzle_return_during_filling() -> None:
     assert mapped.awaiting_filling_complete is True
 
 
+def test_dc3_nozzle_return_discovering_with_volume_awaits() -> None:
+    tx = decode_data_payload(bytes.fromhex("03 04 00 11 75 01")).transactions[0]
+    mapped = map_wayne_observation(
+        tx,
+        context=MapperContext(
+            resolve_as_dc3=True,
+            current_state=PumpState.DISCOVERING,
+            previous_wayne_status=int(WaynePumpStatus.FILLING),
+            nozzle_out=True,
+            dispensed_volume_raw=30,
+        ),
+    )
+    assert mapped.event is PumpEvent.NOZZLE_RETURNED
+    assert mapped.awaiting_filling_complete is True
+
+
+def test_dc3_nozzle_return_authorized_with_volume_awaits() -> None:
+    tx = decode_data_payload(bytes.fromhex("03 04 00 11 75 01")).transactions[0]
+    mapped = map_wayne_observation(
+        tx,
+        context=MapperContext(
+            resolve_as_dc3=True,
+            current_state=PumpState.AUTHORIZED,
+            previous_wayne_status=int(WaynePumpStatus.AUTHORIZED),
+            nozzle_out=True,
+            dispensed_volume_raw=9,
+        ),
+    )
+    assert mapped.event is PumpEvent.NOZZLE_RETURNED
+    assert mapped.awaiting_filling_complete is True
+
+
 def test_dc2_maps_to_filling_updated() -> None:
     tx = decode_data_payload(bytes.fromhex("02 08 00 00 00 00 00 00 00 00")).transactions[0]
     mapped = map_wayne_observation(tx)

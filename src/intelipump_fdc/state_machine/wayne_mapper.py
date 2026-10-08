@@ -495,6 +495,7 @@ def _map_nozzle_return_edge(
     base_kwargs: dict[str, Any],
 ) -> MappedWayneObservation:
     state = ctx.current_state
+    volume = int(ctx.dispensed_volume_raw or 0)
     if state in {PumpState.FILLING, PumpState.SUSPENDED}:
         frame = base_kwargs["observation"].source_frame_raw_hex or ""
         return MappedWayneObservation(
@@ -527,7 +528,6 @@ def _map_nozzle_return_edge(
         )
 
     if state is PumpState.AUTHORIZED:
-        volume = ctx.dispensed_volume_raw or 0
         if volume <= 0:
             return MappedWayneObservation(
                 event=PumpEvent.NOZZLE_RETURNED,
@@ -538,8 +538,44 @@ def _map_nozzle_return_edge(
                 warnings=("authorization_cancelled_no_dispense",),
                 **base_kwargs,
             )
+        # AUTHORIZED with face volume: hang-up await (do not idle-return).
+        frame = base_kwargs["observation"].source_frame_raw_hex or ""
+        return MappedWayneObservation(
+            event=PumpEvent.NOZZLE_RETURNED,
+            awaiting_filling_complete=True,
+            completion_evidence_key=f"nozzle_return_pending:{frame}",
+            inferences=(
+                "INFERENCE: AUTHORIZED + positive DC2 + NOZIO OUT→IN → "
+                "NOZZLE_RETURNED; await DC1 FILLING_COMPLETED.",
+            ),
+            warnings=(
+                "Nozzle hang-up during AUTHORIZED delivery; FILLING_COMPLETE "
+                "pending DC1 confirmation.",
+            ),
+            **base_kwargs,
+        )
 
-    # Idle / NOZZLE_UP / others: READY only on false→true readiness edge.
+    # SM lagged (DISCOVERING / NOZZLE_UP) while live DC2 already shows delivery.
+    if state in {PumpState.DISCOVERING, PumpState.NOZZLE_UP} and volume > 0:
+        frame = base_kwargs["observation"].source_frame_raw_hex or ""
+        return MappedWayneObservation(
+            event=PumpEvent.NOZZLE_RETURNED,
+            awaiting_filling_complete=True,
+            completion_evidence_key=f"nozzle_return_pending:{frame}",
+            inferences=(
+                "INFERENCE: NOZIO OUT→IN while SM "
+                f"{state.value if state is not None else 'None'} but "
+                f"dispensed_volume_raw={volume} → hang-up await "
+                "(ObservedStatus was ahead of SM).",
+            ),
+            warnings=(
+                "Nozzle hang-up with lagged SM; FILLING_COMPLETE pending "
+                "DC1 confirmation.",
+            ),
+            **base_kwargs,
+        )
+
+    # Idle / others: READY only on false→true readiness edge.
     return _maybe_ready_or_status(
         ctx,
         base_kwargs=base_kwargs,
