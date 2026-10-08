@@ -52,6 +52,8 @@ VALID_CASES: list[tuple[PumpState, PumpEvent, PumpState]] = [
     (PumpState.NOZZLE_UP, PumpEvent.NOZZLE_RETURNED, PumpState.RESET),
     (PumpState.AUTHORIZED, PumpEvent.FILLING_STARTED, PumpState.FILLING),
     (PumpState.AUTHORIZED, PumpEvent.NOZZLE_RETURNED, PumpState.RESET),
+    (PumpState.AUTHORIZED, PumpEvent.FILLING_COMPLETED, PumpState.FILLING_COMPLETE),
+    (PumpState.NOZZLE_UP, PumpEvent.FILLING_COMPLETED, PumpState.FILLING_COMPLETE),
     (PumpState.FILLING, PumpEvent.FILLING_UPDATED, PumpState.FILLING),
     (PumpState.FILLING, PumpEvent.FILLING_COMPLETED, PumpState.FILLING_COMPLETE),
     (PumpState.FILLING, PumpEvent.NOZZLE_RETURNED, PumpState.FILLING_COMPLETE),

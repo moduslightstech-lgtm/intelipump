@@ -1002,19 +1002,28 @@ class PumpSession:
         # Gate sale finalize: FILLING_COMPLETED without valid evidence → no sale.
         if mapped.event is PumpEvent.FILLING_COMPLETED:
             ctx0 = self.machine.context
-            # Credit filling only from a real FILLING observation this boot —
-            # never from a retained FILLING_COMPLETE face after restart.
-            if (
-                self._filling_seen_this_boot
-                or ctx0.current_state is PumpState.FILLING
-                or ctx0.previous_state is PumpState.FILLING
-            ):
-                self.state.sale_evidence.filling_observed = True
             # Prefer live DC2 peaks. Fall back to SM dispensed_volume_raw only when
             # live peaks are empty (timeout finalize without a recent DC2 tick).
             # Never max() a stale SM volume onto a non-zero live peak (42 vs 19).
             live_vol = int(self.state.filled_volume_raw or 0)
             live_amt = int(self.state.filled_amount_raw or 0)
+            # Credit filling from a real FILLING observation this boot — never
+            # from a retained FILLING_COMPLETE face after restart. Also credit
+            # when Wayne skipped DC1 FILLING but DC2 already shows delivery
+            # while still AUTHORIZED / NOZZLE_UP (SAO pump-2 hang-up case).
+            if (
+                self._filling_seen_this_boot
+                or ctx0.current_state is PumpState.FILLING
+                or ctx0.previous_state is PumpState.FILLING
+                or (
+                    ctx0.current_state
+                    in {PumpState.AUTHORIZED, PumpState.NOZZLE_UP}
+                    and (live_vol > 0 or live_amt > 0)
+                )
+            ):
+                self.state.sale_evidence.filling_observed = True
+                if not self._filling_seen_this_boot and (live_vol > 0 or live_amt > 0):
+                    self._filling_seen_this_boot = True
             stale_sm = ctx0.dispensed_volume_raw
             if live_vol > 0 or live_amt > 0:
                 self.state.sale_evidence.note_dc2(

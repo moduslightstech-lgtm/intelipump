@@ -41,6 +41,11 @@ TRANSITION_TABLE: dict[tuple[PumpState, PumpEvent], PumpState] = {
     # Cancel auth with no dispense; READY only if readiness edge follows.
     (PumpState.AUTHORIZED, PumpEvent.NOZZLE_RETURNED): PumpState.RESET,
     (PumpState.AUTHORIZED, PumpEvent.NOZZLE_LIFTED): PumpState.AUTHORIZED,
+    # Wayne can jump DC1 AUTHORIZED → FILLING_COMPLETED (skip STATUS=4 FILLING)
+    # while DC2 already carried face volume. Without this edge, hang-up is
+    # rejected and the sale stays ACTIVE forever (sidecar no longer settles).
+    (PumpState.AUTHORIZED, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
+    (PumpState.NOZZLE_UP, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
     (PumpState.FILLING, PumpEvent.FILLING_UPDATED): PumpState.FILLING,
     (PumpState.FILLING, PumpEvent.FILLING_COMPLETED): PumpState.FILLING_COMPLETE,
     # Hang-up: leave FILLING; await/confirm DC1 FILLING_COMPLETED.
