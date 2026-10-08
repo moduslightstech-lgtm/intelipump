@@ -35,6 +35,21 @@ from intelipump_fdc.services.persistence_worker import PersistFlushIncompleteErr
 from intelipump_fdc.services.recovery_service import format_recovery_report
 
 
+def _load_meter_channel_map(settings) -> dict | None:
+    """Best-effort channel map for meter result annotation (read-only)."""
+    path = settings.channel_map_path
+    if not path:
+        return None
+    try:
+        from pathlib import Path
+
+        text = Path(path).read_text(encoding="utf-8")
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     settings = get_settings()
     parser = argparse.ArgumentParser(
@@ -295,6 +310,7 @@ def run(argv: list[str] | None = None) -> None:
         prod_sole = bool(
             getattr(args, "confirm_production_sole_controller_dispense", False)
         )
+        meter_cfg = settings.meter_reading
         safety = ControllerSafetyContext(
             environment=settings.environment,
             mode=mode,
@@ -305,6 +321,10 @@ def run(argv: list[str] | None = None) -> None:
             allow_virtual_polling=True,
             owned_lab_active_session=owned,
             production_sole_controller_session=owned and prod_sole,
+            hardware_meter_cd101_enabled=bool(meter_cfg.hardware_cd101),
+            hardware_meter_allowed_addresses=meter_cfg.allowed_address_set(),
+            hardware_meter_allowed_device_id=meter_cfg.allowed_device_id,
+            hardware_meter_device_id=settings.controller.device_id,
         )
         # Keep default LAB helper available for tests; CLI always overrides.
         _ = default_lab_safety
@@ -368,6 +388,12 @@ def run(argv: list[str] | None = None) -> None:
             startup_unit_price=startup_price,
             logical_nozzle_count=args.logical_nozzle_count,
             sale_display_hold_seconds=hold_s,
+            meter_hardware_cd101=bool(meter_cfg.hardware_cd101),
+            meter_counter_select=int(meter_cfg.counter_select),
+            meter_volume_decimals=meter_cfg.volume_decimals,
+            meter_response_timeout_s=float(meter_cfg.response_timeout_seconds),
+            meter_min_interval_s=float(meter_cfg.min_interval_seconds),
+            meter_channel_map=_load_meter_channel_map(settings),
         )
         loop_ctrl = ControllerLoop(runtime)
         persistence = None

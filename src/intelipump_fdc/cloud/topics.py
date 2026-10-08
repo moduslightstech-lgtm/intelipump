@@ -77,6 +77,10 @@ class TopicBuilder:
         c = _validate_id("correlation_id", correlation_id)
         return f"{self._root()}/stations/{s}/commands/{c}/result"
 
+    def meter_readings(self, station_id: str) -> str:
+        s = _validate_id("station_id", station_id)
+        return f"{self._root()}/stations/{s}/meter-readings"
+
     def sale_acks(self, device_id: str) -> str:
         """Cloud → device application ACK that a sale was committed in PostgreSQL."""
         d = _validate_id("device_id", device_id)

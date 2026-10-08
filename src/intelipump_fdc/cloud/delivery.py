@@ -20,6 +20,9 @@ PUBLISHABLE_QUEUE_EVENTS = frozenset(
         "FILLING_UPDATED",
         "POSSIBLE_UNINTENDED_FLOW",
         "CANCELLED_NO_SALE",
+        "METER_READING",
+        "METER_READING_UNSUPPORTED",
+        "PUMP_METER_READING",
     }
 )
 
@@ -104,6 +107,12 @@ class DeliveryMapper:
             "CANCELLED_NO_SALE",
         }:
             return self._topics.transactions(self._station_id)
+        if event_type in {
+            "METER_READING",
+            "METER_READING_UNSUPPORTED",
+            "PUMP_METER_READING",
+        }:
+            return self._topics.meter_readings(self._station_id)
         if event_type.startswith("ALARM"):
             return self._topics.alarms(self._station_id)
         if event_type.startswith("AUDIT"):

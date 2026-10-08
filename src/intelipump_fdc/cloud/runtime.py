@@ -239,6 +239,7 @@ class CloudRuntime:
                         False,
                     )
                 ),
+                meter_reading_settings=self.settings.meter_reading,
             )
 
         try:

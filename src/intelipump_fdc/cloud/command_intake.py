@@ -39,6 +39,9 @@ from intelipump_fdc.simulator.encoding import encode_cd1_command
 from intelipump_fdc.state_machine.guards import evaluate_command_eligibility
 from intelipump_fdc.state_machine.models import PumpContext
 from intelipump_fdc.cloud.mqtt.errors import MqttError, MqttNotConnectedError, MqttPublishError
+from intelipump_fdc.core.config import MeterReadingSettings
+from intelipump_fdc.services import meter_reading as meter_svc
+
 logger = structlog.get_logger(__name__)
 
 _CD1_MAP: dict[PumpCommand, PumpControlCommand] = {
@@ -75,6 +78,7 @@ class CloudCommandIntake:
         allow_lab_simulator_commands: bool,
         controller_loop: ControllerLoop | None = None,
         allow_production_remote_set_price: bool = False,
+        meter_reading_settings: MeterReadingSettings | None = None,
     ) -> None:
         self._factory = session_factory
         self._mqtt = mqtt
@@ -86,6 +90,7 @@ class CloudCommandIntake:
         self._allow_lab = allow_lab_simulator_commands
         self._loop = controller_loop
         self._allow_production_set_price = bool(allow_production_remote_set_price)
+        self._meter_settings = meter_reading_settings or MeterReadingSettings()
         self._seen: set[str] = set()
         self.active = False
         self._seq = 0
@@ -271,6 +276,7 @@ class CloudCommandIntake:
         current_state = "UNKNOWN"
         resulting_state: str | None = None
         eligible = False
+        meter_result_extra: dict[str, Any] | None = None
 
         try:
             command = PumpCommand(cmd.commandType)
@@ -439,6 +445,163 @@ class CloudCommandIntake:
                 except OSError as exc:
                     reasons.append(f"set_price_write_failed:{exc}")
                     execution_status = "ENQUEUE_FAILED"
+        elif command is PumpCommand.READ_METER and not any(
+            r in reasons
+            for r in (
+                "wrong_station",
+                "wrong_environment",
+                "expired",
+                "duplicate_correlation_id",
+                "duplicate_persisted_command",
+                "unknown_command_type",
+                "pump_not_found",
+            )
+        ):
+            # Additive meter reconciliation: default UNSUPPORTED (never invent zeros).
+            # Optional auto-CD101 uses the existing outbound queue only — no new serial.
+            nozzle_id = meter_svc.nozzle_from_payload(cmd.payload)
+            dart_address = None
+            if ctx is not None:
+                dart_address = int(ctx.dart_address)
+            elif isinstance((cmd.payload or {}).get("dartAddress"), int):
+                dart_address = int(cmd.payload["dartAddress"])
+            rate_limited = meter_svc.is_rate_limited(
+                station_id=self._station_id,
+                pump_id=cmd.pumpId,
+                nozzle_id=nozzle_id,
+                min_interval_seconds=self._meter_settings.min_interval_seconds,
+            )
+            pending_count = 0
+            async with unit_of_work(self._factory) as uow:
+                pending_count = await uow.meter_readings.count_pending(
+                    station_id=self._station_id, pump_id=cmd.pumpId
+                )
+            state_for_gate = ctx.current_state if ctx is not None else current_state
+            execution_status, meter_error_code, meter_message = meter_svc.decide_read_meter(
+                settings=self._meter_settings,
+                current_state=state_for_gate,
+                pending_count=pending_count,
+                rate_limited=rate_limited,
+            )
+            meter_svc.mark_read_attempt(
+                station_id=self._station_id,
+                pump_id=cmd.pumpId,
+                nozzle_id=nozzle_id,
+            )
+            # Experimental CD101 enqueue is LAB + existing outbound only.
+            # Production never opens a competing serial path or invents totals.
+            if execution_status == "PENDING_CONTROLLER":
+                can_lab_enqueue = (
+                    self_env == "LAB"
+                    and self._allow_lab
+                    and self._loop is not None
+                    and ctx is not None
+                    and self._loop.runtime.transport.metadata.is_virtual_or_memory
+                )
+                if not can_lab_enqueue:
+                    execution_status = "UNSUPPORTED"
+                    meter_error_code = "METER_READ_UNSUPPORTED"
+                    meter_message = (
+                        "AUTO_CD101 is set but live/production serial meter capture "
+                        "is not enabled; reporting unsupported (no invented zero)."
+                    )
+                else:
+                    item = OutboundDataItem.create(
+                        address=ctx.dart_address,
+                        application_payload=meter_svc.build_cd101_outbound_payload(),
+                        command_type=PumpCommand.READ_METER,
+                        simulator_only=True,
+                        idempotency=IdempotencyClass.IDEMPOTENT,
+                    )
+                    from dataclasses import replace
+
+                    safety = replace(
+                        self._loop.runtime.safety, allow_lab_simulator_commands=True
+                    )
+                    try:
+                        self._loop.runtime.outbound.enqueue(item, safety)
+                        executed = True
+                        resulting_state = current_state
+                        logger.info(
+                            "meter_read_cd101_queued",
+                            correlationId=cmd.correlationId,
+                            pumpId=cmd.pumpId,
+                            nozzleId=nozzle_id,
+                            address=ctx.dart_address,
+                        )
+                    except (OutboundRejectedError, OutboundQueueFullError) as exc:
+                        reasons.append(f"enqueue_failed:{exc}")
+                        execution_status = "UNSUPPORTED"
+                        meter_error_code = "METER_READ_ENQUEUE_FAILED"
+                        meter_message = (
+                            f"CD101 enqueue failed; reporting unsupported: {exc}"
+                        )
+            # Persist local unsupported/pending evidence + durable cloud delivery.
+            meter_event = (
+                "METER_READING"
+                if execution_status == "PENDING_CONTROLLER"
+                else "METER_READING_UNSUPPORTED"
+            )
+            meter_status = (
+                "PENDING_CONTROLLER"
+                if execution_status == "PENDING_CONTROLLER"
+                else "UNSUPPORTED"
+            )
+            meter_payload = meter_svc.build_unsupported_payload(
+                station_id=self._station_id,
+                device_id=self._device_id,
+                pump_id=cmd.pumpId,
+                nozzle_id=nozzle_id,
+                dart_address=dart_address,
+                correlation_id=cmd.correlationId,
+                reason=meter_message,
+                error_code=meter_error_code,
+                flags={
+                    "automatic_cd101": (
+                        "gated_on" if self._meter_settings.auto_cd101 else "off"
+                    ),
+                    "execution_status": execution_status,
+                },
+            )
+            if execution_status == "PENDING_CONTROLLER":
+                meter_payload["status"] = "PENDING_CONTROLLER"
+                meter_payload["errorCode"] = meter_error_code
+                meter_payload["errorMessage"] = meter_message
+            meter_dedupe = f"meter:{self._station_id}:{cmd.correlationId}:{nozzle_id}"
+            async with unit_of_work(self._factory) as uow:
+                await uow.meter_readings.create(
+                    station_id=self._station_id,
+                    device_id=self._device_id,
+                    pump_id=cmd.pumpId,
+                    nozzle_id=nozzle_id,
+                    dart_address=dart_address,
+                    source="READ_NOW",
+                    status=meter_status,
+                    deduplication_key=meter_dedupe,
+                    correlation_id=cmd.correlationId,
+                    requested_at=datetime.now(UTC),
+                    raw_evidence=meter_payload.get("rawEvidence"),
+                    software_version=meter_svc.SOFTWARE_VERSION,
+                    flags=meter_payload.get("flags"),
+                    error_code=meter_error_code,
+                    error_message=meter_message,
+                )
+                await uow.sync_queue.enqueue_checked(
+                    entity_type="meter_reading",
+                    entity_id=cmd.correlationId,
+                    event_type=meter_event,
+                    payload=meter_payload,
+                    deduplication_key=meter_dedupe,
+                )
+            warnings = list(warnings) + [meter_message]
+            resulting_state = resulting_state or current_state
+            meter_result_extra = {
+                "nozzleId": nozzle_id,
+                "meterStatus": meter_status,
+                "meterEvent": meter_event,
+                "meterMessage": meter_message,
+                "errorCode": meter_error_code,
+            }
         elif command is not None and command in NON_IDEMPOTENT_COMMANDS:
             if not (
                 self_env == "LAB"
@@ -516,6 +679,9 @@ class CloudCommandIntake:
                 "QUEUED_FOR_CONTROLLER",
                 "PENDING_CONTROLLER",
                 "EVALUATED_ONLY",
+                "UNSUPPORTED",
+                "RATE_LIMITED",
+                "DEFERRED",
             }
             and "expired" not in reasons
             and "wrong_station" not in reasons
@@ -539,6 +705,15 @@ class CloudCommandIntake:
         if rejected:
             accepted = False
             execution_status = "REJECTED"
+        elif command is PumpCommand.READ_METER and execution_status in {
+            "UNSUPPORTED",
+            "RATE_LIMITED",
+            "DEFERRED",
+            "PENDING_CONTROLLER",
+        }:
+            # Controller answered read-only meter request; soft eligibility
+            # warnings must not hide the unsupported/deferred outcome.
+            accepted = True
 
         self._seen.add(cmd.correlationId)
 
@@ -598,6 +773,8 @@ class CloudCommandIntake:
             "simulated": self._simulated or cmd.simulatorOnly,
             "timestamp": datetime.now(UTC).isoformat(),
         }
+        if meter_result_extra:
+            result_payload.update(meter_result_extra)
         self._seq += 1
         envelope = build_envelope(
             event_type="COMMAND_RESULT",

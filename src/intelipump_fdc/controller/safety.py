@@ -10,7 +10,7 @@ from intelipump_fdc.domain.pump_command import NON_IDEMPOTENT_COMMANDS, PumpComm
 
 _ACTIVE_COMMANDS: frozenset[PumpCommand] = frozenset(NON_IDEMPOTENT_COMMANDS)
 _READ_COMMANDS: frozenset[PumpCommand] = frozenset(
-    {PumpCommand.READ_STATUS, PumpCommand.READ_TOTALS}
+    {PumpCommand.READ_STATUS, PumpCommand.READ_TOTALS, PumpCommand.READ_METER}
 )
 _OWNED_LAB_COMMANDS: frozenset[PumpCommand] = frozenset(
     {
@@ -41,6 +41,11 @@ class ControllerSafetyContext:
     owned_lab_active_session: bool = False
     # PRODUCTION sole pump controller (same command set as owned-lab). Default OFF.
     production_sole_controller_session: bool = False
+    # Attended real-hardware CD101 (READ_METER only). Default OFF.
+    hardware_meter_cd101_enabled: bool = False
+    hardware_meter_allowed_addresses: frozenset[int] = frozenset()
+    hardware_meter_allowed_device_id: str | None = None
+    hardware_meter_device_id: str | None = None
 
 
 def evaluate_outbound_safety(
@@ -71,6 +76,15 @@ def evaluate_outbound_safety(
                 "use_intelipump_continuous_poll_bench",
             ),
         )
+
+    # Narrow attended canary: READ_METER CD101 on allowlisted address only.
+    # Does not enable AUTHORIZE / RESET / SET_PRICE.
+    if (
+        item.command_type is PumpCommand.READ_METER
+        and ctx.hardware_meter_cd101_enabled
+        and not item.simulator_only
+    ):
+        return _evaluate_hardware_meter_cd101(item, ctx)
 
     if item.command_type in _READ_COMMANDS:
         if ctx.owned_lab_active_session:
@@ -117,6 +131,29 @@ def _owned_lab_environment_ok(ctx: ControllerSafetyContext) -> bool:
     if env == "LAB":
         return True
     return env in {"PRODUCTION", "PROD"} and ctx.production_sole_controller_session
+
+
+def _evaluate_hardware_meter_cd101(
+    item: OutboundDataItem,
+    ctx: ControllerSafetyContext,
+) -> SafetyDecision:
+    """Allow one gated read-only CD101 on the sole controller bus."""
+    reasons: list[str] = []
+    if ctx.mode is not ControllerMode.BENCH_CONTROL:
+        reasons.append("hardware_meter_requires_BENCH_CONTROL")
+    if not ctx.hardware_meter_allowed_addresses:
+        reasons.append("hardware_meter_allowed_addresses_empty")
+    if item.address not in ctx.hardware_meter_allowed_addresses:
+        reasons.append(f"hardware_meter_address_{item.address}_not_allowlisted")
+    expected = (ctx.hardware_meter_allowed_device_id or "").strip()
+    actual = (ctx.hardware_meter_device_id or "").strip()
+    if not expected:
+        reasons.append("hardware_meter_allowed_device_id_unset")
+    elif not actual or actual != expected:
+        reasons.append("hardware_meter_device_id_mismatch")
+    if item.command_type is not PumpCommand.READ_METER:
+        reasons.append("hardware_meter_only_allows_READ_METER")
+    return SafetyDecision(allowed=not reasons, reasons=tuple(reasons))
 
 
 def _evaluate_owned_lab_active(

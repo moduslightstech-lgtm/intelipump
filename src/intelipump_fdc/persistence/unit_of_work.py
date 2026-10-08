@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from intelipump_fdc.persistence.repositories.alarms import AlarmRepository
 from intelipump_fdc.persistence.repositories.audit import AuditRepository
 from intelipump_fdc.persistence.repositories.commands import CommandRepository
+from intelipump_fdc.persistence.repositories.meter_readings import MeterReadingRepository
 from intelipump_fdc.persistence.repositories.nozzle_baselines import NozzleSaleBaselineRepository
 from intelipump_fdc.persistence.repositories.pumps import PumpRepository
 from intelipump_fdc.persistence.repositories.states import StateRepository
@@ -29,6 +30,7 @@ class UnitOfWork:
     audit: AuditRepository
     sync_queue: SyncQueueRepository
     nozzle_baselines: NozzleSaleBaselineRepository
+    meter_readings: MeterReadingRepository
 
 
 @asynccontextmanager
@@ -48,6 +50,7 @@ async def unit_of_work(
                 audit=AuditRepository(session),
                 sync_queue=SyncQueueRepository(session),
                 nozzle_baselines=NozzleSaleBaselineRepository(session),
+                meter_readings=MeterReadingRepository(session),
             )
     finally:
         await session.close()

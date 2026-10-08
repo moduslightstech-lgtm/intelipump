@@ -128,6 +128,24 @@ def evaluate_command_eligibility(
             requires_active_commands_enabled=False,
         )
 
+    if command is PumpCommand.READ_METER:
+        # Read-only reconciliation. Production auto-CD101 is gated elsewhere;
+        # eligibility here never authorizes dispensing or invents a value.
+        if not context.communication_healthy:
+            blocking.append("communication_unhealthy")
+        return CommandEligibilityResult(
+            eligible=not blocking,
+            command=command,
+            current_state=context.current_state,
+            blocking_reasons=tuple(blocking),
+            warnings=(
+                "Meter read is unsupported until auto-CD101 is enabled and "
+                "physically validated; never use last-sale DC2 as a totalizer.",
+            ),
+            requires_physical_enable=False,
+            requires_active_commands_enabled=False,
+        )
+
     if command is PumpCommand.SET_PRICE:
         if not context.communication_healthy:
             blocking.append("communication_unhealthy")

@@ -105,6 +105,13 @@ class ControllerRuntime:
     # Non-negative = hold N seconds then RESET while hung (faster next-lift
     # AUTHORIZE, but clears the face before the next lift).
     sale_display_hold_seconds: float = -1.0
+    # Attended hardware meter canary (from MeterReadingSettings). Default off.
+    meter_hardware_cd101: bool = False
+    meter_counter_select: int = 1
+    meter_volume_decimals: int | None = None
+    meter_response_timeout_s: float = 8.0
+    meter_min_interval_s: float = 60.0
+    meter_channel_map: dict | None = None
 
 
 class ControllerLoop:
@@ -112,6 +119,8 @@ class ControllerLoop:
 
     def __init__(self, runtime: ControllerRuntime) -> None:
         self.runtime = runtime
+        self._meter_pending: dict | None = None
+        self._meter_last_attempt_mono: dict[int, float] = {}
         thresholds = HealthThresholds(
             degraded_after_timeouts=runtime.config.degraded_after_timeouts,
             disconnected_after_timeouts=runtime.config.max_consecutive_timeouts,
@@ -415,6 +424,7 @@ class ControllerLoop:
                 if self._rx_task is None or self._rx_task.done():
                     self._start_rx_task()
                 await self._apply_pending_cloud_set_price()
+                await self._apply_pending_meter_read()
                 for address in self.runtime.config.addresses:
                     if self._stop.is_set():
                         break
@@ -2457,6 +2467,279 @@ class ControllerLoop:
                 f"[CLOUD-PRICE] late DC3 verified {sorted(newly)} for "
                 f"{pending.unit_price_raw} corr={pending.correlation_id} "
                 f"→ {exec_status} (no CD5 resend)"
+            )
+
+    async def _apply_pending_meter_read(self) -> None:
+        """One-shot gated CD101 via existing outbound (attended canary).
+
+        Never invents a zero totalizer. Never RESET / SET_PRICE / AUTHORIZE.
+        Disabled unless ``runtime.meter_hardware_cd101`` and safety allowlist.
+        """
+        from intelipump_fdc.controller.meter_read_request import (
+            clear_meter_read_request,
+            read_meter_read_request,
+            write_meter_read_result,
+        )
+        from intelipump_fdc.protocol.cd101 import build_cd101_request
+        from intelipump_fdc.services.meter_reading import dispensing_blocks_read
+
+        if not self.runtime.meter_hardware_cd101:
+            return
+
+        # Finish in-flight wait for DC101 before accepting a new request.
+        if self._meter_pending is not None:
+            await self._finish_pending_meter_read()
+            return
+
+        req = read_meter_read_request()
+        if req is None:
+            return
+
+        safety = self.runtime.safety
+        now = time.monotonic()
+        addr = int(req.dart_address)
+        result_base = {
+            "correlationId": req.correlation_id,
+            "dartAddress": addr,
+            "counterSelect": int(req.counter_select),
+            "requestedAt": req.requested_at,
+            "requestedBy": req.requested_by,
+            "nozzleHint": req.nozzle_hint,
+            "deviceId": safety.hardware_meter_device_id,
+            "status": "ERROR",
+            "readOnly": True,
+            "specRef": {
+                "cd101": "Pump Interface Rev 2.11, page 19, CD101",
+                "dc101": "Pump Interface Rev 2.11, page 25, DC101",
+            },
+        }
+
+        def _fail(status: str, code: str, message: str) -> None:
+            write_meter_read_result(
+                {
+                    **result_base,
+                    "status": status,
+                    "errorCode": code,
+                    "errorMessage": message,
+                    "volumeLiters": None,
+                    "cumulativeVolumeRaw": None,
+                    "capturedAt": None,
+                }
+            )
+            clear_meter_read_request()
+            logger.warning(
+                "meter_read_refused",
+                correlationId=req.correlation_id,
+                address=addr,
+                status=status,
+                errorCode=code,
+                detail=message,
+            )
+
+        if not safety.hardware_meter_cd101_enabled:
+            _fail(
+                "UNSUPPORTED",
+                "METER_HARDWARE_GATE_OFF",
+                "hardware_meter_cd101_enabled is false",
+            )
+            return
+        if addr not in safety.hardware_meter_allowed_addresses:
+            _fail(
+                "UNSUPPORTED",
+                "METER_ADDRESS_NOT_ALLOWLISTED",
+                f"address {addr} not in hardware meter allowlist",
+            )
+            return
+        if addr not in self.sessions:
+            _fail(
+                "ERROR",
+                "METER_ADDRESS_NOT_IN_POLL_SET",
+                f"address {addr} is not polled by this controller",
+            )
+            return
+
+        last = self._meter_last_attempt_mono.get(addr)
+        if last is not None and (now - last) < float(self.runtime.meter_min_interval_s):
+            _fail(
+                "RATE_LIMITED",
+                "METER_READ_RATE_LIMITED",
+                f"min interval {self.runtime.meter_min_interval_s}s not elapsed",
+            )
+            return
+
+        session = self.sessions[addr]
+        if dispensing_blocks_read(session.machine.context.current_state):
+            _fail(
+                "DEFERRED",
+                "METER_READ_DEFERRED_DISPENSING",
+                "pump busy dispensing; retry when idle",
+            )
+            return
+
+        coun = int(req.counter_select or self.runtime.meter_counter_select)
+        try:
+            cd101 = build_cd101_request(counter_select=coun)
+        except Exception as exc:  # noqa: BLE001
+            _fail("ERROR", "METER_CD101_BUILD_FAILED", str(exc))
+            return
+
+        item = OutboundDataItem.create(
+            address=addr,
+            application_payload=cd101.application_payload,
+            command_type=PumpCommand.READ_METER,
+            simulator_only=False,
+            idempotency=IdempotencyClass.IDEMPOTENT,
+            ttl_ms=int(max(5.0, self.runtime.meter_response_timeout_s) * 1000),
+            max_retries=0,
+        )
+        decision = evaluate_outbound_safety(item, safety)
+        if not decision.allowed:
+            _fail(
+                "UNSUPPORTED",
+                "METER_SAFETY_BLOCKED",
+                ",".join(decision.reasons),
+            )
+            return
+
+        self._meter_last_attempt_mono[addr] = now
+        # Clear prior DC101 so we only accept a fresh reply after this TX.
+        session.state.last_dc101 = None
+        session.state.last_dc101_at_mono = None
+        session.state.last_dc101_frame_hex = None
+        try:
+            self.runtime.outbound.enqueue(item, safety)
+        except OutboundRejectedError as exc:
+            _fail("UNSUPPORTED", "METER_OUTBOUND_REJECTED", ",".join(exc.reasons))
+            return
+
+        self._meter_pending = {
+            "correlation_id": req.correlation_id,
+            "address": addr,
+            "counter_select": coun,
+            "request_payload_hex": cd101.payload_hex,
+            "queued_at_mono": now,
+            "deadline_mono": now + float(self.runtime.meter_response_timeout_s),
+            "requested_at": req.requested_at,
+            "requested_by": req.requested_by,
+            "nozzle_hint": req.nozzle_hint,
+            "outbound_correlation_id": item.correlation_id,
+            "result_base": result_base,
+        }
+        clear_meter_read_request()
+        logger.info(
+            "meter_read_cd101_queued",
+            correlationId=req.correlation_id,
+            address=addr,
+            counterSelect=coun,
+            payloadHex=cd101.payload_hex,
+        )
+        print(
+            f"[METER-READ] queued CD101 addr={addr} coun={coun} "
+            f"corr={req.correlation_id} payload={cd101.payload_hex}"
+        )
+
+    async def _finish_pending_meter_read(self) -> None:
+        from intelipump_fdc.controller.meter_read_request import write_meter_read_result
+
+        pending = self._meter_pending
+        if pending is None:
+            return
+        addr = int(pending["address"])
+        session = self.sessions.get(addr)
+        now = time.monotonic()
+        result_base = dict(pending.get("result_base") or {})
+
+        def _done(payload: dict) -> None:
+            write_meter_read_result(payload)
+            self._meter_pending = None
+            logger.info(
+                "meter_read_finished",
+                correlationId=pending["correlation_id"],
+                address=addr,
+                status=payload.get("status"),
+            )
+            print(
+                f"[METER-READ] finished addr={addr} status={payload.get('status')} "
+                f"corr={pending['correlation_id']}"
+            )
+
+        if session is None:
+            _done(
+                {
+                    **result_base,
+                    "status": "ERROR",
+                    "errorCode": "METER_SESSION_MISSING",
+                    "errorMessage": "session disappeared during meter read",
+                    "volumeLiters": None,
+                    "cumulativeVolumeRaw": None,
+                }
+            )
+            return
+
+        dc101 = session.state.last_dc101
+        dc101_at = session.state.last_dc101_at_mono
+        if (
+            isinstance(dc101, dict)
+            and dc101_at is not None
+            and dc101_at >= float(pending["queued_at_mono"])
+        ):
+            raw_scaled = dc101.get("raw_scaled") if isinstance(dc101.get("raw_scaled"), dict) else {}
+            decimals = self.runtime.meter_volume_decimals
+            # Prefer total_value raw; also expose meter1/meter2 for attended mapping.
+            total_raw = raw_scaled.get("total_value")
+            liters = None
+            if (
+                decimals is not None
+                and isinstance(total_raw, int)
+                and 0x01 <= int(pending["counter_select"]) <= 0x09
+            ):
+                scale = 10 ** int(decimals)
+                liters = total_raw / scale
+            channel = None
+            cmap = self.runtime.meter_channel_map or {}
+            if str(addr) in cmap:
+                channel = cmap[str(addr)]
+            elif addr in cmap:
+                channel = cmap[addr]
+            _done(
+                {
+                    **result_base,
+                    "status": "CAPTURED",
+                    "capturedAt": datetime.now(UTC).isoformat(),
+                    "requestPayloadHex": pending["request_payload_hex"],
+                    "responseFrameHex": session.state.last_dc101_frame_hex,
+                    "decoded": dc101,
+                    "rawScaled": raw_scaled,
+                    "cumulativeVolumeRaw": total_raw if isinstance(total_raw, int) else None,
+                    "volumeDecimals": decimals,
+                    "volumeLiters": liters,
+                    "channelMap": channel,
+                    "mappingNote": (
+                        "Nozzle/meter1/meter2 mapping is unverified until attended "
+                        "face comparison; do not assume which field is the display."
+                    ),
+                    "errorCode": None,
+                    "errorMessage": None,
+                }
+            )
+            return
+
+        if now >= float(pending["deadline_mono"]):
+            _done(
+                {
+                    **result_base,
+                    "status": "UNSUPPORTED",
+                    "errorCode": "METER_DC101_TIMEOUT",
+                    "errorMessage": (
+                        "CD101 queued but no DC101 observed before timeout; "
+                        "reporting unsupported (no invented zero)"
+                    ),
+                    "requestPayloadHex": pending["request_payload_hex"],
+                    "responseFrameHex": None,
+                    "volumeLiters": None,
+                    "cumulativeVolumeRaw": None,
+                    "capturedAt": None,
+                }
             )
 
     async def _apply_pending_cloud_set_price(self) -> None:

@@ -21,6 +21,9 @@ _QOS: dict[str, int] = {
     "AUDIT_EVENT": 1,
     "COMMAND_RESULT": 1,
     "COMMAND_INTAKE": 1,
+    "METER_READING": 1,
+    "METER_READING_UNSUPPORTED": 1,
+    "PUMP_METER_READING": 1,
 }
 
 

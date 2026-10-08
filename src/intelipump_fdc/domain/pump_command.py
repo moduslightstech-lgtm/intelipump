@@ -8,6 +8,8 @@ from enum import StrEnum
 class PumpCommand(StrEnum):
     READ_STATUS = "READ_STATUS"
     READ_TOTALS = "READ_TOTALS"
+    # Additive meter reconciliation (read-only). Not a production CD101 proof.
+    READ_METER = "READ_METER"
     SET_PRICE = "SET_PRICE"
     RESET = "RESET"
     AUTHORIZE = "AUTHORIZE"

@@ -156,6 +156,43 @@ class WatchdogSettings(BaseModel):
     status_interval_s: float = Field(default=15.0, ge=1.0)
 
 
+class MeterReadingSettings(BaseModel):
+    """Additive cumulative meter reconciliation (read-only; default unsupported).
+
+    INTELIPUMP_METER_READING__AUTO_CD101=true — LAB virtual CD101 only.
+    INTELIPUMP_METER_READING__HARDWARE_CD101=true — attended real-hardware
+    one-shot CD101 via the sole controller outbound path (requires allowlists).
+    Default off — never invent zeros; no schedule.
+    """
+
+    auto_cd101: bool = False
+    # Attended real-hardware canary (disabled by default).
+    hardware_cd101: bool = False
+    # Must match INTELIPUMP_CONTROLLER__DEVICE_ID exactly when hardware_cd101.
+    allowed_device_id: str | None = None
+    # Comma-separated DART logical addresses, e.g. "1" or "1,2".
+    allowed_addresses: str = ""
+    # CD101 COUN byte (lab/ePump default 1). Spec: Pump Interface Rev 2.11 p.19.
+    counter_select: int = Field(default=1, ge=0, le=255)
+    # Optional volume decimals for COUN 0x01–0x09 presentation only.
+    # When unset, store raw_scaled only (do not invent litres).
+    volume_decimals: int | None = Field(default=None, ge=0, le=6)
+    response_timeout_seconds: float = Field(default=8.0, ge=1.0, le=60.0)
+    min_interval_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
+    max_pending: int = Field(default=2, ge=1, le=10)
+    # Do not enqueue CD101 while session looks like active dispensing.
+    block_during_dispensing: bool = True
+
+    def allowed_address_set(self) -> frozenset[int]:
+        out: set[int] = set()
+        for part in (self.allowed_addresses or "").split(","):
+            text = part.strip()
+            if not text:
+                continue
+            out.add(int(text))
+        return frozenset(out)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -173,6 +210,7 @@ class Settings(BaseSettings):
     api: ApiSettings = ApiSettings()
     bench: BenchSettings = BenchSettings()
     watchdog: WatchdogSettings = WatchdogSettings()
+    meter_reading: MeterReadingSettings = MeterReadingSettings()
     # JSON object mapping DART address → {pump_id, nozzle_id, source_identifier}.
     # Default (unset) keeps logical pump-{address} for stations that have not
     # migrated. US Lab loads config/channel_map.us-lab.json via CHANNEL_MAP_PATH.

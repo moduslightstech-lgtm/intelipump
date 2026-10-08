@@ -45,6 +45,15 @@ Inbound `SET_PRICE` with `simulatorOnly=false` writes
 `/var/lib/intelipump/set-price-request.json`. The RS-485 controller applies CD5
 on the next idle poll. Remote AUTHORIZE stays off.
 
+### READ_METER (additive reconciliation, read-only)
+
+Dashboard publishes `commandType: "READ_METER"` on the station commands topic.
+Default outcome: `executionStatus=UNSUPPORTED` plus durable
+`METER_READING_UNSUPPORTED` on `…/meter-readings` (never invents a zero totalizer).
+Does not authorize, price, reset, or open a second serial connection.
+Optional `INTELIPUMP_METER_READING__AUTO_CD101=true` may enqueue CD101 only in
+LAB on the existing outbound/virtual path — not a production SAO enablement.
+
 ## Allowed execution
 
 - LAB + `simulatorOnly=true`

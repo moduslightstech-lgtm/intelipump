@@ -20,7 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 AUDIT_GENESIS_HASH = "GENESIS_V1"
 
 NAMING_CONVENTION = {
@@ -265,6 +265,46 @@ class ConfigurationVersionRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MeterReadingRow(Base):
+    """Immutable local cumulative meter observation (additive; not sales)."""
+
+    __tablename__ = "meter_readings"
+    __table_args__ = (
+        UniqueConstraint(
+            "station_id",
+            "deduplication_key",
+            name="uq_meter_readings_station_dedupe",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    station_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    device_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    pump_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    nozzle_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    dart_address: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cumulative_volume_raw: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    volume_decimals: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    volume_liters: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    units: Mapped[str] = mapped_column(String(16), default="liters", nullable=False)
+    captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    slot: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    deduplication_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    raw_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    software_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    flags: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

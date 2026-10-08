@@ -19,6 +19,7 @@ Environment segment is derived from controller environment (`LAB` → `lab`, `PR
 | Audit | `intelipump/{env}/stations/{stationId}/audit` |
 | Commands (inbound) | `intelipump/{env}/stations/{stationId}/commands` |
 | Command result | `intelipump/{env}/stations/{stationId}/commands/{correlationId}/result` |
+| Meter readings (additive recon) | `intelipump/{env}/stations/{stationId}/meter-readings` |
 | Sale application ACK | `intelipump/{env}/devices/{deviceId}/sale-acks` |
 
 ## Identifier rules
@@ -35,5 +36,9 @@ Rejected: empty IDs, wildcards (`+`, `#`), path traversal (`..`, `/`), environme
 | Transaction completed | 1 |
 | Alarm / audit | 1 |
 | Command intake / result | 1 |
+| Meter reading / unsupported | 1 |
 
 Exactly-once business delivery is application-level via `deduplicationKey`, not MQTT QoS.
+
+Meter readings are **not** sale APP_ACK events. Default uplink is
+`METER_READING_UNSUPPORTED` until physical CD101 validation; never a fake zero.

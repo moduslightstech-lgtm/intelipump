@@ -10,6 +10,7 @@ with active commands disabled.
 |---|---|
 | READ_STATUS | Read eligibility |
 | READ_TOTALS | Read eligibility |
+| READ_METER | Read-only meter reconciliation (default unsupported; LAB CD101 gated) |
 | SET_PRICE | Active (future) |
 | RESET | Active (future) |
 | AUTHORIZE | Active (future) |
@@ -46,6 +47,13 @@ commands. No poll is sent.
 ### READ_TOTALS
 
 Allowed when `communication_healthy`. Evaluation only.
+
+### READ_METER
+
+Allowed when `communication_healthy`. Does not authorize dispensing.
+Production controllers report **UNSUPPORTED** (never invent a zero totalizer).
+Optional `INTELIPUMP_METER_READING__AUTO_CD101=true` may enqueue CD101 only in
+**LAB** on the existing outbound/virtual path — not a physical SAO validation.
 
 ### SET_PRICE
 

@@ -188,3 +188,7 @@ class PumpSessionState:
     sale_evidence: SaleEvidence = field(default_factory=SaleEvidence)
     # Events preserved while waiting for command ACK (non-ACK DATA handled).
     pending_command_events: list[str] = field(default_factory=list)
+    # Last DC101 total-counters observation (additive meter canary; not sales).
+    last_dc101: dict | None = None
+    last_dc101_at_mono: float | None = None
+    last_dc101_frame_hex: str | None = None
