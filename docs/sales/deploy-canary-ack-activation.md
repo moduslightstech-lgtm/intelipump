@@ -1,8 +1,10 @@
 # Cloud-first deploy, one-Pi canary, application-ACK activation
 
 **Branches:** `intelipump-fdc` + `DigitalTwin` → `prod_feature`  
-**Pins:** Pi `95e5d5e` · Cloud tip including `ab2b8c5` + live-telemetry separation (`030_live_dispensing_telemetry`) — see `DigitalTwin/docs/sales/release-pins-oct8-session-ack.md`.  
-**Rule:** Do **not** enable `require_application_sale_ack` on SAO until cloud ACK is verified and one attended Pi canary passes. Broker PUBACK ≠ cloud commit.
+**Pins:** Pi `95e5d5edc46fb73c4393a288c8d8ddfaa46c9d0c` · Cloud `62e9a8e05552ca5872a996ffa3d2f2585a05331b` · image tag `prod_feature-62e9a8e05552` — see `DigitalTwin/docs/sales/release-pins-oct8-session-ack.md`.  
+**Executable SAO pump-5 commands:** `docs/sao-oct8-pi-canary.md`.  
+**Rule:** Do **not** enable `require_application_sale_ack` on SAO until cloud ACK is verified and one attended Pi canary passes. Broker PUBACK ≠ cloud commit.  
+**Migrations:** committed head is `030_live_dispensing_telemetry` (revises `028`). Exclude uncommitted `029` meter work from droplet sync.
 
 Physical acceptance is **not** complete until: one observed dispense → one Pi identity → one cloud COMPLETED → one dashboard row, matching amount/litres and delivery status.
 
@@ -18,11 +20,10 @@ cd DigitalTwin
 psql "$DATABASE_URL" -f scripts/migration_028_preflight.sql
 psql "$DATABASE_URL" -f scripts/preflight_sale_dedupe_collisions.sql
 
-# Apply additive migrations only (028 sale identity; do not auto-rewrite history)
-# Keep 029 meter readings separate / already present — do not rewrite sales history.
-docker compose exec api alembic upgrade head
-# or LAB:
-cd lab && ./verify-lab-isolation.sh && docker compose -f docker-compose.lab.yml exec api alembic upgrade head
+# Apply additive migrations via repository runtime (droplet):
+#   IMAGE_TAG=prod_feature-62e9a8e05552 ./scripts/migrate.sh
+# Expect alembic_version = 030_live_dispensing_telemetry
+# Do NOT sync uncommitted 029_pump_meter_readings to the droplet.
 ```
 
 Pi: SQLite schema evolves via app open; no destructive RESET of sale evidence. Keep meter/CD101 work on separate flags.
@@ -87,18 +88,17 @@ FROM sync_queue ORDER BY created_at DESC LIMIT 10;
 
 ## 4. Application-ACK activation (separate from SAO fleet)
 
-Only after canary §3 passes and cloud `SALE_COMMITTED` is observed on the device topic:
+Only after canary §3 passes and cloud `SALE_COMMITTED` is observed on the device topic.
+On the **same** canary Pi only, set the flag in the systemd EnvironmentFile (not a shell `export`):
 
 ```bash
-# On the SAME canary Pi only:
-# INTELIPUMP_MQTT__REQUIRE_APPLICATION_SALE_ACK=true
-# Restart controller (you run restart — agents must not)
-
-# Verify:
-# - sync_queue moves PENDING → AWAITING_APP_ACK after MQTT publish
-# - SALE_COMMITTED arrives on intelipump/<env>/devices/<deviceId>/sale-acks
-# - row becomes DELIVERED only after validated ACK (station/device/tx match)
-# - lost ACK → replay same identity; identical cloud commit → replay ACK
+# /etc/intelipump/intelipump-cloud-sync.env
+INTELIPUMP_MQTT__REQUIRE_APPLICATION_SALE_ACK=true
+sudo systemctl daemon-reload
+sudo systemctl restart intelipump-cloud-sync.service
+# Verify process environ + sale_ack_subscription_active on
+# intelipump/prod/devices/InteliPump-SAO-RS1-pi-005/sale-acks
+# Full steps: docs/sao-oct8-pi-canary.md §3–§4
 ```
 
 Wrong-device / wrong-sale ACKs must be rejected (see `tests/unit/cloud/test_sale_ack_validation.py`).
