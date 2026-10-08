@@ -24,6 +24,10 @@ from intelipump_fdc.domain.pump_command import PumpCommand
 from intelipump_fdc.domain.pump_event import PumpEvent
 from intelipump_fdc.domain.pump_state import PumpState
 from intelipump_fdc.domain.sale_fingerprint import sale_fingerprint, stable_completion_key
+from intelipump_fdc.domain.session_boundary import (
+    is_new_physical_session,
+    session_boundary_reason,
+)
 from intelipump_fdc.events.broker import EventBroker
 from intelipump_fdc.events.models import LiveEventType
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
@@ -307,6 +311,59 @@ class PersistenceBridge:
         if row is not None and row.status in _OPEN_TX_STATUSES:
             return uuid
         return None
+
+    def _detach_mapped_sale_for_new_session(
+        self,
+        *,
+        address: int,
+        prior_uuid: str,
+        prior_volume: int | None,
+        prior_amount: int | None,
+        new_volume: int,
+        new_amount: int,
+        prior_status: str | None,
+    ) -> None:
+        """Leave the prior physical session row intact; clear hose→UUID glue.
+
+        Next verified DC2 mints a new identity. Never high-water across RESET.
+        """
+        reason = session_boundary_reason(
+            prior_volume=prior_volume,
+            prior_amount=prior_amount,
+            new_volume=new_volume,
+            new_amount=new_amount,
+        )
+        logger.info(
+            "new_physical_session_boundary",
+            stationId=self._station_id,
+            sourceAddress=address,
+            priorUuid=prior_uuid,
+            priorStatus=prior_status,
+            priorVolume=prior_volume,
+            priorAmount=prior_amount,
+            newVolume=new_volume,
+            newAmount=new_amount,
+            reason=reason or "meter_reset_face",
+            action="detach_prior_mint_new",
+        )
+        if self._tx_by_address.get(address) == prior_uuid:
+            self._tx_by_address.pop(address, None)
+        can_pump, can_nozzle, _ = self._channel_identity(address)
+        try:
+            state = self._verified.get_or_create(
+                pump_id=can_pump,
+                nozzle_id=can_nozzle,
+                dart_address=address,
+            )
+            if state.transaction_id == prior_uuid:
+                state.transaction_id = None
+        except Exception:
+            logger.debug(
+                "verified_book_detach_skipped",
+                priorUuid=prior_uuid,
+                address=address,
+                exc_info=True,
+            )
 
     async def _begin_sale(
         self,
@@ -1102,67 +1159,10 @@ class PersistenceBridge:
                             mark_published=True,
                         )
                         return
-                    # Exclude twin search only while the candidate is still open;
-                    # excluding a just-settled UUID hid the twin and caused mint.
-                    open_for_exclude = await self._open_uuid(uow, mapped_or_active)
-                    twin = await uow.transactions.find_recent_completed_same_totals(
-                        station_id=self._station_id,
-                        pump_id=pump_db,
-                        raw_volume=int(vol_raw),
-                        raw_amount=int(amt_raw),
-                        exclude_uuid=open_for_exclude,
-                        within_seconds=15.0,
-                    )
-                    if twin is not None:
-                        kept = twin
-                        if price_raw is not None:
-                            enriched = await uow.transactions.enrich_price_if_missing(
-                                twin.transaction_uuid,
-                                raw_price=int(price_raw),
-                                price_decimals=price_decimals,
-                            )
-                            if enriched is not None:
-                                kept = enriched
-                            await self._publish_price_enrichment(
-                                uow,
-                                tx=kept,
-                                raw_price=int(price_raw),
-                                price_decimals=price_decimals,
-                            )
-                        if (
-                            active_tx_s
-                            and active_tx_s != kept.transaction_uuid
-                        ):
-                            await uow.transactions.abandon_as_duplicate(
-                                active_tx_s,
-                                kept_uuid=kept.transaction_uuid,
-                                reason="hangup_same_totals_twin",
-                            )
-                        logger.info(
-                            "duplicate_completion_suppressed_same_totals",
-                            stationId=self._station_id,
-                            pumpId=logical,
-                            nozzleId=nozzle_id,
-                            keptUuid=kept.transaction_uuid,
-                            skippedCandidate=active_tx_s,
-                            fingerprint=fp,
-                            reason="recent_same_totals_twin",
-                            enrichedPrice=price_raw is not None,
-                            priceEnrichmentQueued=price_raw is not None,
-                        )
-                        self._tx_by_address[address] = kept.transaction_uuid
-                        await uow.nozzle_baselines.upsert_baseline(
-                            station_id=self._station_id,
-                            pump_id=pump_db,
-                            dart_address=address,
-                            nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
-                            fingerprint=fp,
-                            raw_volume=int(vol_raw),
-                            raw_amount=int(amt_raw),
-                            transaction_uuid=kept.transaction_uuid,
-                            mark_published=True,
-                        )
-                        return
+                    # Do NOT abandon a distinct UUID solely because amount/litres
+                    # match a recent COMPLETED sale — two equal-value purchases
+                    # must remain two identities. Same-UUID already-completed
+                    # (above) is the only totals-based suppress.
                     complete_uuid = await self._ensure_open_sale(
                         uow,
                         address=address,
@@ -1388,8 +1388,9 @@ class PersistenceBridge:
             )
             open_mapped = await self._open_uuid(uow, self._tx_by_address.get(address))
             # Premature sidecar settle (ACTIVE→COMPLETED while hose still live)
-            # leaves _tx_by_address pointing at a COMPLETED row. If DC2 keeps
-            # climbing past that settle, reopen instead of quarantining.
+            # leaves _tx_by_address pointing at a COMPLETED row. Climbing DC2 on
+            # the *same* physical session may reopen; a meter RESET starts a new
+            # identity and must never high-water onto the prior row.
             if open_mapped is None:
                 prev_uuid = self._tx_by_address.get(address)
                 if prev_uuid:
@@ -1399,7 +1400,22 @@ class PersistenceBridge:
                         if prev_row is not None
                         else ""
                     )
-                    if (
+                    if prev_row is not None and is_new_physical_session(
+                        prior_volume=int(prev_row.raw_volume or 0),
+                        prior_amount=int(prev_row.raw_amount or 0),
+                        new_volume=raw_volume,
+                        new_amount=raw_amount,
+                    ):
+                        self._detach_mapped_sale_for_new_session(
+                            address=address,
+                            prior_uuid=prev_uuid,
+                            prior_volume=int(prev_row.raw_volume or 0),
+                            prior_amount=int(prev_row.raw_amount or 0),
+                            new_volume=raw_volume,
+                            new_amount=raw_amount,
+                            prior_status=str(prev_row.status),
+                        )
+                    elif (
                         prev_row is not None
                         and prev_row.status in {"COMPLETED", "COMPLETE"}
                         and settle_key.startswith("sidecar-settle:")
@@ -1452,27 +1468,36 @@ class PersistenceBridge:
                                 settleKey=settle_key,
                                 action="preserve_original_no_second_sale",
                             )
+            elif open_mapped is not None:
+                open_row = await uow.transactions.get_by_uuid(open_mapped)
+                if open_row is not None and is_new_physical_session(
+                    prior_volume=int(open_row.raw_volume or 0),
+                    prior_amount=int(open_row.raw_amount or 0),
+                    new_volume=raw_volume,
+                    new_amount=raw_amount,
+                ):
+                    self._detach_mapped_sale_for_new_session(
+                        address=address,
+                        prior_uuid=open_mapped,
+                        prior_volume=int(open_row.raw_volume or 0),
+                        prior_amount=int(open_row.raw_amount or 0),
+                        new_volume=raw_volume,
+                        new_amount=raw_amount,
+                        prior_status=str(open_row.status),
+                    )
+                    open_mapped = None
             baseline = await uow.nozzle_baselines.get(
                 station_id=self._station_id,
                 dart_address=address,
                 nozzle_id=baseline_nozzle_key,
             )
-            if open_mapped is None and uow.nozzle_baselines.is_already_observed(baseline, fp):
-                logger.info(
-                    "duplicate_transaction_ignored",
-                    event_name="duplicate_transaction_ignored",
-                    stationId=self._station_id,
-                    pumpId=can_pump,
-                    nozzleId=can_nozzle,
-                    fingerprint=fp,
-                    source="startup_baseline",
-                    detail="dc2_tick_suppressed",
-                )
-                return
             if open_mapped is None:
                 # Verified dispensing: lift ∧ authorize ∧ DC1 FILLING ∧ volume↑.
                 # DC2 may arrive before FILLING after AUTHORIZE — that is not
                 # quarantined. Unauthorize volume rise still is.
+                # Baseline fingerprint suppress runs ONLY when verified dispensing
+                # is absent — equal-value consecutive purchases must open a new
+                # identity even when totals match a prior COMPLETED sale.
                 can_pump, can_nozzle, source_id = self._channel_identity(address)
                 snap = await uow.states.latest(pump_db)
                 state_s = (snap.normalized_state or "").upper() if snap else ""
@@ -1555,6 +1580,18 @@ class PersistenceBridge:
                     return
 
                 if not verified.verified_dispensing:
+                    if uow.nozzle_baselines.is_already_observed(baseline, fp):
+                        logger.info(
+                            "duplicate_transaction_ignored",
+                            event_name="duplicate_transaction_ignored",
+                            stationId=self._station_id,
+                            pumpId=can_pump,
+                            nozzleId=can_nozzle,
+                            fingerprint=fp,
+                            source="startup_baseline",
+                            detail="dc2_tick_suppressed_retained_display",
+                        )
+                        return
                     logger.info(
                         "dc2_tick_ignored_awaiting_verified_dispensing",
                         stationId=self._station_id,

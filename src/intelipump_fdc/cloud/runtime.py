@@ -266,6 +266,7 @@ class CloudRuntime:
                 topics=self.topics,
                 device_id=device_id,
                 sync_worker=self.sync_worker,
+                station_id=station_id,
             )
             await self.sale_ack_intake.start()
         if self.mqtt.is_connected:

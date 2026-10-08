@@ -19,8 +19,6 @@ from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.topics import TopicBuilder
 from intelipump_fdc.persistence.dto import StateSnapshotRecord, TransactionRecord
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
-from intelipump_fdc.services.transaction_models import CompleteTransactionRequest
-from intelipump_fdc.services.transaction_service import TransactionService
 
 logger = structlog.get_logger(__name__)
 
@@ -534,12 +532,16 @@ class LiveFillStream:
         controller_state: str | None = None,
         reason: str = "sidecar_settle_after_hangup",
     ) -> bool:
-        """Hang-up holds DISPLAY; controller may leave the SQLite row ACTIVE.
+        """Sidecar is telemetry / ops visibility only — never financial COMPLETED.
 
-        Complete it here so TRANSACTION_COMPLETED is queued without touching
-        the Wayne loop. sessionSequence continues from the last progress tick.
+        Authoritative capture is hang-up / controller SALE via PersistenceBridge.
+        Flat-meter or terminal-state observation without hang-up evidence records
+        a recoverable CAPTURE_UNCERTAINTY and leaves the row ACTIVE for hang-up
+        (or explicit recovery). Same-totals abandon and sidecar-settle keys are
+        removed from the authoritative path.
         """
-        published = False
+        if tx.transaction_uuid in self._finalized:
+            return False
         session_seq = self._tx_seq.get(tx.transaction_uuid, 0) + 1
         self._tx_seq[tx.transaction_uuid] = session_seq
         amount = round(
@@ -550,62 +552,54 @@ class LiveFillStream:
         )
         try:
             async with unit_of_work(self.session_factory) as uow:
-                already = await uow.transactions.find_recent_completed_same_totals(
+                row = await uow.transactions.get_by_uuid(tx.transaction_uuid)
+                if row is None:
+                    self._finalized.add(tx.transaction_uuid)
+                    return False
+                if row.status in {"COMPLETED", "COMPLETE", "VOID", "CANCELLED"}:
+                    self._finalized.add(tx.transaction_uuid)
+                    return False
+                now = datetime.now(UTC)
+                await uow.transactions.add_event(
+                    transaction_id=row.id,
+                    event_type="CAPTURE_UNCERTAINTY_AWAITING_HANGUP",
+                    event_key=(
+                        f"sidecar-uncertain:{tx.transaction_uuid}:"
+                        f"{raw_volume}:{raw_amount}"
+                    ),
+                    raw_payload={
+                        "reason": reason,
+                        "controller_state": controller_state,
+                        "raw_volume": raw_volume,
+                        "raw_amount": raw_amount,
+                        "amount": amount,
+                        "volumeLitres": volume_litres,
+                        "session_sequence": session_seq,
+                        "sidecar_financial_settle": False,
+                    },
+                    source_frame_ref=None,
+                    observed_at=now,
+                )
+                await uow.audit.append(
+                    actor="live_fill_stream",
+                    source="sidecar",
+                    action="CAPTURE_UNCERTAINTY_AWAITING_HANGUP",
                     station_id=tx.station_id,
                     pump_id=tx.pump_id,
-                    raw_volume=raw_volume,
-                    raw_amount=raw_amount,
-                    exclude_uuid=tx.transaction_uuid,
-                    within_seconds=15.0,
+                    previous_state=controller_state,
+                    resulting_state="ACTIVE",
+                    result="AWAITING_HANGUP",
+                    details={
+                        "transaction_uuid": tx.transaction_uuid,
+                        "reason": reason,
+                        "raw_volume": raw_volume,
+                        "raw_amount": raw_amount,
+                        "detail": (
+                            "Sidecar will not mint financial COMPLETED; "
+                            "hang-up/SALE path remains authoritative"
+                        ),
+                    },
                 )
-                # Authoritative settle price is pump-observed on the TX row only.
-                # Never fill from unit-price.json (current command) or amount÷volume
-                # (rounded-volume drift, e.g. 100000/74→1351 for a genuine 1355 sale).
-                settle_price = (
-                    tx.raw_price
-                    if isinstance(tx.raw_price, int)
-                    and not isinstance(tx.raw_price, bool)
-                    and tx.raw_price > 0
-                    else None
-                )
-                settle_price_decimals = (
-                    tx.price_decimals
-                    if settle_price is not None and tx.price_decimals is not None
-                    else (0 if settle_price is not None else None)
-                )
-                if already is not None:
-                    # Do not create a second COMPLETED row (settle↔settle or
-                    # settle↔hang-up). Abandon this orphan ACTIVE instead.
-                    await uow.transactions.abandon_as_duplicate(
-                        tx.transaction_uuid,
-                        kept_uuid=already.transaction_uuid,
-                        reason="sidecar_settle_same_totals",
-                    )
-                    logger.info(
-                        "live_fill_settle_abandoned_duplicate",
-                        transaction_uuid=tx.transaction_uuid,
-                        kept_uuid=already.transaction_uuid,
-                    )
-                    newly = False
-                    published = False
-                else:
-                    _row, newly = await TransactionService(uow).complete(
-                        CompleteTransactionRequest(
-                            transaction_uuid=tx.transaction_uuid,
-                            source_completion_key=(
-                                f"sidecar-settle:{tx.transaction_uuid}"
-                            ),
-                            raw_volume=raw_volume,
-                            raw_amount=raw_amount,
-                            raw_price=settle_price,
-                            price_decimals=settle_price_decimals,
-                            completion_inferred=True,
-                            completion_warnings=(reason,),
-                            publish_completion=True,
-                            session_sequence=session_seq,
-                        )
-                    )
-                    published = bool(newly)
         except Exception as exc:
             logger.warning(
                 "live_fill_finalize_failed",
@@ -620,23 +614,23 @@ class LiveFillStream:
             raw_amount=raw_amount,
             is_final=True,
         )
-        if published:
-            logger.info(
-                "live_fill_state_transition",
-                source_address=dart,
-                pump_id=tx.canonical_pump_id or tx.pump_id,
-                nozzle_id=(
-                    tx.canonical_nozzle_id if tx.canonical_nozzle_id is not None else tx.nozzle_id
-                ),
-                transaction_id=tx.transaction_uuid,
-                previous_state=controller_state or "DISPENSING",
-                new_state="COMPLETED",
-                sequence=session_seq,
-                session_sequence=session_seq,
-                volumeMinorUnits=raw_volume,
-                amountMinorUnits=raw_amount,
-                amount=amount,
-                volumeLitres=volume_litres,
-                reason=reason,
-            )
-        return published
+        logger.info(
+            "sidecar_financial_settle_disabled",
+            source_address=dart,
+            pump_id=tx.canonical_pump_id or tx.pump_id,
+            nozzle_id=(
+                tx.canonical_nozzle_id if tx.canonical_nozzle_id is not None else tx.nozzle_id
+            ),
+            transaction_id=tx.transaction_uuid,
+            previous_state=controller_state or "DISPENSING",
+            new_state="ACTIVE",
+            sequence=session_seq,
+            session_sequence=session_seq,
+            volumeMinorUnits=raw_volume,
+            amountMinorUnits=raw_amount,
+            amount=amount,
+            volumeLitres=volume_litres,
+            reason=reason,
+            action="capture_uncertainty_awaiting_hangup",
+        )
+        return False

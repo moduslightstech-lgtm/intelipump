@@ -24,6 +24,7 @@ class SaleAckIntake:
     topics: TopicBuilder
     device_id: str
     sync_worker: SyncWorker
+    station_id: str | None = None
     active: bool = False
     _prior_handler: Any = None
 
@@ -76,6 +77,20 @@ class SaleAckIntake:
                 "sale_ack_wrong_device_ignored",
                 expected=self.device_id,
                 got=ack_device,
+            )
+            return
+        ack_station = str(
+            raw.get("stationId") or raw.get("station_id") or ""
+        ).strip()
+        if (
+            self.station_id
+            and ack_station
+            and ack_station != self.station_id
+        ):
+            logger.warning(
+                "sale_ack_wrong_station_ignored",
+                expected=self.station_id,
+                got=ack_station,
             )
             return
         await self.sync_worker.handle_sale_ack_payload(raw)

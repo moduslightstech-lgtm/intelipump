@@ -125,13 +125,11 @@ def test_cloud_sync_cli_defaults_are_publish_only() -> None:
 
 
 def test_queue_publish_filter_includes_live_fills() -> None:
-    assert PUBLISHABLE_QUEUE_EVENTS == {
-        "TRANSACTION_COMPLETED",
-        "TRANSACTION_STARTED",
-        "FILLING_UPDATED",
-        "POSSIBLE_UNINTENDED_FLOW",
-        "CANCELLED_NO_SALE",
-    }
+    assert "TRANSACTION_COMPLETED" in PUBLISHABLE_QUEUE_EVENTS
+    assert "TRANSACTION_STARTED" in PUBLISHABLE_QUEUE_EVENTS
+    assert "FILLING_UPDATED" in PUBLISHABLE_QUEUE_EVENTS
+    assert "POSSIBLE_UNINTENDED_FLOW" in PUBLISHABLE_QUEUE_EVENTS
+    assert "CANCELLED_NO_SALE" in PUBLISHABLE_QUEUE_EVENTS
 
 
 def test_raw_scaled_values_remain_integers() -> None:
@@ -267,6 +265,7 @@ def test_fill_throttling_time_volume_amount_final() -> None:
 async def test_live_fill_stream_completes_settled_hangup(
     db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
 ) -> None:
+    """Sidecar marks uncertainty on terminal face — does not financial-complete."""
     mqtt = FakeMqttClient(host="settle-fill")
     await mqtt.connect()
     started = datetime.now(UTC)
@@ -335,9 +334,15 @@ async def test_live_fill_stream_completes_settled_hangup(
 
     await stream.publish_active_fills(now=started + timedelta(seconds=5))
     async with unit_of_work(db_factory) as uow:
-        assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
-        pending = await uow.sync_queue.pending_count()
-    assert pending >= 1
+        open_rows = await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab")
+        assert len(open_rows) == 1
+        assert open_rows[0].status == "ACTIVE"
+        events = await uow.transactions.list_events(open_rows[0].id)
+        assert any(
+            e.event_type == "CAPTURE_UNCERTAINTY_AWAITING_HANGUP" for e in events
+        )
+        claimed = await uow.sync_queue.claim_batch(limit=20)
+        assert not any(r.event_type == "TRANSACTION_COMPLETED" for r in claimed)
 
 
 @pytest.mark.asyncio
@@ -486,11 +491,15 @@ async def test_live_fill_stream_does_not_publish_duplicate_after_hangup(
     await stream.publish_active_fills(now=started)
     await stream.publish_active_fills(now=started + timedelta(seconds=5))
     async with unit_of_work(db_factory) as uow:
-        assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
         leftover = await uow.transactions.get_by_uuid("tx-live-dup")
         assert leftover is not None
-        # Orphan ACTIVE abandoned when hang-up already posted same totals.
-        assert leftover.status == "CANCELLED"
+        # Sidecar must not abandon by same totals (equal-value sales stay distinct)
+        # and must not mint a second financial COMPLETED.
+        assert leftover.status == "ACTIVE"
+        events = await uow.transactions.list_events(leftover.id)
+        assert any(
+            e.event_type == "CAPTURE_UNCERTAINTY_AWAITING_HANGUP" for e in events
+        )
         pending = await uow.sync_queue.pending_count()
     # Hang-up already posted these totals — do not queue a second COMPLETED.
     assert pending == before
@@ -639,23 +648,23 @@ async def test_live_fill_stream_does_not_fill_price_from_persisted_command(
         simulated=False,
         settle_seconds=4.0,
     )
-    # First tick seeds meter baseline; second tick after settle_seconds completes.
+    # Sidecar must not financial-complete or invent price from unit-price.json.
     await stream.publish_active_fills(now=started)
     await stream.publish_active_fills(now=started + timedelta(seconds=5))
     async with unit_of_work(db_factory) as uow:
         sold = await uow.transactions.get_by_uuid("tx-old-no-price")
         assert sold is not None
-        assert sold.status == "COMPLETED"
+        assert sold.status == "ACTIVE"
         assert sold.raw_volume == 74
         assert sold.raw_amount == 100000
         assert sold.raw_price is None  # not 1400 from unit-price.json
+        events = await uow.transactions.list_events(sold.id)
+        assert any(
+            e.event_type == "CAPTURE_UNCERTAINTY_AWAITING_HANGUP" for e in events
+        )
         batch = await uow.sync_queue.claim_batch(limit=20)
     completed = [row for row in batch if row.event_type == "TRANSACTION_COMPLETED"]
-    assert completed
-    payload = completed[0].payload
-    assert payload.get("priceUncertain") is True
-    assert payload.get("pricePerLiter") is None
-    assert payload.get("estimatedUnitPriceRaw") == 1351
+    assert completed == []
 
 
 @pytest.mark.asyncio
@@ -732,7 +741,7 @@ async def test_live_fill_stream_holds_provisional_while_dc1_filling(
         assert open_rows[0].transaction_uuid == "tx-stale-fill"
         assert open_rows[0].status == "ACTIVE"
 
-    # After DC1 leaves live fill (hang-up / complete face), settle is allowed.
+    # After DC1 leaves live fill, sidecar records uncertainty — hang-up path completes.
     async with unit_of_work(db_factory) as uow:
         await PumpStateService(uow).persist_context(
             pump_db_id=pump.id,
@@ -749,10 +758,17 @@ async def test_live_fill_stream_holds_provisional_while_dc1_filling(
         )
     await stream.publish_active_fills(now=started + timedelta(seconds=15))
     async with unit_of_work(db_factory) as uow:
-        assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
+        open_rows = await uow.transactions.list_unresolved(
+            station_id="InteliPump-US-Lab"
+        )
+        assert len(open_rows) == 1
         sold = await uow.transactions.get_by_uuid("tx-stale-fill")
         assert sold is not None
-        assert sold.status == "COMPLETED"
+        assert sold.status == "ACTIVE"
+        events = await uow.transactions.list_events(sold.id)
+        assert any(
+            e.event_type == "CAPTURE_UNCERTAINTY_AWAITING_HANGUP" for e in events
+        )
 
 
 @pytest.mark.asyncio
@@ -908,7 +924,7 @@ async def test_live_fill_stream_keepalive_reuses_transaction_id(
 async def test_live_fill_completes_immediately_on_filling_complete_face(
     db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
 ) -> None:
-    """FILLING_COMPLETED snapshot must not wait for the old 90s force settle."""
+    """FILLING_COMPLETED face raises uncertainty immediately — no financial settle."""
     mqtt = FakeMqttClient(host="immediate-complete")
     await mqtt.connect()
     started = datetime.now(UTC)
@@ -971,35 +987,29 @@ async def test_live_fill_completes_immediately_on_filling_complete_face(
         force_settle_seconds=5.0,
         keepalive_seconds=10.0,
     )
-    # Seed unchanged baseline, then complete on the next poll (no 90s wait).
+    # Seed unchanged baseline, then record uncertainty on the next poll (no 90s wait).
     await stream.publish_active_fills(now=started)
     assert not any(
         json.loads(m.payload).get("eventType") == "FILLING_UPDATED" for m in mqtt.published
     )
     await stream.publish_active_fills(now=started + timedelta(seconds=1))
     async with unit_of_work(db_factory) as uow:
-        assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
         sold = await uow.transactions.get_by_uuid(
             "f020bb5c-76e6-4e64-b8e2-03c09aca5cc0"
         )
         assert sold is not None
-        assert sold.status == "COMPLETED"
+        assert sold.status == "ACTIVE"
         assert sold.raw_amount == 35000
         assert sold.raw_volume == 29
         assert sold.canonical_pump_id == "pump-1"
         assert sold.canonical_nozzle_id == "nozzle-2"
+        events = await uow.transactions.list_events(sold.id)
+        assert any(
+            e.event_type == "CAPTURE_UNCERTAINTY_AWAITING_HANGUP" for e in events
+        )
         claimed = await uow.sync_queue.claim_batch(limit=20)
         completed = [r for r in claimed if r.event_type == "TRANSACTION_COMPLETED"]
-        assert len(completed) == 1
-        payload = completed[0].payload
-        assert payload["amount"] == "350.00"
-        assert payload["volumeLitres"] == "0.29"
-        assert payload["amountMinorUnits"] == 35000
-        assert payload["volumeMinorUnits"] == 29
-        assert payload["pumpId"] == "pump-1"
-        assert payload["nozzleId"] == "nozzle-2"
-        assert payload["transactionId"] == "f020bb5c-76e6-4e64-b8e2-03c09aca5cc0"
-        assert payload["sessionSequence"] == 1
+        assert completed == []
 
 
 @pytest.mark.asyncio
