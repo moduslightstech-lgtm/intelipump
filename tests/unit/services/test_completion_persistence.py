@@ -174,12 +174,15 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
             assert await uow.transactions.count_completed(station_id=STATION) == 1
             tx = await uow.transactions.get_by_uuid(sale_id)
             assert tx is not None
-            assert tx.source_completion_key == "complete:frame:5"
+            # Business identity is UUID-scoped; Wayne frame is evidence only.
+            assert tx.source_completion_key == f"complete:{sale_id}"
             evs = await uow.transactions.list_events(tx.id)
             completed = [e for e in evs if e.event_type == "COMPLETED"]
             assert len(completed) == 1
             assert completed[0].raw_payload is not None
             assert completed[0].raw_payload.get("completion_inferred") is False
+            assert completed[0].event_key == f"completed:complete:{sale_id}"
+            assert completed[0].source_frame_ref == "complete:frame:5"
             audits = await uow.audit.list_all()
             assert any(a.action == "TRANSACTION_COMPLETED" for a in audits)
             pending = await uow.sync_queue.pending_count()
@@ -191,7 +194,7 @@ async def test_hangup_awaits_then_confirmed_completes_once(tmp_path: Path) -> No
             ]
             assert len(completed_sync) == 1
             assert completed_sync[0].deduplication_key == (
-                f"tx-completed:{STATION}:complete:frame:5"
+                f"tx-completed:{STATION}:complete:{sale_id}"
             )
     finally:
         await persistence.shutdown()
