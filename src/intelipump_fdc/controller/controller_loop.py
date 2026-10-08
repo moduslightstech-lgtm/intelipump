@@ -190,6 +190,8 @@ class ControllerLoop:
         self._cloud_set_price_awaiting_dc3: dict[str, set[int]] = {}
         # LINK_ACK received but DC3 never matched within the bound.
         self._cloud_set_price_unverified: dict[str, set[int]] = {}
+        # Addresses where LINK_ACK/APP_CONFIRMED seeded provisional face (idle DC3=0).
+        self._cloud_set_price_face_seeded: dict[str, set[int]] = {}
         # corr:addr -> unit_price_obs_gen at LINK_ACK (confirm only when gen increases)
         self._cloud_set_price_dc3_baseline: dict[str, int] = {}
         # corr:addr -> monotonic deadline to stop awaiting DC3
@@ -1705,7 +1707,7 @@ class ControllerLoop:
         unit_price_raw: int,
         link_acked: bool = False,
         application_confirmed: bool = False,
-    ) -> None:
+    ) -> bool:
         """Record CD5 lifecycle and keep a provisional sale face price.
 
         Positive DC3 still overwrites ``unit_price_raw`` (pump_session). When
@@ -1715,9 +1717,11 @@ class ControllerLoop:
         missing: idle Wayne DC3 often reports 0 after CD5, and without this
         hang-up sales publish ``raw_price=null`` → cloud Unit price Unknown.
         Amount÷volume estimates remain non-authoritative elsewhere.
+
+        Returns True when this call provisionally seeded ``unit_price_raw``.
         """
         if not isinstance(unit_price_raw, int) or unit_price_raw <= 0:
-            return
+            return False
         session.state.requested_unit_price_raw = unit_price_raw
         if link_acked:
             session.state.link_acked_unit_price_raw = unit_price_raw
@@ -1732,6 +1736,7 @@ class ControllerLoop:
         ):
             session.state.unit_price_raw = None
             observed = None
+        seeded = False
         if link_acked or application_confirmed:
             if not (
                 isinstance(observed, int)
@@ -1739,6 +1744,8 @@ class ControllerLoop:
                 and observed > 0
             ):
                 session.state.unit_price_raw = unit_price_raw
+                seeded = True
+        return seeded
 
     def _capture_completed_sale_snapshot(self, session: PumpSession) -> bool:
         """Record completed-sale amount/volume/identity before any RESET.
@@ -2032,6 +2039,7 @@ class ControllerLoop:
         self._cloud_set_price_gave_up.pop(corr, None)
         self._cloud_set_price_awaiting_dc3.pop(corr, None)
         self._cloud_set_price_unverified.pop(corr, None)
+        self._cloud_set_price_face_seeded.pop(corr, None)
         self._cloud_set_price_seen_at.pop(corr, None)
         self._cloud_set_price_unit_persisted.pop(corr, None)
         self._cloud_set_price_persist_fail_count.pop(corr, None)
@@ -2552,9 +2560,12 @@ class ControllerLoop:
         awaiting_dc3 = self._cloud_set_price_awaiting_dc3.setdefault(corr, set())
         unverified = self._cloud_set_price_unverified.setdefault(corr, set())
 
-        # Promote LINK_ACK → applied only on a *fresh matching* DC3 after CD5.
-        # Idle Wayne often reports filling price 0 — that is unavailable evidence,
-        # not a mismatch that may resend CD5.
+        # Promote LINK_ACK → applied on fresh matching DC3, or when this CD5
+        # provisionally seeded the face (idle Wayne never bumps obs_gen). A
+        # pre-existing stale face that already matched the commanded price must
+        # still wait for fresh DC3 — otherwise re-SET of the same ₦/L would
+        # false-confirm without bus evidence.
+        face_seeded = self._cloud_set_price_face_seeded.setdefault(corr, set())
         for addr in list(awaiting_dc3):
             session = self.sessions.get(addr)
             if session is None:
@@ -2567,30 +2578,35 @@ class ControllerLoop:
             obs_gen = int(session.state.unit_price_obs_gen or 0)
             observed = session.state.unit_price_raw
             retry_key = f"{corr}:{addr}"
-            if obs_gen > baseline:
-                if (
-                    isinstance(observed, int)
-                    and not isinstance(observed, bool)
-                    and observed == pending.unit_price_raw
-                ):
-                    self._price_programmed.add(addr)
-                    applied.add(addr)
-                    awaiting_dc3.discard(addr)
-                    unverified.discard(addr)
-                    self._cloud_set_price_dc3_baseline.pop(retry_key, None)
-                    self._cloud_set_price_dc3_deadline.pop(retry_key, None)
-                    self._cloud_set_price_verify_reads.pop(retry_key, None)
-                    self._cloud_set_price_fail_count.pop(retry_key, None)
-                    self._cloud_set_price_next_try.pop(retry_key, None)
-                    logger.info(
-                        "cloud_set_price_confirmed_via_dc3",
-                        address=addr,
-                        unitPriceRaw=pending.unit_price_raw,
-                        correlationId=corr,
-                        unitPriceObsGen=obs_gen,
-                        baselineGen=baseline,
-                    )
-                elif deadline is not None and now >= deadline:
+            face_matches = (
+                isinstance(observed, int)
+                and not isinstance(observed, bool)
+                and observed == pending.unit_price_raw
+            )
+            confirm_via_seed = face_matches and addr in face_seeded
+            confirm_via_dc3 = face_matches and obs_gen > baseline
+            if confirm_via_seed or confirm_via_dc3:
+                self._price_programmed.add(addr)
+                applied.add(addr)
+                awaiting_dc3.discard(addr)
+                unverified.discard(addr)
+                self._cloud_set_price_dc3_baseline.pop(retry_key, None)
+                self._cloud_set_price_dc3_deadline.pop(retry_key, None)
+                self._cloud_set_price_verify_reads.pop(retry_key, None)
+                self._cloud_set_price_fail_count.pop(retry_key, None)
+                self._cloud_set_price_next_try.pop(retry_key, None)
+                logger.info(
+                    "cloud_set_price_confirmed_via_face_match",
+                    address=addr,
+                    unitPriceRaw=pending.unit_price_raw,
+                    correlationId=corr,
+                    unitPriceObsGen=obs_gen,
+                    baselineGen=baseline,
+                    viaSeed=confirm_via_seed,
+                    viaFreshDc3=confirm_via_dc3,
+                )
+            elif obs_gen > baseline:
+                if deadline is not None and now >= deadline:
                     self._set_price_mark_unverified(
                         corr=corr,
                         addr=addr,
@@ -2923,16 +2939,19 @@ class ControllerLoop:
                         isinstance(pending.unit_price_raw, int)
                         and pending.unit_price_raw > 0
                     ):
-                        self._note_command_price_lifecycle(
+                        if self._note_command_price_lifecycle(
                             session,
                             unit_price_raw=pending.unit_price_raw,
                             application_confirmed=True,
-                        )
+                        ):
+                            self._cloud_set_price_face_seeded.setdefault(
+                                corr, set()
+                            ).add(addr)
                     any_ok = True
                 elif result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED:
-                    # Link ACK alone is NOT confirmed success — await matching
-                    # DC3. Idle DC3 often reports 0; that must not resend CD5.
-                    # LINK_ACK must never become authoritative sale unit_price_raw.
+                    # Link ACK alone is not yet PRICE_CONFIRMED — await matching
+                    # DC3 or confirm next tick via provisional face seed (idle
+                    # Wayne DC3 often stays 0 and never bumps obs_gen).
                     awaiting_dc3.add(addr)
                     unverified.discard(addr)
                     self._cloud_set_price_dc3_baseline[f"{corr}:{addr}"] = int(
@@ -2947,11 +2966,14 @@ class ControllerLoop:
                         isinstance(pending.unit_price_raw, int)
                         and pending.unit_price_raw > 0
                     ):
-                        self._note_command_price_lifecycle(
+                        if self._note_command_price_lifecycle(
                             session,
                             unit_price_raw=pending.unit_price_raw,
                             link_acked=True,
-                        )
+                        ):
+                            self._cloud_set_price_face_seeded.setdefault(
+                                corr, set()
+                            ).add(addr)
                     logger.info(
                         "cloud_set_price_link_ack_awaiting_dc3",
                         address=addr,

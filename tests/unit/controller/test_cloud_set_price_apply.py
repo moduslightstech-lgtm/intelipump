@@ -282,6 +282,45 @@ async def test_reset_failure_does_not_clear_retained_sale_state(
 
 
 @pytest.mark.asyncio
+async def test_link_ack_provisional_seed_confirms_without_obs_gen_bump(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idle Wayne: LINK_ACK seeds face; next tick → CONFIRMED (not PARTIAL)."""
+    _write_price(tmp_path, monkeypatch, "corr-ago-seed", 1875, pump="pump-8")
+    loop = _dual_addr_loop()
+    for addr in (1, 2):
+        _fresh_in(loop.sessions[addr], status=ObservedStatus.RESET)
+        loop.sessions[addr].state.unit_price_raw = 0
+        loop.sessions[addr].state.unit_price_obs_gen = 1
+
+    link = AsyncMock(
+        return_value=type(
+            "R",
+            (),
+            {"status": ExchangeResultStatus.LINK_ACKNOWLEDGED},
+        )()
+    )
+    loop._run_owned_command = link  # type: ignore[method-assign]
+
+    await loop._apply_pending_cloud_set_price()
+    assert loop._cloud_set_price_awaiting_dc3.get("corr-ago-seed") == {1, 2}
+    assert loop._cloud_set_price_face_seeded.get("corr-ago-seed") == {1, 2}
+    for addr in (1, 2):
+        assert loop.sessions[addr].state.unit_price_raw == 1875
+        # Idle DC3 never bumps gen — seed alone must confirm.
+        assert loop.sessions[addr].state.unit_price_obs_gen == 1
+
+    await loop._apply_pending_cloud_set_price()
+    assert read_set_price_request() is None
+    outcome = consume_set_price_outcome()
+    assert outcome is not None
+    assert outcome.execution_status == "PRICE_CONFIRMED"
+    assert set(outcome.applied_addresses) == {1, 2}
+    assert outcome.unverified_addresses == ()
+    assert link.await_count == 2  # no CD5 resend
+
+
+@pytest.mark.asyncio
 async def test_link_ack_stale_price_does_not_confirm_without_fresh_dc3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
