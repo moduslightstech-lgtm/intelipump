@@ -659,9 +659,10 @@ async def test_live_fill_stream_does_not_fill_price_from_persisted_command(
 
 
 @pytest.mark.asyncio
-async def test_live_fill_stream_force_settles_stale_filling_snapshot(
+async def test_live_fill_stream_holds_provisional_while_dc1_filling(
     db_factory: async_sessionmaker[AsyncSession], topics: TopicBuilder
 ) -> None:
+    """Live FILLING must not force-settle (Oct 8 premature sidecar overcount)."""
     mqtt = FakeMqttClient(host="force-settle")
     await mqtt.connect()
     started = datetime.now(UTC)
@@ -722,10 +723,31 @@ async def test_live_fill_stream_force_settles_stale_filling_snapshot(
     )
     await stream.publish_active_fills(now=started)
     await stream.publish_active_fills(now=started + timedelta(seconds=5))
-    async with unit_of_work(db_factory) as uow:
-        assert len(await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab")) == 1
-
     await stream.publish_active_fills(now=started + timedelta(seconds=9))
+    async with unit_of_work(db_factory) as uow:
+        open_rows = await uow.transactions.list_unresolved(
+            station_id="InteliPump-US-Lab"
+        )
+        assert len(open_rows) == 1
+        assert open_rows[0].transaction_uuid == "tx-stale-fill"
+        assert open_rows[0].status == "ACTIVE"
+
+    # After DC1 leaves live fill (hang-up / complete face), settle is allowed.
+    async with unit_of_work(db_factory) as uow:
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump.id,
+            context=PumpContext(
+                pump_id="pump-1",
+                dart_address=1,
+                current_state=PumpState.FILLING_COMPLETE,
+                previous_state=PumpState.FILLING,
+                active_transaction_id="tx-stale-fill",
+                communication_healthy=True,
+                state_version=4,
+            ),
+            observed_at=started + timedelta(seconds=10),
+        )
+    await stream.publish_active_fills(now=started + timedelta(seconds=15))
     async with unit_of_work(db_factory) as uow:
         assert await uow.transactions.list_unresolved(station_id="InteliPump-US-Lab") == ()
         sold = await uow.transactions.get_by_uuid("tx-stale-fill")

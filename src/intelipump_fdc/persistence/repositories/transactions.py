@@ -262,6 +262,55 @@ class TransactionRepository:
         await self._session.flush()
         return _tx(row)
 
+    async def reopen_provisional_sidecar(
+        self,
+        transaction_uuid: str,
+        *,
+        raw_volume: int,
+        raw_amount: int,
+        reason: str = "dc2_growth_after_provisional_sidecar",
+    ) -> TransactionRecord | None:
+        """Roll back a sidecar-settle COMPLETED to ACTIVE for the same UUID.
+
+        Only provisional sidecar settles are eligible. Verified hang-up /
+        FILLING_COMPLETED keys are left untouched (no silent amend).
+        """
+        result = await self._session.execute(
+            select(TransactionRow).where(
+                TransactionRow.transaction_uuid == transaction_uuid
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        key = str(row.source_completion_key or "")
+        if not key.startswith("sidecar-settle:"):
+            return None
+        if row.status not in {"COMPLETED", "COMPLETE"}:
+            return _tx(row)
+        now = datetime.now(UTC)
+        row.status = "ACTIVE"
+        row.source_completion_key = None
+        row.completed_at = None
+        row.raw_volume = max(int(row.raw_volume or 0), int(raw_volume))
+        row.raw_amount = max(int(row.raw_amount or 0), int(raw_amount))
+        row.updated_at = now
+        await self._session.flush()
+        await self.add_event(
+            transaction_id=row.id,
+            event_type="PROVISIONAL_SIDECAR_REOPENED",
+            event_key=f"provisional-reopen:{transaction_uuid}:{now.isoformat()}",
+            raw_payload={
+                "reason": reason,
+                "raw_volume": row.raw_volume,
+                "raw_amount": row.raw_amount,
+                "prior_completion_key": key,
+            },
+            source_frame_ref=None,
+            observed_at=now,
+        )
+        return _tx(row)
+
     async def abandon_as_duplicate(
         self,
         transaction_uuid: str,

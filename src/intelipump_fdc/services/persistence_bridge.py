@@ -1171,12 +1171,18 @@ class PersistenceBridge:
                         nozzle_id=nozzle_id,
                         reason="sale_complete",
                     )
-                    key = (
-                        completion_key_s
-                        or stable_completion_key(
-                            transaction_uuid=complete_uuid, fingerprint=fp
-                        )
+                    # UUID-scoped business key; Wayne frame hex is evidence only.
+                    key = stable_completion_key(
+                        transaction_uuid=complete_uuid, fingerprint=fp
                     )
+                    if completion_key_s and completion_key_s != key:
+                        logger.info(
+                            "completion_frame_evidence_not_identity",
+                            stationId=self._station_id,
+                            transactionId=complete_uuid,
+                            stableKey=key,
+                            frameEvidenceKey=completion_key_s,
+                        )
                     _tx, newly = await TransactionService(
                         uow, fill_book=self._fill_book
                     ).complete(
@@ -1187,7 +1193,8 @@ class PersistenceBridge:
                             raw_amount=amt_raw,
                             raw_price=price_raw,
                             price_decimals=price_decimals,
-                            source_frame_ref=detail_payload.get("source_frame_ref"),
+                            source_frame_ref=detail_payload.get("source_frame_ref")
+                            or completion_key_s,
                             completion_inferred=completion_inferred,
                             completion_warnings=warn_tuple,
                         )
@@ -1401,48 +1408,50 @@ class PersistenceBridge:
                             or raw_amount > int(prev_row.raw_amount or 0)
                         )
                     ):
-                        logger.warning(
-                            "live_sale_reopened_after_premature_settle",
-                            stationId=self._station_id,
-                            sourceAddress=address,
-                            previousUuid=prev_uuid,
-                            previousVolume=prev_row.raw_volume,
-                            previousAmount=prev_row.raw_amount,
-                            newVolume=raw_volume,
-                            newAmount=raw_amount,
+                        # Same physical session: roll back provisional sidecar to
+                        # ACTIVE and continue — never mint a second countable sale.
+                        reopened = await uow.transactions.reopen_provisional_sidecar(
+                            prev_uuid,
+                            raw_volume=raw_volume,
+                            raw_amount=raw_amount,
+                            reason="dc2_growth_after_provisional_sidecar",
                         )
-                        open_mapped = await self._ensure_open_sale(
-                            uow,
-                            address=address,
-                            pump_db=pump_db,
-                            candidate=None,
-                            nozzle_id=nozzle_id,
-                            raw_price=price_raw,
-                            price_decimals=(
-                                detail_payload.get("price_decimals")
-                                if isinstance(detail_payload.get("price_decimals"), int)
-                                else None
-                            ),
-                            volume_decimals=(
-                                detail_payload.get("volume_decimals")
-                                if isinstance(detail_payload.get("volume_decimals"), int)
-                                else None
-                            ),
-                            amount_decimals=(
-                                detail_payload.get("amount_decimals")
-                                if isinstance(detail_payload.get("amount_decimals"), int)
-                                else None
-                            ),
-                            reason="reopen_after_premature_sidecar_settle",
-                        )
-                        await self._mark_controller_filling(
-                            uow,
-                            address=address,
-                            pump_db=pump_db,
-                            nozzle_id=nozzle_id,
-                            transaction_id=open_mapped,
-                            previous_state=PumpState.DISCOVERING.value,
-                        )
+                        if reopened is not None:
+                            logger.warning(
+                                "live_sale_reopened_after_premature_settle",
+                                stationId=self._station_id,
+                                sourceAddress=address,
+                                previousUuid=prev_uuid,
+                                newUuid=prev_uuid,
+                                action="reopen_same_identity",
+                                previousVolume=prev_row.raw_volume,
+                                previousAmount=prev_row.raw_amount,
+                                newVolume=raw_volume,
+                                newAmount=raw_amount,
+                            )
+                            open_mapped = prev_uuid
+                            self._tx_by_address[address] = prev_uuid
+                            await self._mark_controller_filling(
+                                uow,
+                                address=address,
+                                pump_db=pump_db,
+                                nozzle_id=nozzle_id,
+                                transaction_id=open_mapped,
+                                previous_state=PumpState.DISCOVERING.value,
+                            )
+                        else:
+                            logger.error(
+                                "post_completion_growth_uncertain",
+                                stationId=self._station_id,
+                                sourceAddress=address,
+                                previousUuid=prev_uuid,
+                                previousVolume=prev_row.raw_volume,
+                                previousAmount=prev_row.raw_amount,
+                                newVolume=raw_volume,
+                                newAmount=raw_amount,
+                                settleKey=settle_key,
+                                action="preserve_original_no_second_sale",
+                            )
             baseline = await uow.nozzle_baselines.get(
                 station_id=self._station_id,
                 dart_address=address,

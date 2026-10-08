@@ -605,7 +605,7 @@ async def test_hangup_completes_open_sale_not_stale_controller_uuid(
 async def test_dc2_reopens_after_premature_sidecar_settle(
     engine_factory: tuple,
 ) -> None:
-    """Climbing DC2 after sidecar-settle must open a new ACTIVE sale, not quarantine."""
+    """Climbing DC2 after provisional sidecar keeps one session identity."""
     from intelipump_fdc.services.pump_state_service import PumpStateService
     from intelipump_fdc.services.transaction_models import (
         BeginTransactionRequest,
@@ -698,8 +698,115 @@ async def test_dc2_reopens_after_premature_sidecar_settle(
     async with unit_of_work(factory) as uow:
         open_rows = await uow.transactions.list_unresolved(station_id=STATION)
         assert len(open_rows) == 1
-        assert open_rows[0].transaction_uuid != "tx-premature"
+        assert open_rows[0].transaction_uuid == "tx-premature"
         assert open_rows[0].raw_volume == 37
+        assert open_rows[0].status == "ACTIVE"
+        # One physical session — no second sale minted.
+        all_tx = await uow.transactions.list_unresolved(station_id=STATION)
+        assert len(all_tx) == 1
         snap = await uow.states.latest(pump_id)
         assert snap is not None
         assert snap.normalized_state == PumpState.FILLING.value
+
+
+@pytest.mark.asyncio
+async def test_dc2_growth_43_to_54_keeps_one_identity(
+    engine_factory: tuple,
+) -> None:
+    """43.03 L provisional sidecar then ~54 L climb → one verified session UUID."""
+    from intelipump_fdc.services.pump_state_service import PumpStateService
+    from intelipump_fdc.services.transaction_models import (
+        BeginTransactionRequest,
+        CompleteTransactionRequest,
+        FillingUpdateRequest,
+    )
+    from intelipump_fdc.services.transaction_service import TransactionService
+    from intelipump_fdc.state_machine.models import PumpContext
+
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        pump = await uow.pumps.upsert(
+            station_id=STATION, logical_pump_id="pump-3", dart_address=2
+        )
+        pump_id = pump.id
+        await PumpStateService(uow).persist_context(
+            pump_db_id=pump_id,
+            context=PumpContext(
+                pump_id="pump-3",
+                dart_address=2,
+                current_state=PumpState.FILLING,
+                communication_healthy=True,
+                state_version=1,
+            ),
+            observed_at=datetime.now(UTC),
+        )
+        await TransactionService(uow).begin(
+            BeginTransactionRequest(
+                station_id=STATION,
+                pump_db_id=pump_id,
+                transaction_uuid="tx-43-54",
+                nozzle_id=2,
+                raw_price=1355,
+                price_decimals=0,
+                volume_decimals=2,
+                amount_decimals=2,
+                simulated=False,
+                environment="PROD",
+            )
+        )
+        await TransactionService(uow).update_filling(
+            FillingUpdateRequest(
+                transaction_uuid="tx-43-54",
+                raw_volume=4303,
+                raw_amount=5830560,
+                event_key="fill:tx-43-54:4303:5830560",
+            )
+        )
+        await TransactionService(uow).complete(
+            CompleteTransactionRequest(
+                transaction_uuid="tx-43-54",
+                source_completion_key="sidecar-settle:tx-43-54",
+                raw_volume=4303,
+                raw_amount=5830560,
+                completion_inferred=True,
+            )
+        )
+
+    bridge = PersistenceBridge(
+        session_factory=factory,
+        station_id=STATION,
+        environment="PROD",
+        simulated=False,
+        worker=PersistenceWorker(),
+        pump_id_by_address={2: pump_id},
+        logical_by_address={2: "pump-3"},
+        events=EventBus(),
+        mqtt_pump_by_address={2: "pump-3"},
+        mqtt_nozzle_by_address={2: "nozzle-2"},
+        mqtt_source_by_address={2: "pump-3-n2"},
+    )
+    bridge._tx_by_address[2] = "tx-43-54"
+
+    for vol, amt in ((4335, 5873920), (5400, 7317000)):
+        await bridge._handle_app_decoded(
+            {
+                "address": 2,
+                "is_dc2": True,
+                "payload": {
+                    "raw_volume": vol,
+                    "raw_amount": amt,
+                    "volume_decimals": 2,
+                    "amount_decimals": 2,
+                    "raw_price": 1355,
+                    "price_decimals": 0,
+                    "selected_nozzle": 2,
+                },
+            }
+        )
+
+    async with unit_of_work(factory) as uow:
+        open_rows = await uow.transactions.list_unresolved(station_id=STATION)
+        assert len(open_rows) == 1
+        assert open_rows[0].transaction_uuid == "tx-43-54"
+        assert open_rows[0].raw_volume == 5400
+        assert open_rows[0].status == "ACTIVE"

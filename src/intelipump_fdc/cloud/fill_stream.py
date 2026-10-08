@@ -203,10 +203,11 @@ class LiveFillStream:
                 filling = True
             if prev and prev[0] == raw_volume and prev[1] == raw_amount:
                 unchanged = (now - prev[2]).total_seconds()
+                live_session = filling or state_u in _LIVE_FILL_STATES
                 if allow_short:
                     ready = unchanged >= self.settle_seconds
                 elif (
-                    state_u not in _LIVE_FILL_STATES
+                    not live_session
                     and unchanged >= self.hangup_flat_meter_seconds
                     and (
                         tx.transaction_uuid in self._last_fill_publish
@@ -216,6 +217,22 @@ class LiveFillStream:
                     # Meter stopped and snapshot left live FILLING (e.g. DISCOVERING).
                     ready = True
                     allow_short = True
+                elif live_session:
+                    # Still dispensing / DC1 live — hold provisional snapshot only.
+                    # Never mint an authoritative COMPLETED (Oct 8 premature settle).
+                    ready = False
+                    if unchanged >= self.force_settle_seconds:
+                        logger.info(
+                            "provisional_sidecar_snapshot_held",
+                            stationId=tx.station_id,
+                            transactionId=tx.transaction_uuid,
+                            pumpId=logical.get(tx.pump_id),
+                            state=state_u,
+                            unchangedSeconds=round(unchanged, 2),
+                            volumeMinorUnits=raw_volume,
+                            amountMinorUnits=raw_amount,
+                            reason="live_session_not_verified_complete",
+                        )
                 else:
                     ready = unchanged >= self.force_settle_seconds
                 if tx.transaction_uuid not in self._finalized and ready:
