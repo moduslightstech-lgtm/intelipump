@@ -3312,6 +3312,18 @@ class ControllerLoop:
                         amountMinorUnits=amt,
                         reason="fresh_nonzero_dc2",
                     )
+                    # Same nonzero totals on later polls are still a live meter;
+                    # do not treat unchanged DC2 as "no fresh frame".
+            elif saw_fresh_nonzero:
+                # Persistently non-zero DC2 after RESET — keep waiting / fail closed.
+                logger.info(
+                    "pre_auth_waiting_zero_baseline",
+                    address=addr,
+                    attempt=attempt,
+                    volumeMinorUnits=int(after[0]) if after else 0,
+                    amountMinorUnits=int(after[1]) if after else 0,
+                    reason="persistent_nonzero_dc2",
+                )
             else:
                 # No fresh DC2 after RESET (normal after display-hold). Proceed.
                 session.state.filled_volume_raw = 0

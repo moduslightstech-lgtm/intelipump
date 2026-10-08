@@ -131,69 +131,106 @@ async def test_restart_recovery_completed_tx_once(tmp_path: Path) -> None:
 async def test_duplicate_data_does_not_duplicate_transaction(
     tmp_path: Path,
 ) -> None:
+    """Repeated FILLING_COMPLETED for one verified sale must complete once.
+
+    Zero-volume hang-ups are CANCELLED_NO_SALE (not COMPLETED). The release
+    objective is idempotent completion for a real dispensed sale — seed volume
+    and emit the authoritative completion frame twice.
+    """
     db = f"sqlite+aiosqlite:///{tmp_path / 'dup.db'}"
+    events = EventBus()
     persistence = await start_persistence(
         database_url=db,
         station_id=STATION,
         environment="LAB",
         addresses=(1,),
-        events=EventBus(),
+        events=events,
     )
     try:
-        pump_id = persistence.pump_id_by_address[1]
         bridge = persistence.bridge
-        # Seed active tx mapping via state change to FILLING then COMPLETE twice
-        for detail, payload in (
-            (
-                "AUTHORIZED->FILLING",
-                {
+        can_pump, can_nozzle, _ = bridge._channel_identity(1)
+        bridge._verified.note_nozzle_lifted(
+            pump_id=can_pump, nozzle_id=can_nozzle, dart_address=1
+        )
+        bridge._verified.note_authorized(
+            pump_id=can_pump,
+            nozzle_id=can_nozzle,
+            dart_address=1,
+            baseline_volume_raw=0,
+        )
+        state = bridge._verified.get_or_create(
+            pump_id=can_pump, nozzle_id=can_nozzle, dart_address=1
+        )
+        state.transaction_id = "dup-tx"
+
+        events.publish(
+            ControllerEvent(
+                type=ControllerEventType.STATE_CHANGED,
+                address=1,
+                detail="AUTHORIZED->FILLING",
+                payload={
+                    "event": "FILLING_STARTED",
                     "previous_state": "AUTHORIZED",
                     "normalized_state": "FILLING",
                     "state_version": 2,
+                    "selected_nozzle": 1,
                     "active_transaction_id": "dup-tx",
                     "communication_healthy": True,
                 },
-            ),
-            (
-                "FILLING->FILLING_COMPLETE",
-                {
-                    "previous_state": "FILLING",
-                    "normalized_state": "FILLING_COMPLETE",
-                    "state_version": 3,
-                    "active_transaction_id": "dup-tx",
-                    "completion_evidence_key": "ev-dup",
-                    "communication_healthy": True,
+            )
+        )
+        await asyncio.sleep(0.4)
+        events.publish(
+            ControllerEvent(
+                type=ControllerEventType.APPLICATION_TRANSACTION_DECODED,
+                address=1,
+                detail="DC2",
+                payload={
+                    "raw_volume": 46,
+                    "raw_amount": 54050,
+                    "volume_decimals": 2,
+                    "amount_decimals": 2,
+                    "raw_price": 1175,
+                    "price_decimals": 2,
+                    "selected_nozzle": 1,
                 },
-            ),
-            (
-                "FILLING->FILLING_COMPLETE",
-                {
-                    "previous_state": "FILLING",
-                    "normalized_state": "FILLING_COMPLETE",
-                    "state_version": 3,
-                    "active_transaction_id": "dup-tx",
-                    "completion_evidence_key": "ev-dup",
-                    "communication_healthy": True,
-                },
-            ),
-        ):
-            bridge.on_event(
+            )
+        )
+        await asyncio.sleep(0.4)
+
+        for version in (3, 4):
+            events.publish(
                 ControllerEvent(
                     type=ControllerEventType.STATE_CHANGED,
                     address=1,
-                    detail=detail,
-                    payload=payload,
+                    detail="FILLING->FILLING_COMPLETE",
+                    payload={
+                        "event": "FILLING_COMPLETED",
+                        "previous_state": "FILLING",
+                        "normalized_state": "FILLING_COMPLETE",
+                        "state_version": version,
+                        "selected_nozzle": 1,
+                        "active_transaction_id": "dup-tx",
+                        "completion_evidence_key": "complete:frame:dup",
+                        "filled_volume_raw": 46,
+                        "filled_amount_raw": 54050,
+                        "may_publish_sale": True,
+                        "awaiting_filling_complete": False,
+                        "communication_healthy": True,
+                    },
                 )
             )
-        await asyncio.sleep(0.4)
+            await asyncio.sleep(0.4)
+
         async with unit_of_work(persistence.session_factory) as uow:
             assert await uow.transactions.count_completed(station_id=STATION) == 1
             tx = await uow.transactions.get_by_uuid("dup-tx")
             assert tx is not None
-            events = await uow.transactions.list_events(tx.id)
-            completed = [e for e in events if e.event_type == "COMPLETED"]
+            assert tx.status == "COMPLETED"
+            assert tx.source_completion_key == "complete:dup-tx"
+            tx_events = await uow.transactions.list_events(tx.id)
+            completed = [e for e in tx_events if e.event_type == "COMPLETED"]
             assert len(completed) == 1
-            _ = pump_id
     finally:
         await persistence.shutdown()
 

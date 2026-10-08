@@ -70,6 +70,10 @@ async def test_verify_zero_allows_when_no_fresh_dc2_after_invalidate() -> None:
 
 @pytest.mark.asyncio
 async def test_verify_zero_blocks_on_fresh_nonzero_dc2() -> None:
+    """Fresh non-zero DC2 after RESET must fail closed even if totals stay unchanged.
+
+    Unchanged subsequent polls are still a live meter (not display-hold silence).
+    """
     loop = await _loop()
     session = loop.sessions[1]
     loop._last_dc2.pop(1, None)
