@@ -1,7 +1,7 @@
 # SAO Oct-8 Pi canary — pump 5
 
-**Pin (install this SHA):** `7c07c4b9159eea0fd87871e476bd836c4cd284e0` on `prod_feature` (feature base `955aea1` + review + zero-gate fix).  
-Deploy only after cloud Stage 1 consumer `kacytunde/intelipump-consumer:prod_feature-3510426f6ee5` is live.
+**Pin (install this SHA):** `74d0d3052fb11f2b4e2cab6eadf5ae1655b9bfdf` on `prod_feature` (feature base `955aea1` + zero-gate fix + recover test).  
+Deploy only after cloud Stage 1 consumer `kacytunde/intelipump-consumer:prod_feature-3023dd0e69bc` is live.
 
 **Repo path on pump 5:** `/home/intelipump/intelipump-fdc/intelipump`  
 **Controller binary:** `/home/intelipump/intelipump-fdc/intelipump/.venv/bin/intelipump-controller`
@@ -26,7 +26,7 @@ Preserve `/etc/intelipump/intelipump.env`, channel maps, prices, SQLite.
 Run on the Pi as `intelipump` (or with sudo where shown). Nozzles idle; no active dispense.
 
 ```bash
-export PI_SHA=7c07c4b9159eea0fd87871e476bd836c4cd284e0
+export PI_SHA=74d0d3052fb11f2b4e2cab6eadf5ae1655b9bfdf
 export PREV_SHA="$(git -C /home/intelipump/intelipump-fdc/intelipump rev-parse HEAD)"
 echo "PREV_SHA=$PREV_SHA" | tee /tmp/intelipump-pump5-prev-sha.txt
 
@@ -51,7 +51,7 @@ grep -E 'REQUIRE_APPLICATION_SALE_ACK' /etc/intelipump/intelipump-cloud-sync.env
 
 # 3) Pinned checkout (detached OK for canary)
 git checkout "$PI_SHA"
-git rev-parse HEAD   # must print 7c07c4b9159eea0fd87871e476bd836c4cd284e0
+git rev-parse HEAD   # must print 74d0d3052fb11f2b4e2cab6eadf5ae1655b9bfdf
 git status --porcelain=v1   # still empty
 
 # 4) Package install into existing venv (preserves /etc configs)
