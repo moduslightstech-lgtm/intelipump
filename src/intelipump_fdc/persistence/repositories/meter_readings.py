@@ -37,6 +37,34 @@ class MeterReadingRepository:
         )
         return len(list(result.scalars().all()))
 
+    async def resolve_pending_by_correlation(
+        self,
+        *,
+        station_id: str,
+        correlation_id: str,
+        status: str,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> int:
+        """Clear intake PENDING_CONTROLLER rows so max_pending does not stick."""
+        result = await self._session.execute(
+            select(MeterReadingRow).where(
+                MeterReadingRow.station_id == station_id,
+                MeterReadingRow.correlation_id == correlation_id,
+                MeterReadingRow.status.in_(("PENDING", "PENDING_CONTROLLER")),
+            )
+        )
+        rows = list(result.scalars().all())
+        for row in rows:
+            row.status = status
+            if error_code is not None:
+                row.error_code = error_code
+            if error_message is not None:
+                row.error_message = error_message
+        if rows:
+            await self._session.flush()
+        return len(rows)
+
     async def latest_for_nozzle(
         self, *, station_id: str, pump_id: str, nozzle_id: str
     ) -> MeterReadingRow | None:

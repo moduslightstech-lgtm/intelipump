@@ -60,6 +60,7 @@ class MeterReadRequest:
     requested_by: str | None = None
     requested_at: str | None = None
     nozzle_hint: str | None = None
+    pump_id: str | None = None
     notes: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -70,6 +71,7 @@ class MeterReadRequest:
             "requestedBy": self.requested_by,
             "requestedAt": self.requested_at or datetime.now(UTC).isoformat(),
             "nozzleHint": self.nozzle_hint,
+            "pumpId": self.pump_id,
             "notes": self.notes,
             "readOnly": True,
             "schemaVersion": "1.1",
@@ -95,13 +97,16 @@ def _parse_request_dict(raw: dict[str, Any]) -> MeterReadRequest | None:
         )
     except (TypeError, ValueError):
         return None
+    nozzle = raw.get("nozzleHint") or raw.get("nozzle_hint")
+    pump = raw.get("pumpId") or raw.get("pump_id")
     return MeterReadRequest(
         correlation_id=corr,
         dart_address=addr,
         counter_select=coun,
         requested_by=(str(raw["requestedBy"]) if raw.get("requestedBy") else None),
         requested_at=(str(raw["requestedAt"]) if raw.get("requestedAt") else None),
-        nozzle_hint=(str(raw["nozzleHint"]) if raw.get("nozzleHint") else None),
+        nozzle_hint=(str(nozzle) if nozzle else None),
+        pump_id=(str(pump) if pump else None),
         notes=(str(raw["notes"]) if raw.get("notes") else None),
     )
 

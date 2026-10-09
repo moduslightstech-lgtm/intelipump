@@ -75,10 +75,15 @@ class MeterResultPublisher:
             or "nozzle-1"
         )
         pump_id = (
-            (result.get("channelMap") or {}).get("pump_id")
-            if isinstance(result.get("channelMap"), dict)
-            else None
-        ) or "pump-unknown"
+            result.get("pumpId")
+            or result.get("pump_id")
+            or (
+                (result.get("channelMap") or {}).get("pump_id")
+                if isinstance(result.get("channelMap"), dict)
+                else None
+            )
+            or "pump-unknown"
+        )
 
         event = "METER_READING" if status == "CAPTURED" else "METER_READING_UNSUPPORTED"
         payload: dict[str, Any] = {
@@ -114,6 +119,19 @@ class MeterResultPublisher:
         }
         dedupe = f"meter-result:{self._station_id}:{corr}:{nozzle_id}:{status}"
         async with unit_of_work(self._factory) as uow:
+            # Intake inserts PENDING_CONTROLLER; resolve it or max_pending (default 2)
+            # permanently blocks further dashboard Read now on this pump.
+            await uow.meter_readings.resolve_pending_by_correlation(
+                station_id=self._station_id,
+                correlation_id=corr,
+                status=status,
+                error_code=(
+                    str(result["errorCode"]) if result.get("errorCode") else None
+                ),
+                error_message=(
+                    str(result["errorMessage"]) if result.get("errorMessage") else None
+                ),
+            )
             await uow.sync_queue.enqueue_checked(
                 entity_type="meter_reading",
                 entity_id=corr,

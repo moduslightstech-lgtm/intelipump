@@ -66,6 +66,11 @@ Code pin: include meter file-bridge + result publisher (`6bb2566` or later with 
 Admin/Executive → **Pump Meter Readings** → station/pump → **Read now** per nozzle.  
 Manual entry still works. Scheduled production reads remain off until dispense-delta soak.
 
+**MQTT topic:** API must publish `intelipump/prod/stations/{mqtt}/commands` (TopicBuilder /
+`_env_segment`), not `intelipump/production/...`. A bad `.lower()` on `PRODUCTION` left
+Read now PENDING with no Pi intake; SET_PRICE was unaffected because it already used
+`_env_segment`.
+
 ## SAO scale (operator-verified pump-3)
 
 `litres = raw_scaled / 1000` (3 decimal places).  

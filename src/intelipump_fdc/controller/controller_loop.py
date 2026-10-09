@@ -2950,6 +2950,7 @@ class ControllerLoop:
             "requestedAt": req.requested_at,
             "requestedBy": req.requested_by,
             "nozzleHint": req.nozzle_hint,
+            "pumpId": req.pump_id,
             "deviceId": safety.hardware_meter_device_id,
             "status": "ERROR",
             "readOnly": True,

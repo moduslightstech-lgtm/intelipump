@@ -550,6 +550,7 @@ class CloudCommandIntake:
                                     ),
                                     requested_by=cmd.requestedBy,
                                     nozzle_hint=nozzle_id,
+                                    pump_id=cmd.pumpId,
                                     notes="dashboard-read-now",
                                 )
                             )
@@ -688,6 +689,17 @@ class CloudCommandIntake:
                 "meterMessage": meter_message,
                 "errorCode": meter_error_code,
             }
+            if execution_status != "PENDING_CONTROLLER":
+                logger.warning(
+                    "meter_read_intake_not_queued",
+                    correlationId=cmd.correlationId,
+                    pumpId=cmd.pumpId,
+                    nozzleId=nozzle_id,
+                    executionStatus=execution_status,
+                    errorCode=meter_error_code,
+                    detail=meter_message,
+                    pendingCount=pending_count,
+                )
         elif command is not None and command in NON_IDEMPOTENT_COMMANDS:
             if not (
                 self_env == "LAB"
