@@ -102,3 +102,34 @@ def test_nozzle_lift_before_tx_cancels_meter_read(tmp_path, monkeypatch) -> None
     assert result["errorCode"] == "METER_READ_DEFERRED_NOZZLE_OUT"
     assert result.get("volumeLiters") is None
     assert result.get("cumulativeVolumeRaw") is None
+
+
+def test_post_timeout_quarantine_blocks_new_tx(tmp_path, monkeypatch) -> None:
+    import time
+
+    monkeypatch.setattr(time, "monotonic", lambda: 1_050.0)
+    loop = _loop(tmp_path, monkeypatch)
+    loop.runtime.meter_post_timeout_quarantine_s = 8.0
+    session = loop.sessions[1]
+    session.state.meter_dc101_quarantine_until_mono = 1_055.0  # still active
+    session.state.meter_last_timeout_coun = 1
+    session.state.meter_last_timeout_mono = 1_047.0
+
+    from intelipump_fdc.controller.meter_read_request import (
+        MeterReadRequest,
+        write_meter_read_request,
+    )
+    from intelipump_fdc.controller.meter_read_request import read_meter_read_result
+
+    write_meter_read_request(
+        MeterReadRequest(correlation_id="corr-q", dart_address=1, counter_select=1)
+    )
+    import asyncio
+
+    asyncio.run(loop._apply_pending_meter_read())
+    result = read_meter_read_result(correlation_id="corr-q")
+    assert result is not None
+    assert result["status"] == "DEFERRED"
+    assert result["errorCode"] == "METER_READ_QUARANTINE_AFTER_TIMEOUT"
+    assert result.get("cumulativeVolumeRaw") is None
+    assert loop._meter_pending is None

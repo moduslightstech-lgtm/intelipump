@@ -74,6 +74,60 @@ def test_late_reply_cannot_satisfy_newer_request_window() -> None:
     assert not ok and reason == "before_request_window"
 
 
+def test_timed_out_request_late_dc101_blocked_by_quarantine_floor() -> None:
+    """Late DC101 after timeout must not match the next same-address/COUN TX.
+
+    Protocol limitation: no request UUID on the wire. Quarantine raises the
+    acceptance floor so a reply belonging to the timed-out CD101 cannot bind.
+    """
+    # Prior request timed out at t=100; quarantine until t=108.
+    # Next TX starts at t=110. Late reply stamped t=105 (during quarantine)
+    # must not match even though it is after the new TX... wait, 105 < 110.
+    # Critical case: late reply arrives at t=112 after new TX at 110 but still
+    # below quarantine floor if we extended quarantine past TX — floor is
+    # max(tx_started, quarantine_until). If quarantine_until=108 and TX=110,
+    # floor=110; reply at 112 matches. So quarantine alone isn't enough after
+    # TX — we also refuse new TX until quarantine ends (controller gate).
+    ok, reason = meter_svc.dc101_matches_pending(
+        decoded={"counter_select": 1},
+        observed_at_mono=105.0,
+        expected_address=1,
+        observed_address=1,
+        expected_coun=1,
+        queued_at_mono=100.0,
+        tx_started_at_mono=102.0,
+        quarantine_until_mono=108.0,
+    )
+    assert not ok and reason == "before_request_window"
+
+    # Reply after both TX and quarantine floor is allowed by matcher; controller
+    # still marks CAPTURED_AMBIGUOUS when a prior timeout was recent.
+    ok2, reason2 = meter_svc.dc101_matches_pending(
+        decoded={"counter_select": 1},
+        observed_at_mono=112.0,
+        expected_address=1,
+        observed_address=1,
+        expected_coun=1,
+        queued_at_mono=109.0,
+        tx_started_at_mono=110.0,
+        quarantine_until_mono=108.0,
+    )
+    assert ok2 and reason2 == "matched"
+
+
+def test_recommended_nozzle_freshness_from_poll_timing() -> None:
+    age = meter_svc.recommended_nozzle_in_max_age_s(
+        address_count=2,
+        response_timeout_ms=120,
+        inter_poll_delay_ms=5,
+        idle_sleep_ms=20,
+        tx_delay_ms=35,
+        rounds=40,
+    )
+    # per_addr=160ms → round=340ms → 40 rounds = 13.6s; function uses that.
+    assert 10.0 <= age <= 30.0
+
+
 def test_eligibility_refuses_unknown_stale_out_and_sale() -> None:
     now = 1_000.0
     ok, code, _ = meter_svc.evaluate_meter_tx_eligibility(

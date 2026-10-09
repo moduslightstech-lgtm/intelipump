@@ -192,3 +192,8 @@ class PumpSessionState:
     last_dc101: dict | None = None
     last_dc101_at_mono: float | None = None
     last_dc101_frame_hex: str | None = None
+    # After a meter-read timeout, ignore DC101 for completion until this mono
+    # time so a late reply cannot satisfy the next same-address/COUN request.
+    meter_dc101_quarantine_until_mono: float | None = None
+    meter_last_timeout_coun: int | None = None
+    meter_last_timeout_mono: float | None = None

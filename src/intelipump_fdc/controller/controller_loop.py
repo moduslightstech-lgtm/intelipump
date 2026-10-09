@@ -111,7 +111,8 @@ class ControllerRuntime:
     meter_volume_decimals: int | None = None
     meter_response_timeout_s: float = 8.0
     meter_min_interval_s: float = 60.0
-    meter_nozzle_in_max_age_s: float = 300.0
+    meter_nozzle_in_max_age_s: float = 30.0
+    meter_post_timeout_quarantine_s: float = 8.0
     meter_channel_map: dict | None = None
 
 
@@ -2719,6 +2720,17 @@ class ControllerLoop:
         if not ok:
             _fail("DEFERRED", code, msg)
             return
+        q_until = session.state.meter_dc101_quarantine_until_mono
+        if q_until is not None and now < float(q_until):
+            remaining = float(q_until) - now
+            _fail(
+                "DEFERRED",
+                "METER_READ_QUARANTINE_AFTER_TIMEOUT",
+                f"prior CD101 timed out; refusing new TX for {remaining:.1f}s "
+                "so a late DC101 cannot bind to this request "
+                "(Wayne has no request UUID)",
+            )
+            return
 
         try:
             cd101 = build_cd101_request(counter_select=coun)
@@ -2846,6 +2858,7 @@ class ControllerLoop:
             expected_coun=int(pending["counter_select"]),
             queued_at_mono=float(pending["queued_at_mono"]),
             tx_started_at_mono=pending.get("tx_started_at_mono"),
+            quarantine_until_mono=session.state.meter_dc101_quarantine_until_mono,
         )
         if matched and isinstance(dc101, dict):
             raw_scaled = (
@@ -2868,13 +2881,38 @@ class ControllerLoop:
                 channel = cmap[str(addr)]
             elif addr in cmap:
                 channel = cmap[addr]
+            flags = build_capture_flags(
+                counter_select=coun,
+                volume_decimals=decimals,
+                liters=liters,
+            )
+            # Expose residual ambiguity if a prior timeout on same COUN was recent.
+            prior_to = session.state.meter_last_timeout_mono
+            prior_coun = session.state.meter_last_timeout_coun
+            ambiguous = (
+                prior_to is not None
+                and prior_coun is not None
+                and int(prior_coun) == coun
+                and (now - float(prior_to))
+                < (2.0 * float(self.runtime.meter_post_timeout_quarantine_s))
+            )
+            if ambiguous:
+                flags["ambiguousCorrelation"] = True
+                flags["priorTimeoutMonoAgeS"] = now - float(prior_to)
+            status = "CAPTURED_AMBIGUOUS" if ambiguous else "CAPTURED"
+            # Consume observation so it cannot satisfy a later request.
+            session.state.last_dc101 = None
+            session.state.last_dc101_at_mono = None
+            frame_hex = session.state.last_dc101_frame_hex
+            session.state.last_dc101_frame_hex = None
+            session.state.meter_dc101_quarantine_until_mono = None
             _done(
                 {
                     **result_base,
-                    "status": "CAPTURED",
+                    "status": status,
                     "capturedAt": datetime.now(UTC).isoformat(),
                     "requestPayloadHex": pending["request_payload_hex"],
-                    "responseFrameHex": session.state.last_dc101_frame_hex,
+                    "responseFrameHex": frame_hex,
                     "decoded": dc101,
                     "rawScaled": raw_scaled,
                     "rawCounters": {
@@ -2889,18 +2927,26 @@ class ControllerLoop:
                     "volumeDecimals": decimals,
                     "volumeLiters": liters,
                     "channelMap": channel,
-                    "flags": build_capture_flags(
-                        counter_select=coun,
-                        volume_decimals=decimals,
-                        liters=liters,
-                    ),
+                    "flags": flags,
                     "mappingNote": (
-                        "CAPTURED = correlated DC101 reply. "
-                        "Nozzle/meter1/meter2 mapping and face scale are "
-                        "unverified until attended comparison."
+                        f"{status} = correlated DC101 reply"
+                        + (
+                            " but a prior timeout on this address/COUN was recent; "
+                            "treat as ambiguous (no wire request UUID)."
+                            if ambiguous
+                            else ". Nozzle/meter mapping and face scale are "
+                            "unverified until attended comparison."
+                        )
                     ),
-                    "errorCode": None,
-                    "errorMessage": None,
+                    "errorCode": (
+                        "METER_CORRELATION_AMBIGUOUS" if ambiguous else None
+                    ),
+                    "errorMessage": (
+                        "Possible late DC101 from a prior timed-out CD101; "
+                        "re-read after quarantine if totals look wrong."
+                        if ambiguous
+                        else None
+                    ),
                 }
             )
             return
@@ -2921,6 +2967,14 @@ class ControllerLoop:
             )
 
         if now >= float(pending["deadline_mono"]):
+            # Quarantine: late DC101 must not satisfy the next same-address/COUN TX.
+            q = float(self.runtime.meter_post_timeout_quarantine_s)
+            session.state.meter_dc101_quarantine_until_mono = now + q
+            session.state.meter_last_timeout_coun = int(pending["counter_select"])
+            session.state.meter_last_timeout_mono = now
+            session.state.last_dc101 = None
+            session.state.last_dc101_at_mono = None
+            session.state.last_dc101_frame_hex = None
             _done(
                 {
                     **result_base,
@@ -2928,7 +2982,8 @@ class ControllerLoop:
                     "errorCode": "METER_DC101_TIMEOUT",
                     "errorMessage": (
                         "CD101 queued but no matching DC101 (address+COUN+window) "
-                        "before timeout; reporting unsupported (no invented zero)"
+                        "before timeout; reporting unsupported (no invented zero); "
+                        f"quarantine {q:.1f}s before next TX on this address"
                         + (f"; last_ignore={reason}" if reason else "")
                     ),
                     "requestPayloadHex": pending["request_payload_hex"],
@@ -2936,6 +2991,7 @@ class ControllerLoop:
                     "volumeLiters": None,
                     "cumulativeVolumeRaw": None,
                     "capturedAt": None,
+                    "quarantineSeconds": q,
                 }
             )
 

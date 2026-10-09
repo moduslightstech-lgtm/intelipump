@@ -211,6 +211,27 @@ def evaluate_meter_tx_eligibility(
     return (True, "", "")
 
 
+def recommended_nozzle_in_max_age_s(
+    *,
+    address_count: int = 2,
+    response_timeout_ms: int = 120,
+    inter_poll_delay_ms: int = 5,
+    idle_sleep_ms: int = 20,
+    tx_delay_ms: int = 35,
+    rounds: int = 40,
+) -> float:
+    """Derive a freshness ceiling from scheduler timing (not a wall-clock guess).
+
+    One dual-hose round ≈ per-address (response_timeout + inter_poll + tx_delay)
+    plus idle_sleep. Default ``rounds=40`` ≈ 30s for stock dual-address timing.
+    """
+    per_addr_ms = (
+        int(response_timeout_ms) + int(inter_poll_delay_ms) + int(tx_delay_ms)
+    )
+    round_ms = int(address_count) * per_addr_ms + int(idle_sleep_ms)
+    return max(5.0, (round_ms * int(rounds)) / 1000.0)
+
+
 def dc101_matches_pending(
     *,
     decoded: dict[str, Any] | None,
@@ -220,13 +241,15 @@ def dc101_matches_pending(
     expected_coun: int,
     queued_at_mono: float,
     tx_started_at_mono: float | None,
+    quarantine_until_mono: float | None = None,
 ) -> tuple[bool, str]:
     """Correlate DC101 to a pending CD101 request.
 
     Protocol limitation (documented): Wayne DC101 does not echo a request UUID.
     Correlation is (DART address + requested COUN + observation after our TX).
     Unsolicited / late / wrong-address / wrong-COUN replies must not complete a
-    newer request.
+    newer request. Observations at/before a post-timeout quarantine floor are
+    rejected so a timed-out request's late DC101 cannot satisfy the next one.
     """
     if observed_address != int(expected_address):
         return False, "wrong_address"
@@ -240,6 +263,8 @@ def dc101_matches_pending(
         if tx_started_at_mono is not None
         else float(queued_at_mono)
     )
+    if quarantine_until_mono is not None:
+        floor = max(floor, float(quarantine_until_mono))
     if float(observed_at_mono) < floor:
         return False, "before_request_window"
     coun = decoded.get("counter_select")

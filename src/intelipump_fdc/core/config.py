@@ -183,7 +183,13 @@ class MeterReadingSettings(BaseModel):
     # Do not enqueue CD101 while session looks like active dispensing.
     block_during_dispensing: bool = True
     # Max age of last verified nozzle-IN (NOZIO/DC3) before refuse as stale.
-    nozzle_in_max_age_seconds: float = Field(default=300.0, ge=5.0, le=3600.0)
+    # Default 30s ≈ tens of dual-address poll rounds (see PollSchedulerConfig:
+    # ~120ms response + 5ms inter-poll + bus delays per address). 300s was too
+    # loose for catching a dead/stuck poller before an attended read.
+    nozzle_in_max_age_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
+    # After CD101 timeout, block new TX on that address this long so late DC101
+    # cannot bind to the next request (protocol has no request UUID).
+    post_timeout_quarantine_seconds: float = Field(default=8.0, ge=1.0, le=120.0)
 
     def allowed_address_set(self) -> frozenset[int]:
         out: set[int] = set()

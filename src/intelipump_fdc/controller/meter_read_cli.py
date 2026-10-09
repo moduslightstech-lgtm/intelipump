@@ -142,7 +142,11 @@ def _request_one(
     result_file = result_path_for(corr)
     print(f"REQUEST_WRITTEN path={path} address={address} correlationId={corr}")
     print(f"CD101_PAYLOAD {cd101.payload_hex}")
+    print(f"RESULT_FILE path={result_file}")
     print(f"AWAITING_RESULT path={result_file} wait={wait_seconds}s")
+    print(
+        "NOTE: export THIS correlation file (not only meter-read-result.json latest)."
+    )
     if wait_seconds <= 0:
         return 0
 
@@ -152,9 +156,10 @@ def _request_one(
         last = read_meter_read_result(correlation_id=corr)
         if last and last.get("correlationId") == corr:
             print(json.dumps(last, indent=2, sort_keys=True))
+            print(f"RESULT_FILE_EXPORT path={result_file}")
             status = str(last.get("status") or "")
-            if status == "CAPTURED":
-                return 0
+            if status in {"CAPTURED", "CAPTURED_AMBIGUOUS"}:
+                return 0 if status == "CAPTURED" else 1
             return 1
         time.sleep(0.25)
     print(
