@@ -35,7 +35,22 @@ address + COUN + post-TX window. CAPTURED ≠ verified nozzle mapping/scale.
 
 ## Permanent Pi config (controller + cloud-sync)
 
-Add to **both** `/etc/intelipump/intelipump.env` and `/etc/intelipump/intelipump-cloud-sync.env`:
+**One-shot on the Pi** (preferred):
+
+```bash
+cd ~/intelipump-fdc/intelipump   # or your checkout that systemd ExecStart uses
+git pull   # meter-reading pin with file bridge
+./scripts/setup_sao_meter_reading_pi.sh --pump N
+# If attended face check needs swapped hoses:
+# ./scripts/setup_sao_meter_reading_pi.sh --pump N --swap-nozzles
+```
+
+That writes `config/channel_map.sao-rs1-pumpN.json`, upserts meter gates +
+`COMMAND_SUBSCRIPTION_ENABLED=true` into both env files, clears stuck local
+`PENDING_CONTROLLER` rows (`max_pending=2`), and restarts services.
+
+Manual equivalent — add to **both** `/etc/intelipump/intelipump.env` and
+`/etc/intelipump/intelipump-cloud-sync.env`:
 
 ```bash
 INTELIPUMP_METER_READING__HARDWARE_CD101=true
@@ -60,6 +75,9 @@ sudo systemctl restart intelipump.service intelipump-cloud-sync.service
 ```
 
 Code pin: include meter file-bridge + result publisher (`6bb2566` or later with dashboard wiring).
+
+**Operator note:** after long idle, re-seat the nozzle (fresh NOZIO IN) then
+Read now within ~30s (`NOZZLE_IN_MAX_AGE`).
 
 ## Dashboard
 
