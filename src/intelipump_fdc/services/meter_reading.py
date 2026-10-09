@@ -352,22 +352,50 @@ def build_cd101_outbound_payload(*, counter_select: int = 1) -> bytes:
     return build_cd101_request(counter_select=counter_select).application_payload
 
 
+def pump_ids_from_channel_map(
+    channel_mappings: dict[int, Any] | None,
+) -> set[str]:
+    """Logical pump ids owned by this Pi's channel map."""
+    out: set[str] = set()
+    if not channel_mappings:
+        return out
+    for meta in channel_mappings.values():
+        pump = None
+        if hasattr(meta, "pump_id"):
+            pump = getattr(meta, "pump_id")
+        elif isinstance(meta, dict):
+            pump = meta.get("pump_id") or meta.get("pumpId")
+        text = str(pump or "").strip()
+        if text:
+            out.add(text)
+    return out
+
+
 def dart_address_for_nozzle(
     channel_mappings: dict[int, Any] | None,
     nozzle_id: str,
+    *,
+    pump_id: str | None = None,
 ) -> int | None:
-    """Resolve DART logical address from channel map nozzle_id."""
+    """Resolve DART logical address from channel map nozzle_id (+ optional pump_id)."""
     if not channel_mappings:
         return None
     want = (nozzle_id or "").strip()
+    want_pump = (pump_id or "").strip()
     for addr, meta in channel_mappings.items():
         nozzle = None
+        pump = None
         if hasattr(meta, "nozzle_id"):
             nozzle = getattr(meta, "nozzle_id")
+            pump = getattr(meta, "pump_id", None)
         elif isinstance(meta, dict):
             nozzle = meta.get("nozzle_id") or meta.get("nozzleId")
-        if str(nozzle or "").strip() == want:
-            return int(addr)
+            pump = meta.get("pump_id") or meta.get("pumpId")
+        if str(nozzle or "").strip() != want:
+            continue
+        if want_pump and str(pump or "").strip() != want_pump:
+            continue
+        return int(addr)
     return None
 
 

@@ -18,7 +18,10 @@ from intelipump_fdc.cloud.mqtt.base import MqttClient
 from intelipump_fdc.cloud.mqtt.models import MqttMessage
 from intelipump_fdc.cloud.qos import qos_for_event
 from intelipump_fdc.cloud.schemas import CloudCommandInbound
-from intelipump_fdc.cloud.set_price_ownership import local_set_price_pump_ids
+from intelipump_fdc.cloud.set_price_ownership import (
+    local_set_price_pump_ids,
+    owned_logical_pump_ids,
+)
 from intelipump_fdc.cloud.set_price_request import (
     SetPriceRequest,
     ack_set_price_outcome,
@@ -481,6 +484,38 @@ class CloudCommandIntake:
                 "unknown_command_type",
             )
         ):
+            # Station topic is shared: every Pi sees every READ_METER. Only the
+            # Pi that owns this logical pumpId may act or publish meter events.
+            local_meter_pumps = meter_svc.pump_ids_from_channel_map(
+                self._channel_mappings
+            )
+            owned = owned_logical_pump_ids(device_id=self._device_id)
+            if owned is not None:
+                local_meter_pumps |= set(owned)
+            if cmd.pumpId not in local_meter_pumps:
+                logger.info(
+                    "meter_read_ignored_other_pump",
+                    stationId=self._station_id,
+                    deviceId=self._device_id,
+                    commandPumpId=cmd.pumpId,
+                    localPumpIds=sorted(local_meter_pumps),
+                    correlationId=cmd.correlationId,
+                )
+                return {
+                    "commandId": cmd.commandId,
+                    "correlationId": cmd.correlationId,
+                    "accepted": False,
+                    "evaluated": True,
+                    "executed": False,
+                    "executionStatus": "IGNORED_OTHER_PUMP",
+                    "blockingReasons": ["not_for_this_device"],
+                    "warnings": [],
+                    "currentPumpState": current_state,
+                    "resultingState": None,
+                    "environment": self._environment,
+                    "simulated": self._simulated or cmd.simulatorOnly,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
             # Additive meter reconciliation: default UNSUPPORTED (never invent zeros).
             # Optional auto-CD101 uses the existing outbound queue only — no new serial.
             nozzle_id = meter_svc.nozzle_from_payload(cmd.payload)
@@ -523,7 +558,9 @@ class CloudCommandIntake:
                 else:
                     if dart_address is None:
                         dart_address = meter_svc.dart_address_for_nozzle(
-                            self._channel_mappings, nozzle_id
+                            self._channel_mappings,
+                            nozzle_id,
+                            pump_id=cmd.pumpId,
                         )
                     if dart_address is None and ctx is not None:
                         dart_address = int(ctx.dart_address)
