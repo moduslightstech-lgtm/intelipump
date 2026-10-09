@@ -256,5 +256,33 @@ def read_meter_read_result(*, correlation_id: str | None = None) -> dict[str, An
     return raw if isinstance(raw, dict) else None
 
 
+def list_meter_read_results(*, limit: int = 32) -> list[dict[str, Any]]:
+    """Load correlation-scoped result files (oldest first).
+
+    Startup OPENING captures both addresses back-to-back; cloud-sync must not
+    rely only on the latest pointer or the first CAPTURED is dropped.
+    """
+    base = request_dir()
+    if not base.is_dir():
+        return []
+    paths = sorted(
+        (
+            p
+            for p in base.glob("meter-read-result.*.json")
+            if p.is_file() and not p.name.endswith(".tmp")
+        ),
+        key=lambda p: p.stat().st_mtime,
+    )
+    out: list[dict[str, Any]] = []
+    for path in paths[-max(1, int(limit)) :]:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(raw, dict):
+            out.append(raw)
+    return out
+
+
 def new_correlation_id() -> str:
     return str(uuid4())

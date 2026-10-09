@@ -1,4 +1,4 @@
-"""Publish controller meter-read-result.json to sync_queue / MQTT (cloud-sync)."""
+"""Publish controller meter-read-result*.json to sync_queue / MQTT (cloud-sync)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ from typing import Any
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from intelipump_fdc.controller.meter_read_request import read_meter_read_result
+from intelipump_fdc.controller.meter_read_request import (
+    list_meter_read_results,
+    read_meter_read_result,
+)
 from intelipump_fdc.core.config import MeterReadingSettings
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 from intelipump_fdc.services import meter_reading as meter_svc
@@ -34,7 +37,18 @@ class MeterResultPublisher:
         self._seen: set[str] = set()
 
     async def publish_new_results(self) -> int:
-        result = read_meter_read_result()
+        # Prefer per-correlation files so back-to-back OPENING captures both land.
+        results = list_meter_read_results(limit=32)
+        if not results:
+            latest = read_meter_read_result()
+            if latest:
+                results = [latest]
+        published = 0
+        for result in results:
+            published += await self._publish_one(result)
+        return published
+
+    async def _publish_one(self, result: dict[str, Any]) -> int:
         if not result:
             return 0
         corr = str(result.get("correlationId") or "").strip()
@@ -65,23 +79,22 @@ class MeterResultPublisher:
                 int(raw) if raw is not None else None, decimals
             )
 
+        # Prefer channel map (DART→nozzle) over request hint — a wrong/default
+        # nozzleHint was tagging addr-1 captures as nozzle-2 on the dashboard.
+        channel = (
+            result.get("channelMap")
+            if isinstance(result.get("channelMap"), dict)
+            else {}
+        )
         nozzle_id = (
-            str(result.get("nozzleHint") or "").strip()
-            or (
-                (result.get("channelMap") or {}).get("nozzle_id")
-                if isinstance(result.get("channelMap"), dict)
-                else None
-            )
+            str(channel.get("nozzle_id") or channel.get("nozzleId") or "").strip()
+            or str(result.get("nozzleHint") or "").strip()
             or "nozzle-1"
         )
         pump_id = (
-            result.get("pumpId")
+            str(channel.get("pump_id") or channel.get("pumpId") or "").strip()
+            or result.get("pumpId")
             or result.get("pump_id")
-            or (
-                (result.get("channelMap") or {}).get("pump_id")
-                if isinstance(result.get("channelMap"), dict)
-                else None
-            )
             or "pump-unknown"
         )
 
