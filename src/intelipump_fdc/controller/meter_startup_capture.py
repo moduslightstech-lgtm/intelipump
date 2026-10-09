@@ -46,6 +46,35 @@ def save_marker(data: dict[str, Any], path: Path | None = None) -> None:
     tmp.replace(p)
 
 
+def _int_keys(section: Any) -> set[int]:
+    if not isinstance(section, dict):
+        return set()
+    out: set[int] = set()
+    for key in section:
+        try:
+            out.add(int(key))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _today_marker(
+    *,
+    timezone: str = "Africa/Lagos",
+    path: Path | None = None,
+) -> dict[str, Any]:
+    today = business_date_today(timezone=timezone)
+    data = load_marker(path)
+    if str(data.get("businessDate") or "") != today:
+        return {"businessDate": today, "captured": {}, "failed": {}}
+    if not isinstance(data.get("captured"), dict):
+        data["captured"] = {}
+    if not isinstance(data.get("failed"), dict):
+        data["failed"] = {}
+    data["businessDate"] = today
+    return data
+
+
 def captured_addresses_for_today(
     *,
     timezone: str = "Africa/Lagos",
@@ -54,16 +83,19 @@ def captured_addresses_for_today(
     data = load_marker(path)
     if str(data.get("businessDate") or "") != business_date_today(timezone=timezone):
         return set()
-    captured = data.get("captured") or {}
-    if not isinstance(captured, dict):
+    return _int_keys(data.get("captured"))
+
+
+def finished_addresses_for_today(
+    *,
+    timezone: str = "Africa/Lagos",
+    path: Path | None = None,
+) -> set[int]:
+    """Addresses that must not be re-queued today (CAPTURED or terminal fail)."""
+    data = load_marker(path)
+    if str(data.get("businessDate") or "") != business_date_today(timezone=timezone):
         return set()
-    out: set[int] = set()
-    for key in captured:
-        try:
-            out.add(int(key))
-        except (TypeError, ValueError):
-            continue
-    return out
+    return _int_keys(data.get("captured")) | _int_keys(data.get("failed"))
 
 
 def mark_address_captured(
@@ -74,16 +106,50 @@ def mark_address_captured(
     path: Path | None = None,
 ) -> None:
     today = business_date_today(timezone=timezone)
-    data = load_marker(path)
-    if str(data.get("businessDate") or "") != today:
-        data = {"businessDate": today, "captured": {}}
+    data = _today_marker(timezone=timezone, path=path)
     captured = data.setdefault("captured", {})
     if not isinstance(captured, dict):
         captured = {}
         data["captured"] = captured
+    # Success wins over a prior fail entry for the same day.
+    failed = data.get("failed")
+    if isinstance(failed, dict):
+        failed.pop(str(int(address)), None)
     captured[str(int(address))] = {
         "correlationId": correlation_id,
         "capturedAt": datetime.now(ZoneInfo(timezone or "Africa/Lagos")).isoformat(),
+    }
+    data["businessDate"] = today
+    save_marker(data, path)
+
+
+def mark_address_failed(
+    *,
+    address: int,
+    correlation_id: str,
+    status: str,
+    error_code: str | None = None,
+    timezone: str = "Africa/Lagos",
+    path: Path | None = None,
+) -> None:
+    """Stop retrying this address for the local business day after a terminal fail.
+
+    Does not overwrite an existing CAPTURED entry.
+    """
+    today = business_date_today(timezone=timezone)
+    data = _today_marker(timezone=timezone, path=path)
+    captured = data.get("captured")
+    if isinstance(captured, dict) and str(int(address)) in captured:
+        return
+    failed = data.setdefault("failed", {})
+    if not isinstance(failed, dict):
+        failed = {}
+        data["failed"] = failed
+    failed[str(int(address))] = {
+        "correlationId": correlation_id,
+        "status": str(status or "UNSUPPORTED").upper(),
+        "errorCode": error_code,
+        "failedAt": datetime.now(ZoneInfo(timezone or "Africa/Lagos")).isoformat(),
     }
     data["businessDate"] = today
     save_marker(data, path)

@@ -129,6 +129,9 @@ class ControllerLoop:
         self._meter_last_attempt_mono: dict[int, float] = {}
         self._meter_loop_started_mono: float | None = None
         self._meter_startup_window_closed: bool = False
+        # After DEFERRED / quarantine, wait before re-queuing the same OPENING addr.
+        self._meter_startup_next_try_mono: dict[int, float] = {}
+        self._meter_startup_defer_backoff_s: float = 15.0
         thresholds = HealthThresholds(
             degraded_after_timeouts=runtime.config.degraded_after_timeouts,
             disconnected_after_timeouts=runtime.config.max_consecutive_timeouts,
@@ -2834,6 +2837,72 @@ class ControllerLoop:
             startup_opening=startup_opening,
         )
 
+    def _startup_meter_backoff(self, address: int, *, extra_s: float = 0.0) -> None:
+        delay = max(
+            float(self._meter_startup_defer_backoff_s),
+            float(extra_s),
+            float(self.runtime.meter_post_timeout_quarantine_s) + 1.0,
+        )
+        self._meter_startup_next_try_mono[int(address)] = time.monotonic() + delay
+
+    def _note_startup_meter_outcome(
+        self,
+        *,
+        address: int,
+        correlation_id: str | None,
+        status: str,
+        error_code: str | None = None,
+        startup_opening: bool,
+    ) -> None:
+        """Backoff DEFERRED; mark day-done on CAPTURED / terminal fail."""
+        if not startup_opening:
+            return
+        status_u = str(status or "").upper()
+        tz = self.runtime.meter_startup_capture_timezone or "Africa/Lagos"
+        corr = str(correlation_id or "")
+        try:
+            if status_u.startswith("CAPTURED"):
+                from intelipump_fdc.controller.meter_startup_capture import (
+                    mark_address_captured,
+                )
+
+                mark_address_captured(
+                    address=int(address),
+                    correlation_id=corr,
+                    timezone=tz,
+                )
+                self._meter_startup_next_try_mono.pop(int(address), None)
+                return
+            if status_u in {"UNSUPPORTED", "ERROR"}:
+                from intelipump_fdc.controller.meter_startup_capture import (
+                    mark_address_failed,
+                )
+
+                mark_address_failed(
+                    address=int(address),
+                    correlation_id=corr,
+                    status=status_u,
+                    error_code=error_code,
+                    timezone=tz,
+                )
+                self._meter_startup_next_try_mono.pop(int(address), None)
+                logger.info(
+                    "meter_startup_capture_address_finished",
+                    address=address,
+                    status=status_u,
+                    errorCode=error_code,
+                    correlationId=corr,
+                )
+                return
+            if status_u == "DEFERRED":
+                self._startup_meter_backoff(int(address))
+        except OSError as exc:
+            logger.warning(
+                "meter_startup_capture_marker_failed",
+                address=address,
+                error=str(exc),
+            )
+
     async def _maybe_queue_startup_meter_capture(self) -> None:
         """Once per local morning after boot: queue OPENING CD101 per address."""
         from uuid import uuid4
@@ -2844,7 +2913,7 @@ class ControllerLoop:
             MeterReadRequest,
         )
         from intelipump_fdc.controller.meter_startup_capture import (
-            captured_addresses_for_today,
+            finished_addresses_for_today,
         )
 
         if not self.runtime.meter_hardware_cd101:
@@ -2872,16 +2941,34 @@ class ControllerLoop:
             return
 
         tz = self.runtime.meter_startup_capture_timezone or "Africa/Lagos"
-        done = captured_addresses_for_today(timezone=tz)
+        done = finished_addresses_for_today(timezone=tz)
         safety = self.runtime.safety
         allowed = set(safety.hardware_meter_allowed_addresses)
-        for addr in self.runtime.config.addresses:
-            if int(addr) in done:
-                continue
-            if allowed and int(addr) not in allowed:
+        candidates = [
+            int(a)
+            for a in self.runtime.config.addresses
+            if (not allowed or int(a) in allowed) and int(a) not in done
+        ]
+        if not candidates:
+            self._meter_startup_window_closed = True
+            logger.info(
+                "meter_startup_capture_all_addresses_done",
+                finished=sorted(done),
+            )
+            return
+
+        for addr in candidates:
+            next_try = self._meter_startup_next_try_mono.get(int(addr))
+            if next_try is not None and now < float(next_try):
                 continue
             session = self.sessions.get(int(addr))
             if session is None:
+                continue
+            q_until = session.state.meter_dc101_quarantine_until_mono
+            if q_until is not None and now < float(q_until):
+                self._startup_meter_backoff(
+                    int(addr), extra_s=float(q_until) - now
+                )
                 continue
             ok, code, msg = self._meter_session_eligibility(
                 session, startup_opening=True
@@ -2893,6 +2980,7 @@ class ControllerLoop:
                     errorCode=code,
                     detail=msg,
                 )
+                self._startup_meter_backoff(int(addr))
                 continue
             cmap = self.runtime.meter_channel_map or {}
             meta = None
@@ -3023,6 +3111,13 @@ class ControllerLoop:
             }
         )
         clear_meter_read_request()
+        self._note_startup_meter_outcome(
+            address=addr,
+            correlation_id=pending.get("correlation_id"),
+            status=status,
+            error_code=code,
+            startup_opening=bool(pending.get("startup_opening")),
+        )
         logger.warning(
             "meter_read_cancelled",
             correlationId=pending.get("correlation_id"),
@@ -3105,6 +3200,13 @@ class ControllerLoop:
                 }
             )
             clear_meter_read_request()
+            self._note_startup_meter_outcome(
+                address=addr,
+                correlation_id=req.correlation_id,
+                status=status,
+                error_code=code,
+                startup_opening=startup_opening,
+            )
             logger.warning(
                 "meter_read_refused",
                 correlationId=req.correlation_id,
@@ -3254,24 +3356,17 @@ class ControllerLoop:
             write_meter_read_result(payload)
             clear_meter_read_request()
             status = str(payload.get("status") or "").upper()
-            if pending.get("startup_opening") and status.startswith("CAPTURED"):
-                try:
-                    from intelipump_fdc.controller.meter_startup_capture import (
-                        mark_address_captured,
-                    )
-
-                    mark_address_captured(
-                        address=addr,
-                        correlation_id=str(pending["correlation_id"]),
-                        timezone=self.runtime.meter_startup_capture_timezone
-                        or "Africa/Lagos",
-                    )
-                except OSError as exc:
-                    logger.warning(
-                        "meter_startup_capture_marker_failed",
-                        address=addr,
-                        error=str(exc),
-                    )
+            self._note_startup_meter_outcome(
+                address=addr,
+                correlation_id=str(pending["correlation_id"]),
+                status=status,
+                error_code=(
+                    str(payload.get("errorCode"))
+                    if payload.get("errorCode") is not None
+                    else None
+                ),
+                startup_opening=bool(pending.get("startup_opening")),
+            )
             self._meter_pending = None
             logger.info(
                 "meter_read_finished",
@@ -3299,7 +3394,10 @@ class ControllerLoop:
 
         # If still queued (not TX'd) and eligibility fails (nozzle lift), cancel.
         if pending.get("tx_started_at_mono") is None:
-            ok, code, msg = self._meter_session_eligibility(session)
+            ok, code, msg = self._meter_session_eligibility(
+                session,
+                startup_opening=bool(pending.get("startup_opening")),
+            )
             if not ok:
                 self._meter_cancel_pending(status="DEFERRED", code=code, message=msg)
                 return
