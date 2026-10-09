@@ -306,10 +306,18 @@ class CloudCommandIntake:
         production_set_price = (
             command is PumpCommand.SET_PRICE and self._allow_production_set_price
         )
+        # Dashboard READ_METER resolves DART address from channel map + nozzleId;
+        # one-Pi-per-pump stations often have no local SQLite pump catalog row.
+        hardware_read_meter = command is PumpCommand.READ_METER
 
         pump_db_id: str | None = None
         ctx: PumpContext | None = None
-        if not reasons and command is not None and not production_set_price:
+        if (
+            not reasons
+            and command is not None
+            and not production_set_price
+            and not hardware_read_meter
+        ):
             async with unit_of_work(self._factory) as uow:
                 pumps = await uow.pumps.list_for_station(self._station_id)
                 pump = next(
@@ -471,7 +479,6 @@ class CloudCommandIntake:
                 "duplicate_correlation_id",
                 "duplicate_persisted_command",
                 "unknown_command_type",
-                "pump_not_found",
             )
         ):
             # Additive meter reconciliation: default UNSUPPORTED (never invent zeros).
