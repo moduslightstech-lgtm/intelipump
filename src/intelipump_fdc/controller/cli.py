@@ -36,7 +36,11 @@ from intelipump_fdc.services.recovery_service import format_recovery_report
 
 
 def _load_meter_channel_map(settings) -> dict | None:
-    """Best-effort channel map for meter result annotation (read-only)."""
+    """Best-effort channel map for meter result annotation (read-only).
+
+    Normalizes JSON string keys (\"1\") to int keys so startup OPENING and
+    CAPTURED paths resolve pump_id / nozzle_id consistently.
+    """
     path = settings.channel_map_path
     if not path:
         return None
@@ -45,7 +49,18 @@ def _load_meter_channel_map(settings) -> dict | None:
 
         text = Path(path).read_text(encoding="utf-8")
         data = json.loads(text)
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        out: dict = {}
+        for key, val in data.items():
+            try:
+                out[int(key)] = val
+            except (TypeError, ValueError):
+                out[key] = val
+            if isinstance(val, dict):
+                # Keep string key too for older lookup sites.
+                out[str(key)] = val
+        return out
     except (OSError, json.JSONDecodeError):
         return None
 

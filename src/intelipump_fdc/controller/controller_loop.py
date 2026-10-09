@@ -2895,7 +2895,11 @@ class ControllerLoop:
                 )
                 continue
             cmap = self.runtime.meter_channel_map or {}
-            meta = cmap.get(int(addr)) if isinstance(cmap, dict) else None
+            meta = None
+            if isinstance(cmap, dict):
+                meta = cmap.get(int(addr))
+                if meta is None:
+                    meta = cmap.get(str(int(addr)))
             nozzle_hint = None
             pump_id = None
             if meta is not None:
