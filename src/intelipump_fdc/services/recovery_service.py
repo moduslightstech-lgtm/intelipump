@@ -88,76 +88,131 @@ class RecoveryService:
         return mapping
 
     async def recover(self) -> RecoveryReport:
+        """Restore pump contexts after restart.
+
+        Uses separate transactions so a sync_queue flush failure (common under
+        SQLite lock contention with cloud-sync) cannot PendingRollback the
+        whole recovery and brick ``intelipump.service``.
+        """
+        import structlog
+
+        logger = structlog.get_logger(__name__)
+
         await configure_sqlite_pragmas(self._engine)
         schema = await init_schema(self._engine)
         report = RecoveryReport(schema_version=schema)
 
-        async with unit_of_work(self._factory) as uow:
-            report.queue_locks_released = await uow.sync_queue.release_stale_locks(
-                older_than_seconds=60
-            )
-            pumps = await uow.pumps.list_for_station(self._station_id)
-            for pump in pumps:
-                report.pumps_restored.append(pump.logical_pump_id)
-                snap = await uow.states.latest(pump.id)
-                if snap is None:
-                    ctx = PumpContext(
-                        pump_id=pump.logical_pump_id,
-                        dart_address=pump.dart_address,
-                        current_state=PumpState.DISCONNECTED,
-                        communication_healthy=False,
-                    )
-                else:
-                    try:
-                        state = PumpState(snap.normalized_state)
-                    except ValueError:
-                        state = PumpState.DISCOVERING
-                        report.warnings.append(
-                            f"unknown persisted state {snap.normalized_state} "
-                            f"for {pump.logical_pump_id}"
-                        )
-                    prev = None
-                    if snap.previous_state:
-                        try:
-                            prev = PumpState(snap.previous_state)
-                        except ValueError:
-                            prev = None
-                    ctx = PumpContext(
-                        pump_id=pump.logical_pump_id,
-                        dart_address=pump.dart_address,
-                        current_state=state,
-                        previous_state=prev,
-                        selected_nozzle=snap.selected_nozzle,
-                        active_transaction_id=snap.active_transaction_id,
-                        communication_healthy=False,  # require live observation
-                        last_raw_wayne_status=snap.raw_wayne_status,
-                        state_version=snap.state_version,
-                        last_source_frame_hex=snap.source_frame_ref,
-                    )
-                    if snap.communication_healthy:
-                        report.warnings.append(
-                            f"{pump.logical_pump_id}: persisted communication "
-                            "was healthy; restart forces unhealthy until live data"
-                        )
-                report.pump_contexts[pump.logical_pump_id] = ctx
-
-            unresolved = await uow.transactions.list_unresolved(
-                station_id=self._station_id
-            )
-            for tx in unresolved:
-                report.unresolved_transactions.append(tx.transaction_uuid)
-                report.warnings.append(
-                    f"unresolved transaction preserved: {tx.transaction_uuid}"
+        # 1) Best-effort stale lock release (own transaction).
+        try:
+            async with unit_of_work(self._factory) as uow:
+                report.queue_locks_released = await uow.sync_queue.release_stale_locks(
+                    older_than_seconds=60
                 )
-
-            pending = await uow.commands.list_pending_or_in_progress(
-                station_id=self._station_id
+        except Exception as exc:  # noqa: BLE001 — never block controller start
+            logger.exception("recovery_release_stale_locks_failed")
+            report.warnings.append(
+                f"sync_queue release_stale_locks failed: {type(exc).__name__}: {exc}"
             )
-            now = datetime.now(UTC)
-            for cmd in pending:
-                await self._reconcile_command(uow, cmd, now, report)
 
-            _ = await get_schema_version(uow.session)
+        # 2) Pump state snapshots (own transaction).
+        try:
+            async with unit_of_work(self._factory) as uow:
+                pumps = await uow.pumps.list_for_station(self._station_id)
+                for pump in pumps:
+                    report.pumps_restored.append(pump.logical_pump_id)
+                    try:
+                        snap = await uow.states.latest(pump.id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception(
+                            "recovery_state_latest_failed",
+                            pump_id=pump.logical_pump_id,
+                        )
+                        report.warnings.append(
+                            f"state snapshot load failed for "
+                            f"{pump.logical_pump_id}: {type(exc).__name__}: {exc}"
+                        )
+                        snap = None
+                    if snap is None:
+                        ctx = PumpContext(
+                            pump_id=pump.logical_pump_id,
+                            dart_address=pump.dart_address,
+                            current_state=PumpState.DISCONNECTED,
+                            communication_healthy=False,
+                        )
+                    else:
+                        try:
+                            state = PumpState(snap.normalized_state)
+                        except ValueError:
+                            state = PumpState.DISCOVERING
+                            report.warnings.append(
+                                f"unknown persisted state {snap.normalized_state} "
+                                f"for {pump.logical_pump_id}"
+                            )
+                        prev = None
+                        if snap.previous_state:
+                            try:
+                                prev = PumpState(snap.previous_state)
+                            except ValueError:
+                                prev = None
+                        ctx = PumpContext(
+                            pump_id=pump.logical_pump_id,
+                            dart_address=pump.dart_address,
+                            current_state=state,
+                            previous_state=prev,
+                            selected_nozzle=snap.selected_nozzle,
+                            active_transaction_id=snap.active_transaction_id,
+                            communication_healthy=False,  # require live observation
+                            last_raw_wayne_status=snap.raw_wayne_status,
+                            state_version=snap.state_version,
+                            last_source_frame_hex=snap.source_frame_ref,
+                        )
+                        if snap.communication_healthy:
+                            report.warnings.append(
+                                f"{pump.logical_pump_id}: persisted communication "
+                                "was healthy; restart forces unhealthy until live data"
+                            )
+                    report.pump_contexts[pump.logical_pump_id] = ctx
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recovery_pump_contexts_failed")
+            report.warnings.append(
+                f"pump context recovery failed: {type(exc).__name__}: {exc}"
+            )
+
+        # 3) Unresolved sales + pending commands (own transaction).
+        try:
+            async with unit_of_work(self._factory) as uow:
+                unresolved = await uow.transactions.list_unresolved(
+                    station_id=self._station_id
+                )
+                for tx in unresolved:
+                    report.unresolved_transactions.append(tx.transaction_uuid)
+                    report.warnings.append(
+                        f"unresolved transaction preserved: {tx.transaction_uuid}"
+                    )
+
+                pending = await uow.commands.list_pending_or_in_progress(
+                    station_id=self._station_id
+                )
+                now = datetime.now(UTC)
+                for cmd in pending:
+                    try:
+                        await self._reconcile_command(uow, cmd, now, report)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception(
+                            "recovery_command_reconcile_failed",
+                            correlation_id=cmd.correlation_id,
+                        )
+                        report.warnings.append(
+                            f"command reconcile failed {cmd.correlation_id}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+                _ = await get_schema_version(uow.session)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("recovery_commands_failed")
+            report.warnings.append(
+                f"command/tx recovery failed: {type(exc).__name__}: {exc}"
+            )
 
         report.warnings.append("Never automatically authorize after restart.")
         report.warnings.append(
