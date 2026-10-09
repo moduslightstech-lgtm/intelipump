@@ -114,6 +114,10 @@ class ControllerRuntime:
     meter_nozzle_in_max_age_s: float = 30.0
     meter_post_timeout_quarantine_s: float = 8.0
     meter_channel_map: dict | None = None
+    meter_startup_capture_enabled: bool = False
+    meter_startup_capture_timezone: str = "Africa/Lagos"
+    meter_startup_capture_settle_s: float = 20.0
+    meter_startup_capture_window_s: float = 1800.0
 
 
 class ControllerLoop:
@@ -123,6 +127,8 @@ class ControllerLoop:
         self.runtime = runtime
         self._meter_pending: dict | None = None
         self._meter_last_attempt_mono: dict[int, float] = {}
+        self._meter_loop_started_mono: float | None = None
+        self._meter_startup_window_closed: bool = False
         thresholds = HealthThresholds(
             degraded_after_timeouts=runtime.config.degraded_after_timeouts,
             disconnected_after_timeouts=runtime.config.max_consecutive_timeouts,
@@ -437,6 +443,7 @@ class ControllerLoop:
                 if self._rx_task is None or self._rx_task.done():
                     self._start_rx_task()
                 await self._apply_pending_cloud_set_price()
+                await self._maybe_queue_startup_meter_capture()
                 await self._apply_pending_meter_read()
                 for address in self.runtime.config.addresses:
                     if self._stop.is_set():
@@ -2808,7 +2815,7 @@ class ControllerLoop:
             )
 
     def _meter_session_eligibility(
-        self, session: PumpSession
+        self, session: PumpSession, *, startup_opening: bool = False
     ) -> tuple[bool, str, str]:
         from intelipump_fdc.services.meter_reading import evaluate_meter_tx_eligibility
 
@@ -2824,7 +2831,116 @@ class ControllerLoop:
             held_completion=session._held_completion is not None,
             pending_exchange=bool(session.state.pending_exchange),
             block_during_dispensing=True,
+            startup_opening=startup_opening,
         )
+
+    async def _maybe_queue_startup_meter_capture(self) -> None:
+        """Once per local morning after boot: queue OPENING CD101 per address."""
+        from uuid import uuid4
+
+        from intelipump_fdc.controller.meter_read_request import (
+            request_busy,
+            write_meter_read_request,
+            MeterReadRequest,
+        )
+        from intelipump_fdc.controller.meter_startup_capture import (
+            captured_addresses_for_today,
+        )
+
+        if not self.runtime.meter_hardware_cd101:
+            return
+        if not self.runtime.meter_startup_capture_enabled:
+            return
+        if self._meter_startup_window_closed:
+            return
+        if self._meter_pending is not None or request_busy():
+            return
+
+        now = time.monotonic()
+        if self._meter_loop_started_mono is None:
+            self._meter_loop_started_mono = now
+        elapsed = now - float(self._meter_loop_started_mono)
+        if elapsed < float(self.runtime.meter_startup_capture_settle_s):
+            return
+        if elapsed > float(self.runtime.meter_startup_capture_window_s):
+            self._meter_startup_window_closed = True
+            logger.info(
+                "meter_startup_capture_window_closed",
+                elapsed_s=round(elapsed, 1),
+                window_s=self.runtime.meter_startup_capture_window_s,
+            )
+            return
+
+        tz = self.runtime.meter_startup_capture_timezone or "Africa/Lagos"
+        done = captured_addresses_for_today(timezone=tz)
+        safety = self.runtime.safety
+        allowed = set(safety.hardware_meter_allowed_addresses)
+        for addr in self.runtime.config.addresses:
+            if int(addr) in done:
+                continue
+            if allowed and int(addr) not in allowed:
+                continue
+            session = self.sessions.get(int(addr))
+            if session is None:
+                continue
+            ok, code, msg = self._meter_session_eligibility(
+                session, startup_opening=True
+            )
+            if not ok:
+                logger.debug(
+                    "meter_startup_capture_wait",
+                    address=addr,
+                    errorCode=code,
+                    detail=msg,
+                )
+                continue
+            cmap = self.runtime.meter_channel_map or {}
+            meta = cmap.get(int(addr)) if isinstance(cmap, dict) else None
+            nozzle_hint = None
+            pump_id = None
+            if meta is not None:
+                nozzle_hint = getattr(meta, "nozzle_id", None) or (
+                    meta.get("nozzle_id") if isinstance(meta, dict) else None
+                )
+                pump_id = getattr(meta, "pump_id", None) or (
+                    meta.get("pump_id") if isinstance(meta, dict) else None
+                )
+            corr = str(uuid4())
+            try:
+                write_meter_read_request(
+                    MeterReadRequest(
+                        correlation_id=corr,
+                        dart_address=int(addr),
+                        counter_select=int(self.runtime.meter_counter_select),
+                        requested_by="startup-opening",
+                        nozzle_hint=str(nozzle_hint) if nozzle_hint else None,
+                        pump_id=str(pump_id) if pump_id else None,
+                        notes="startup-opening-morning",
+                        slot="OPENING",
+                        startup_opening=True,
+                    )
+                )
+            except FileExistsError:
+                return
+            except OSError as exc:
+                logger.warning(
+                    "meter_startup_capture_write_failed",
+                    address=addr,
+                    error=str(exc),
+                )
+                return
+            logger.info(
+                "meter_startup_capture_queued",
+                address=addr,
+                correlationId=corr,
+                slot="OPENING",
+                nozzleId=nozzle_hint,
+                pumpId=pump_id,
+            )
+            print(
+                f"[METER-READ] startup OPENING queued addr={addr} corr={corr}"
+            )
+            return  # one address per loop turn (exclusive bridge)
 
     def _meter_tx_still_allowed(
         self, session: PumpSession, item: OutboundDataItem
@@ -2842,7 +2958,10 @@ class ControllerLoop:
                 message="pending meter read address mismatch at TX",
             )
             return False
-        ok, code, msg = self._meter_session_eligibility(session)
+        startup = bool(pending.get("startup_opening"))
+        ok, code, msg = self._meter_session_eligibility(
+            session, startup_opening=startup
+        )
         if not ok:
             self._meter_cancel_pending(status="DEFERRED", code=code, message=msg)
             return False
@@ -2943,6 +3062,7 @@ class ControllerLoop:
         now = time.monotonic()
         addr = int(req.dart_address)
         coun = int(req.counter_select or self.runtime.meter_counter_select)
+        startup_opening = bool(req.startup_opening) or str(req.slot or "").upper() == "OPENING"
         result_base = {
             "correlationId": req.correlation_id,
             "dartAddress": addr,
@@ -2951,6 +3071,8 @@ class ControllerLoop:
             "requestedBy": req.requested_by,
             "nozzleHint": req.nozzle_hint,
             "pumpId": req.pump_id,
+            "slot": req.slot or ("OPENING" if startup_opening else "AD_HOC"),
+            "startupOpening": startup_opening,
             "deviceId": safety.hardware_meter_device_id,
             "status": "ERROR",
             "readOnly": True,
@@ -3010,17 +3132,22 @@ class ControllerLoop:
             )
             return
 
-        last = self._meter_last_attempt_mono.get(addr)
-        if last is not None and (now - last) < float(self.runtime.meter_min_interval_s):
-            _fail(
-                "RATE_LIMITED",
-                "METER_READ_RATE_LIMITED",
-                f"min interval {self.runtime.meter_min_interval_s}s not elapsed",
-            )
-            return
+        if not startup_opening:
+            last = self._meter_last_attempt_mono.get(addr)
+            if last is not None and (now - last) < float(
+                self.runtime.meter_min_interval_s
+            ):
+                _fail(
+                    "RATE_LIMITED",
+                    "METER_READ_RATE_LIMITED",
+                    f"min interval {self.runtime.meter_min_interval_s}s not elapsed",
+                )
+                return
 
         session = self.sessions[addr]
-        ok, code, msg = self._meter_session_eligibility(session)
+        ok, code, msg = self._meter_session_eligibility(
+            session, startup_opening=startup_opening
+        )
         if not ok:
             _fail("DEFERRED", code, msg)
             return
@@ -3084,6 +3211,8 @@ class ControllerLoop:
             "nozzle_hint": req.nozzle_hint,
             "outbound_correlation_id": item.correlation_id,
             "result_base": result_base,
+            "startup_opening": startup_opening,
+            "slot": result_base.get("slot"),
         }
         # Inflight file remains until finish/cancel (serialized ownership).
         logger.info(
@@ -3120,6 +3249,25 @@ class ControllerLoop:
         def _done(payload: dict) -> None:
             write_meter_read_result(payload)
             clear_meter_read_request()
+            status = str(payload.get("status") or "").upper()
+            if pending.get("startup_opening") and status.startswith("CAPTURED"):
+                try:
+                    from intelipump_fdc.controller.meter_startup_capture import (
+                        mark_address_captured,
+                    )
+
+                    mark_address_captured(
+                        address=addr,
+                        correlation_id=str(pending["correlation_id"]),
+                        timezone=self.runtime.meter_startup_capture_timezone
+                        or "Africa/Lagos",
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "meter_startup_capture_marker_failed",
+                        address=addr,
+                        error=str(exc),
+                    )
             self._meter_pending = None
             logger.info(
                 "meter_read_finished",

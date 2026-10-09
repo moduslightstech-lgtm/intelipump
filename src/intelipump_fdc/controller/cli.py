@@ -398,6 +398,16 @@ def run(argv: list[str] | None = None) -> None:
                 meter_cfg.post_timeout_quarantine_seconds
             ),
             meter_channel_map=_load_meter_channel_map(settings),
+            meter_startup_capture_enabled=bool(meter_cfg.startup_capture_enabled),
+            meter_startup_capture_timezone=str(
+                meter_cfg.startup_capture_timezone or "Africa/Lagos"
+            ),
+            meter_startup_capture_settle_s=float(
+                meter_cfg.startup_capture_settle_seconds
+            ),
+            meter_startup_capture_window_s=float(
+                meter_cfg.startup_capture_window_seconds
+            ),
         )
         loop_ctrl = ControllerLoop(runtime)
         persistence = None

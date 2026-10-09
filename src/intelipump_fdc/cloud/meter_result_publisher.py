@@ -93,8 +93,21 @@ class MeterResultPublisher:
             "nozzleId": nozzle_id,
             "dartAddress": result.get("dartAddress"),
             "status": status,
-            "source": "READ_NOW",
-            "slot": "AD_HOC",
+            "source": (
+                "STARTUP_OPENING"
+                if result.get("startupOpening")
+                or str(result.get("slot") or "").upper() == "OPENING"
+                else "READ_NOW"
+            ),
+            "slot": (
+                str(result.get("slot") or "").upper()
+                if result.get("slot")
+                else (
+                    "OPENING"
+                    if result.get("startupOpening")
+                    else "AD_HOC"
+                )
+            ),
             "requestedAt": result.get("requestedAt"),
             "capturedAt": result.get("capturedAt") or datetime.now(UTC).isoformat(),
             "cumulativeVolumeRaw": int(raw) if raw is not None else None,
@@ -145,8 +158,9 @@ class MeterResultPublisher:
                 pump_id=str(pump_id),
                 nozzle_id=str(nozzle_id),
                 dart_address=result.get("dartAddress"),
-                source="READ_NOW",
+                source=str(payload.get("source") or "READ_NOW"),
                 status=status,
+                slot=str(payload.get("slot") or "AD_HOC"),
                 deduplication_key=dedupe,
                 correlation_id=corr,
                 cumulative_volume_raw=int(raw) if raw is not None else None,

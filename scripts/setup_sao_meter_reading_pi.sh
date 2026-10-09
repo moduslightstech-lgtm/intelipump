@@ -192,6 +192,11 @@ apply_meter_keys() {
   upsert_env "$file" "INTELIPUMP_METER_READING__MIN_INTERVAL_SECONDS" "$MIN_INTERVAL"
   upsert_env "$file" "INTELIPUMP_METER_READING__NOZZLE_IN_MAX_AGE_SECONDS" "$NOZZLE_MAX_AGE"
   upsert_env "$file" "INTELIPUMP_METER_READING__RESPONSE_TIMEOUT_SECONDS" "8"
+  # Morning auto OPENING when Pi boots (controller). No re-seat ritual.
+  upsert_env "$file" "INTELIPUMP_METER_READING__STARTUP_CAPTURE_ENABLED" "true"
+  upsert_env "$file" "INTELIPUMP_METER_READING__STARTUP_CAPTURE_TIMEZONE" "Africa/Lagos"
+  upsert_env "$file" "INTELIPUMP_METER_READING__STARTUP_CAPTURE_SETTLE_SECONDS" "20"
+  upsert_env "$file" "INTELIPUMP_METER_READING__STARTUP_CAPTURE_WINDOW_SECONDS" "1800"
 }
 
 clear_pending() {

@@ -76,8 +76,14 @@ sudo systemctl restart intelipump.service intelipump-cloud-sync.service
 
 Code pin: include meter file-bridge + result publisher (`6bb2566` or later with dashboard wiring).
 
-**Operator note:** after long idle, re-seat the nozzle (fresh NOZIO IN) then
-Read now within ~30s (`NOZZLE_IN_MAX_AGE`).
+**Morning OPENING (preferred):** with `STARTUP_CAPTURE_ENABLED=true` on the
+controller env, each Pi captures both addresses once per local business day
+after boot (~20s settle, 30 min window), slot=`OPENING`, no re-seat ritual.
+Dashboard **Read now** remains for ad-hoc checks and still uses the 30s
+nozzle-IN freshness gate.
+
+**Operator note (ad-hoc Read now):** after long idle, re-seat the nozzle
+(fresh NOZIO IN) then Read now within ~30s (`NOZZLE_IN_MAX_AGE`).
 
 ## Dashboard
 

@@ -144,10 +144,13 @@ def evaluate_meter_tx_eligibility(
     held_completion: bool = False,
     pending_exchange: bool = False,
     block_during_dispensing: bool = True,
+    startup_opening: bool = False,
 ) -> tuple[bool, str, str]:
     """Return (allowed, error_code, message) for CD101 TX / enqueue.
 
-    Unknown or stale nozzle-IN evidence refuses the read.
+    Normal Read now: unknown/stale nozzle-IN refuses the read.
+    Startup OPENING (morning Pi boot): allow hung/idle without fresh re-seat;
+    still refuse nozzle OUT and active dispensing / sale.
     """
     if block_during_dispensing and dispensing_blocks_read(current_state):
         return (
@@ -164,31 +167,11 @@ def evaluate_meter_tx_eligibility(
             pos = NozzlePosition(str(nozzle_position))
         except ValueError:
             pos = NozzlePosition.UNKNOWN
-    if pos is NozzlePosition.UNKNOWN:
-        return (
-            False,
-            "METER_READ_REFUSED_NOZZLE_UNKNOWN",
-            "nozzle position unknown; wait for verified NOZIO IN",
-        )
     if pos is NozzlePosition.OUT:
         return (
             False,
             "METER_READ_DEFERRED_NOZZLE_OUT",
             "nozzle is OUT; hang up and retry when idle",
-        )
-    if last_nozio_mono is None:
-        return (
-            False,
-            "METER_READ_REFUSED_NOZZLE_UNVERIFIED",
-            "no verified nozzle-IN observation yet this session",
-        )
-    age = float(now_mono) - float(last_nozio_mono)
-    if age > float(nozzle_in_max_age_s):
-        return (
-            False,
-            "METER_READ_REFUSED_NOZZLE_STALE",
-            f"nozzle-IN evidence stale ({age:.1f}s > {nozzle_in_max_age_s}s); "
-            "re-seat nozzle or wait for a fresh DC3/NOZIO",
         )
     life = str(sale_lifecycle or "")
     if life in _BUSY_SALE_LIFECYCLES:
@@ -214,6 +197,51 @@ def evaluate_meter_tx_eligibility(
             False,
             "METER_READ_DEFERRED_PENDING_EXCHANGE",
             "command exchange in flight; retry shortly",
+        )
+
+    if startup_opening:
+        # Morning boot: nozzles should be hung; Wayne may not re-emit NOZIO until
+        # a lift. Allow IN, or UNKNOWN while idle RESET / FILLING_COMPLETE.
+        if pos is NozzlePosition.IN:
+            return (True, "", "")
+        state_val = (
+            current_state.value
+            if isinstance(current_state, PumpState)
+            else str(current_state or "")
+        )
+        if pos is NozzlePosition.UNKNOWN and state_val in {
+            PumpState.RESET.value,
+            PumpState.FILLING_COMPLETE.value,
+            PumpState.READY.value,
+            "UNKNOWN",
+            "",
+        }:
+            return (True, "", "")
+        return (
+            False,
+            "METER_READ_REFUSED_NOZZLE_UNKNOWN",
+            "startup opening: wait for idle hung nozzle (IN or unknown+RESET)",
+        )
+
+    if pos is NozzlePosition.UNKNOWN:
+        return (
+            False,
+            "METER_READ_REFUSED_NOZZLE_UNKNOWN",
+            "nozzle position unknown; wait for verified NOZIO IN",
+        )
+    if last_nozio_mono is None:
+        return (
+            False,
+            "METER_READ_REFUSED_NOZZLE_UNVERIFIED",
+            "no verified nozzle-IN observation yet this session",
+        )
+    age = float(now_mono) - float(last_nozio_mono)
+    if age > float(nozzle_in_max_age_s):
+        return (
+            False,
+            "METER_READ_REFUSED_NOZZLE_STALE",
+            f"nozzle-IN evidence stale ({age:.1f}s > {nozzle_in_max_age_s}s); "
+            "re-seat nozzle or wait for a fresh DC3/NOZIO",
         )
     return (True, "", "")
 

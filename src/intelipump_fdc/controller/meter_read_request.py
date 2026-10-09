@@ -62,6 +62,8 @@ class MeterReadRequest:
     nozzle_hint: str | None = None
     pump_id: str | None = None
     notes: str | None = None
+    slot: str | None = None  # OPENING | CLOSING | AD_HOC
+    startup_opening: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +75,8 @@ class MeterReadRequest:
             "nozzleHint": self.nozzle_hint,
             "pumpId": self.pump_id,
             "notes": self.notes,
+            "slot": self.slot,
+            "startupOpening": bool(self.startup_opening),
             "readOnly": True,
             "schemaVersion": "1.1",
         }
@@ -99,6 +103,10 @@ def _parse_request_dict(raw: dict[str, Any]) -> MeterReadRequest | None:
         return None
     nozzle = raw.get("nozzleHint") or raw.get("nozzle_hint")
     pump = raw.get("pumpId") or raw.get("pump_id")
+    slot = raw.get("slot")
+    startup = raw.get("startupOpening")
+    if startup is None:
+        startup = raw.get("startup_opening")
     return MeterReadRequest(
         correlation_id=corr,
         dart_address=addr,
@@ -108,6 +116,8 @@ def _parse_request_dict(raw: dict[str, Any]) -> MeterReadRequest | None:
         nozzle_hint=(str(nozzle) if nozzle else None),
         pump_id=(str(pump) if pump else None),
         notes=(str(raw["notes"]) if raw.get("notes") else None),
+        slot=(str(slot) if slot else None),
+        startup_opening=bool(startup),
     )
 
 

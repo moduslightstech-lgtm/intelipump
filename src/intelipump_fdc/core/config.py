@@ -190,6 +190,13 @@ class MeterReadingSettings(BaseModel):
     # After CD101 timeout, block new TX on that address this long so late DC101
     # cannot bind to the next request (protocol has no request UUID).
     post_timeout_quarantine_seconds: float = Field(default=8.0, ge=1.0, le=120.0)
+    # Once per local business day after controller boot: auto CD101 → OPENING.
+    # Uses relaxed nozzle freshness (no re-seat ritual). Still refuses nozzle OUT
+    # and active dispensing / sale lifecycle.
+    startup_capture_enabled: bool = False
+    startup_capture_timezone: str = "Africa/Lagos"
+    startup_capture_settle_seconds: float = Field(default=20.0, ge=5.0, le=600.0)
+    startup_capture_window_seconds: float = Field(default=1800.0, ge=60.0, le=7200.0)
 
     def allowed_address_set(self) -> frozenset[int]:
         out: set[int] = set()
