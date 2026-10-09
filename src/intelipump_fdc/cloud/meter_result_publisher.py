@@ -80,17 +80,25 @@ class MeterResultPublisher:
             )
 
         # Prefer channel map (DART→nozzle) over request hint — a wrong/default
-        # nozzleHint was tagging addr-1 captures as nozzle-2 on the dashboard.
+        # nozzleHint was tagging captures on the wrong nozzle on the dashboard.
         channel = (
             result.get("channelMap")
             if isinstance(result.get("channelMap"), dict)
             else {}
         )
-        nozzle_id = (
-            str(channel.get("nozzle_id") or channel.get("nozzleId") or "").strip()
-            or str(result.get("nozzleHint") or "").strip()
-            or "nozzle-1"
-        )
+        mapped_nozzle = str(
+            channel.get("nozzle_id") or channel.get("nozzleId") or ""
+        ).strip()
+        hint_nozzle = str(result.get("nozzleHint") or "").strip()
+        nozzle_id = mapped_nozzle or hint_nozzle or "nozzle-1"
+        if mapped_nozzle and hint_nozzle and mapped_nozzle != hint_nozzle:
+            logger.warning(
+                "meter_result_nozzle_hint_mismatch",
+                correlationId=corr,
+                dartAddress=result.get("dartAddress"),
+                channelMapNozzle=mapped_nozzle,
+                nozzleHint=hint_nozzle,
+            )
         pump_id = (
             str(channel.get("pump_id") or channel.get("pumpId") or "").strip()
             or result.get("pumpId")
