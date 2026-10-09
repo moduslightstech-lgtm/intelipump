@@ -35,7 +35,16 @@ address + COUN + post-TX window. CAPTURED ≠ verified nozzle mapping/scale.
 
 ## Permanent Pi config (controller + cloud-sync)
 
-**One-shot on the Pi** (preferred):
+**One-shot from Mac** (preferred — sync + uv + env + restart):
+
+```bash
+cd /path/to/intelipump-fdc
+./scripts/deploy_sao_meter_reading_to_pi.sh --pump N intelipump@<pi-host>
+# Swapped faces (like pump-6):
+# ./scripts/deploy_sao_meter_reading_to_pi.sh --pump N intelipump@<pi-host> --swap-nozzles
+```
+
+**One-shot on the Pi** (code already on disk):
 
 ```bash
 cd ~/intelipump-fdc/intelipump   # or your checkout that systemd ExecStart uses
