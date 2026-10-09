@@ -886,12 +886,15 @@ class PumpSession:
             if self.state.pending_exchange:
                 self.state.pending_command_events.append(tx.transaction_type.value)
             if tx.transaction_type.value == "DC101_TOTAL_COUNTERS":
-                # Store evidence only — never fold into filled_volume_raw / sales.
+                # Cumulative totalizer only. Never touch sale face, evidence,
+                # or the state machine — CD101/DC101 must not interfere with
+                # nozzle-lift / authorize / dispense paths.
                 self.state.last_dc101 = (
                     dict(decoded) if isinstance(decoded, dict) else {"raw": decoded}
                 )
                 self.state.last_dc101_at_mono = obs_mono
                 self.state.last_dc101_frame_hex = tx.source_frame_raw_hex
+                continue
             if isinstance(raw_volume, int):
                 self._note_dc2_volume(raw_volume, at=datetime.now(UTC))
                 self.state.filled_volume_raw = max(self.state.filled_volume_raw, raw_volume)

@@ -555,10 +555,14 @@ class PersistenceBridge:
             )
         elif event.type is ControllerEventType.APPLICATION_TRANSACTION_DECODED:
             detail = event.detail or ""
-            is_dc2 = "DC2" in detail.upper() or detail == "DC2_FILLED_VOLUME_AMOUNT"
+            detail_u = detail.upper()
+            # Meter totalizers must never enter the sale persistence worker.
+            if "DC101" in detail_u:
+                return
+            is_dc2 = "DC2" in detail_u or detail_u == "DC2_FILLED_VOLUME_AMOUNT"
             priority = (
                 PersistPriority.CRITICAL
-                if "COMPLETE" in detail.upper()
+                if "COMPLETE" in detail_u
                 else PersistPriority.NORMAL
             )
             self._worker.submit(

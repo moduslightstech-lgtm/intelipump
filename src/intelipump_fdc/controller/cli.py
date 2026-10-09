@@ -393,6 +393,7 @@ def run(argv: list[str] | None = None) -> None:
             meter_volume_decimals=meter_cfg.volume_decimals,
             meter_response_timeout_s=float(meter_cfg.response_timeout_seconds),
             meter_min_interval_s=float(meter_cfg.min_interval_seconds),
+            meter_nozzle_in_max_age_s=float(meter_cfg.nozzle_in_max_age_seconds),
             meter_channel_map=_load_meter_channel_map(settings),
         )
         loop_ctrl = ControllerLoop(runtime)

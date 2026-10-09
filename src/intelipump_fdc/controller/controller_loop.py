@@ -111,6 +111,7 @@ class ControllerRuntime:
     meter_volume_decimals: int | None = None
     meter_response_timeout_s: float = 8.0
     meter_min_interval_s: float = 60.0
+    meter_nozzle_in_max_age_s: float = 300.0
     meter_channel_map: dict | None = None
 
 
@@ -792,10 +793,23 @@ class ControllerLoop:
                 detail="skip_reset_already_reset",
             )
 
+        # Meter CD101: re-check eligibility immediately before TX. If the nozzle
+        # lifted (or sale woke up) while queued, cancel without transmitting.
+        if item.command_type is PumpCommand.READ_METER:
+            if not self._meter_tx_still_allowed(session, item):
+                return ExchangeResult(
+                    status=ExchangeResultStatus.REJECTED,
+                    address=session.address,
+                    correlation_id=item.correlation_id,
+                    detail="meter_read_cancelled_before_tx",
+                )
+
         seq = item.sequence if item.sequence is not None else session.state.tx_sequence
         attempts = item.attempts
         exchange_start: float | None = None
         while True:
+            if item.command_type is PumpCommand.READ_METER:
+                self._meter_mark_tx_started(item, write_mono=time.monotonic())
             result = await self._send_outbound_once(
                 session, item, seq=seq, ack_not_before=exchange_start
             )
@@ -2489,6 +2503,113 @@ class ControllerLoop:
                 f"→ {exec_status} (no CD5 resend)"
             )
 
+    def _meter_session_eligibility(
+        self, session: PumpSession
+    ) -> tuple[bool, str, str]:
+        from intelipump_fdc.services.meter_reading import evaluate_meter_tx_eligibility
+
+        ctx = session.machine.context
+        return evaluate_meter_tx_eligibility(
+            current_state=ctx.current_state,
+            nozzle_position=session.state.nozzle_position,
+            last_nozio_mono=session.state.last_nozio_time,
+            now_mono=time.monotonic(),
+            nozzle_in_max_age_s=float(self.runtime.meter_nozzle_in_max_age_s),
+            sale_lifecycle=str(session.state.sale_lifecycle.value),
+            active_transaction_id=ctx.active_transaction_id,
+            held_completion=session._held_completion is not None,
+            pending_exchange=bool(session.state.pending_exchange),
+            block_during_dispensing=True,
+        )
+
+    def _meter_tx_still_allowed(
+        self, session: PumpSession, item: OutboundDataItem
+    ) -> bool:
+        """Re-check gates immediately before CD101 TX; cancel pending if not."""
+        pending = self._meter_pending
+        if pending is None:
+            return False
+        if pending.get("outbound_correlation_id") != item.correlation_id:
+            return False
+        if int(pending.get("address", -1)) != int(session.address):
+            self._meter_cancel_pending(
+                status="ERROR",
+                code="METER_ADDRESS_MISMATCH",
+                message="pending meter read address mismatch at TX",
+            )
+            return False
+        ok, code, msg = self._meter_session_eligibility(session)
+        if not ok:
+            self._meter_cancel_pending(status="DEFERRED", code=code, message=msg)
+            return False
+        return True
+
+    def _meter_mark_tx_started(
+        self, item: OutboundDataItem, *, write_mono: float
+    ) -> None:
+        pending = self._meter_pending
+        if pending is None:
+            return
+        if pending.get("outbound_correlation_id") != item.correlation_id:
+            return
+        pending["tx_started_at_mono"] = float(write_mono)
+
+    def _meter_cancel_pending(
+        self, *, status: str, code: str, message: str
+    ) -> None:
+        from intelipump_fdc.controller.meter_read_request import (
+            clear_meter_read_request,
+            write_meter_read_result,
+        )
+
+        pending = self._meter_pending
+        if pending is None:
+            clear_meter_read_request()
+            return
+        addr = int(pending["address"])
+        outbound_corr = pending.get("outbound_correlation_id")
+        # Drop only this meter item — never wipe SET_PRICE / other outbound.
+        self.runtime.outbound.drop_where(
+            lambda it: (
+                it.command_type is PumpCommand.READ_METER
+                and int(it.address) == addr
+                and (
+                    outbound_corr is None
+                    or it.correlation_id == outbound_corr
+                )
+            )
+        )
+        result_base = dict(pending.get("result_base") or {})
+        write_meter_read_result(
+            {
+                **result_base,
+                "status": status,
+                "errorCode": code,
+                "errorMessage": message,
+                "volumeLiters": None,
+                "cumulativeVolumeRaw": None,
+                "capturedAt": None,
+                "protocolCorrelationNote": (
+                    "Wayne DC101 does not echo a request UUID; correlation is "
+                    "DART address + COUN + post-TX observation window."
+                ),
+            }
+        )
+        clear_meter_read_request()
+        logger.warning(
+            "meter_read_cancelled",
+            correlationId=pending.get("correlation_id"),
+            address=addr,
+            status=status,
+            errorCode=code,
+            detail=message,
+        )
+        print(
+            f"[METER-READ] cancelled addr={addr} status={status} "
+            f"code={code} corr={pending.get('correlation_id')}"
+        )
+        self._meter_pending = None
+
     async def _apply_pending_meter_read(self) -> None:
         """One-shot gated CD101 via existing outbound (attended canary).
 
@@ -2496,12 +2617,11 @@ class ControllerLoop:
         Disabled unless ``runtime.meter_hardware_cd101`` and safety allowlist.
         """
         from intelipump_fdc.controller.meter_read_request import (
+            claim_meter_read_request,
             clear_meter_read_request,
-            read_meter_read_request,
             write_meter_read_result,
         )
         from intelipump_fdc.protocol.cd101 import build_cd101_request
-        from intelipump_fdc.services.meter_reading import dispensing_blocks_read
 
         if not self.runtime.meter_hardware_cd101:
             return
@@ -2511,27 +2631,34 @@ class ControllerLoop:
             await self._finish_pending_meter_read()
             return
 
-        req = read_meter_read_request()
+        req = claim_meter_read_request()
         if req is None:
             return
 
         safety = self.runtime.safety
         now = time.monotonic()
         addr = int(req.dart_address)
+        coun = int(req.counter_select or self.runtime.meter_counter_select)
         result_base = {
             "correlationId": req.correlation_id,
             "dartAddress": addr,
-            "counterSelect": int(req.counter_select),
+            "counterSelect": coun,
             "requestedAt": req.requested_at,
             "requestedBy": req.requested_by,
             "nozzleHint": req.nozzle_hint,
             "deviceId": safety.hardware_meter_device_id,
             "status": "ERROR",
             "readOnly": True,
+            "softwareVersion": "intelipump-fdc-meter-reading-2",
             "specRef": {
                 "cd101": "Pump Interface Rev 2.11, page 19, CD101",
                 "dc101": "Pump Interface Rev 2.11, page 25, DC101",
             },
+            "protocolCorrelationNote": (
+                "Wayne DC101 does not echo a request UUID; correlation is "
+                "DART address + requested COUN + observation after our CD101 TX. "
+                "Unsolicited/late/wrong-COUN replies are ignored for completion."
+            ),
         }
 
         def _fail(status: str, code: str, message: str) -> None:
@@ -2588,15 +2715,11 @@ class ControllerLoop:
             return
 
         session = self.sessions[addr]
-        if dispensing_blocks_read(session.machine.context.current_state):
-            _fail(
-                "DEFERRED",
-                "METER_READ_DEFERRED_DISPENSING",
-                "pump busy dispensing; retry when idle",
-            )
+        ok, code, msg = self._meter_session_eligibility(session)
+        if not ok:
+            _fail("DEFERRED", code, msg)
             return
 
-        coun = int(req.counter_select or self.runtime.meter_counter_select)
         try:
             cd101 = build_cd101_request(counter_select=coun)
         except Exception as exc:  # noqa: BLE001
@@ -2610,7 +2733,7 @@ class ControllerLoop:
             simulator_only=False,
             idempotency=IdempotencyClass.IDEMPOTENT,
             ttl_ms=int(max(5.0, self.runtime.meter_response_timeout_s) * 1000),
-            max_retries=0,
+            max_retries=0,  # never retry — must not delay critical polling
         )
         decision = evaluate_outbound_safety(item, safety)
         if not decision.allowed:
@@ -2622,7 +2745,7 @@ class ControllerLoop:
             return
 
         self._meter_last_attempt_mono[addr] = now
-        # Clear prior DC101 so we only accept a fresh reply after this TX.
+        # Clear prior DC101 so a stale/unsolicited reply cannot satisfy this request.
         session.state.last_dc101 = None
         session.state.last_dc101_at_mono = None
         session.state.last_dc101_frame_hex = None
@@ -2638,6 +2761,7 @@ class ControllerLoop:
             "counter_select": coun,
             "request_payload_hex": cd101.payload_hex,
             "queued_at_mono": now,
+            "tx_started_at_mono": None,
             "deadline_mono": now + float(self.runtime.meter_response_timeout_s),
             "requested_at": req.requested_at,
             "requested_by": req.requested_by,
@@ -2645,7 +2769,7 @@ class ControllerLoop:
             "outbound_correlation_id": item.correlation_id,
             "result_base": result_base,
         }
-        clear_meter_read_request()
+        # Inflight file remains until finish/cancel (serialized ownership).
         logger.info(
             "meter_read_cd101_queued",
             correlationId=req.correlation_id,
@@ -2659,7 +2783,15 @@ class ControllerLoop:
         )
 
     async def _finish_pending_meter_read(self) -> None:
-        from intelipump_fdc.controller.meter_read_request import write_meter_read_result
+        from intelipump_fdc.controller.meter_read_request import (
+            clear_meter_read_request,
+            write_meter_read_result,
+        )
+        from intelipump_fdc.services.meter_reading import (
+            build_capture_flags,
+            dc101_matches_pending,
+            liters_from_raw_scaled,
+        )
 
         pending = self._meter_pending
         if pending is None:
@@ -2671,6 +2803,7 @@ class ControllerLoop:
 
         def _done(payload: dict) -> None:
             write_meter_read_result(payload)
+            clear_meter_read_request()
             self._meter_pending = None
             logger.info(
                 "meter_read_finished",
@@ -2696,25 +2829,39 @@ class ControllerLoop:
             )
             return
 
+        # If still queued (not TX'd) and eligibility fails (nozzle lift), cancel.
+        if pending.get("tx_started_at_mono") is None:
+            ok, code, msg = self._meter_session_eligibility(session)
+            if not ok:
+                self._meter_cancel_pending(status="DEFERRED", code=code, message=msg)
+                return
+
         dc101 = session.state.last_dc101
         dc101_at = session.state.last_dc101_at_mono
-        if (
-            isinstance(dc101, dict)
-            and dc101_at is not None
-            and dc101_at >= float(pending["queued_at_mono"])
-        ):
-            raw_scaled = dc101.get("raw_scaled") if isinstance(dc101.get("raw_scaled"), dict) else {}
+        matched, reason = dc101_matches_pending(
+            decoded=dc101 if isinstance(dc101, dict) else None,
+            observed_at_mono=dc101_at,
+            expected_address=addr,
+            observed_address=addr,
+            expected_coun=int(pending["counter_select"]),
+            queued_at_mono=float(pending["queued_at_mono"]),
+            tx_started_at_mono=pending.get("tx_started_at_mono"),
+        )
+        if matched and isinstance(dc101, dict):
+            raw_scaled = (
+                dc101.get("raw_scaled")
+                if isinstance(dc101.get("raw_scaled"), dict)
+                else {}
+            )
             decimals = self.runtime.meter_volume_decimals
-            # Prefer total_value raw; also expose meter1/meter2 for attended mapping.
+            coun = int(pending["counter_select"])
+            # Retain all raw counter fields; litres only when COUN+scale verified.
             total_raw = raw_scaled.get("total_value")
-            liters = None
-            if (
-                decimals is not None
-                and isinstance(total_raw, int)
-                and 0x01 <= int(pending["counter_select"]) <= 0x09
-            ):
-                scale = 10 ** int(decimals)
-                liters = total_raw / scale
+            liters = liters_from_raw_scaled(
+                total_raw if isinstance(total_raw, int) else None,
+                decimals,
+                counter_select=coun,
+            )
             channel = None
             cmap = self.runtime.meter_channel_map or {}
             if str(addr) in cmap:
@@ -2730,19 +2877,48 @@ class ControllerLoop:
                     "responseFrameHex": session.state.last_dc101_frame_hex,
                     "decoded": dc101,
                     "rawScaled": raw_scaled,
-                    "cumulativeVolumeRaw": total_raw if isinstance(total_raw, int) else None,
+                    "rawCounters": {
+                        "totalValue": raw_scaled.get("total_value"),
+                        "totalMeter1OrNofill": raw_scaled.get("total_meter1_or_nofill"),
+                        "totalMeter2": raw_scaled.get("total_meter2"),
+                        "counterSelect": dc101.get("counter_select"),
+                    },
+                    "cumulativeVolumeRaw": (
+                        total_raw if isinstance(total_raw, int) else None
+                    ),
                     "volumeDecimals": decimals,
                     "volumeLiters": liters,
                     "channelMap": channel,
+                    "flags": build_capture_flags(
+                        counter_select=coun,
+                        volume_decimals=decimals,
+                        liters=liters,
+                    ),
                     "mappingNote": (
-                        "Nozzle/meter1/meter2 mapping is unverified until attended "
-                        "face comparison; do not assume which field is the display."
+                        "CAPTURED = correlated DC101 reply. "
+                        "Nozzle/meter1/meter2 mapping and face scale are "
+                        "unverified until attended comparison."
                     ),
                     "errorCode": None,
                     "errorMessage": None,
                 }
             )
             return
+
+        if (
+            isinstance(dc101, dict)
+            and dc101_at is not None
+            and reason in {"wrong_coun", "before_request_window", "wrong_address"}
+        ):
+            # Keep waiting until timeout; do not bind a wrong reply to this request.
+            logger.info(
+                "meter_read_dc101_ignored",
+                correlationId=pending["correlation_id"],
+                address=addr,
+                reason=reason,
+                observedCoun=dc101.get("counter_select"),
+                expectedCoun=pending["counter_select"],
+            )
 
         if now >= float(pending["deadline_mono"]):
             _done(
@@ -2751,8 +2927,9 @@ class ControllerLoop:
                     "status": "UNSUPPORTED",
                     "errorCode": "METER_DC101_TIMEOUT",
                     "errorMessage": (
-                        "CD101 queued but no DC101 observed before timeout; "
-                        "reporting unsupported (no invented zero)"
+                        "CD101 queued but no matching DC101 (address+COUN+window) "
+                        "before timeout; reporting unsupported (no invented zero)"
+                        + (f"; last_ignore={reason}" if reason else "")
                     ),
                     "requestPayloadHex": pending["request_payload_hex"],
                     "responseFrameHex": None,

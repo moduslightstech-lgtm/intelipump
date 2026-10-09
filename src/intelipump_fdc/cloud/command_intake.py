@@ -560,6 +560,10 @@ class CloudCommandIntake:
                                 nozzleId=nozzle_id,
                                 address=dart_address,
                             )
+                        except FileExistsError as exc:
+                            execution_status = "RATE_LIMITED"
+                            meter_error_code = "METER_REQUEST_BRIDGE_BUSY"
+                            meter_message = str(exc)
                         except OSError as exc:
                             execution_status = "ENQUEUE_FAILED"
                             meter_error_code = "METER_REQUEST_WRITE_FAILED"

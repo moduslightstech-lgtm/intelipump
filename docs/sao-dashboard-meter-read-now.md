@@ -21,6 +21,18 @@ Dashboard "Read now"
 
 No second serial connection. No RESET / SET_PRICE / AUTHORIZE.
 
+**Sale isolation:** DC101 replies are stored on the session only; they do not
+update `filled_volume_raw`, sale evidence, or the pump state machine. Persistence
+bridge drops `APPLICATION_TRANSACTION_DECODED` for DC101 (no financial worker).
+Meter reads are refused while the nozzle is OUT/UNKNOWN/stale, or the pump is
+dispensing / finalizing a sale. Eligibility is re-checked immediately before TX.
+
+**Correlation limitation:** DC101 does not echo a request UUID — match by DART
+address + COUN + post-TX window. CAPTURED ≠ verified nozzle mapping/scale.
+
+**Local Pi test (no cloud):** see `docs/pi-meter-read-test.md`
+(test `--address 1` first, then `--address 2`).
+
 ## Permanent Pi config (controller + cloud-sync)
 
 Add to **both** `/etc/intelipump/intelipump.env` and `/etc/intelipump/intelipump-cloud-sync.env`:

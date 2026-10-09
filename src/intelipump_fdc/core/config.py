@@ -182,6 +182,8 @@ class MeterReadingSettings(BaseModel):
     max_pending: int = Field(default=2, ge=1, le=10)
     # Do not enqueue CD101 while session looks like active dispensing.
     block_during_dispensing: bool = True
+    # Max age of last verified nozzle-IN (NOZIO/DC3) before refuse as stale.
+    nozzle_in_max_age_seconds: float = Field(default=300.0, ge=5.0, le=3600.0)
 
     def allowed_address_set(self) -> frozenset[int]:
         out: set[int] = set()
