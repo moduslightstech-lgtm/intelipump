@@ -86,6 +86,66 @@ class PersistenceBridge:
         self._tx_by_address: dict[int, str] = {}
         self._verified = VerifiedDispensingBook(station_id=station_id)
 
+    def _publish_sale_identity_bound(
+        self, address: int, tx_uuid: str, *, previous: str | None = None
+    ) -> None:
+        """Notify live PumpSession so SM active_transaction_id matches SQLite."""
+        self._events.publish(
+            ControllerEvent(
+                type=ControllerEventType.SALE_IDENTITY_BOUND,
+                address=address,
+                timestamp=datetime.now(UTC),
+                detail=tx_uuid,
+                payload={
+                    "transaction_uuid": tx_uuid,
+                    "previous_uuid": previous,
+                },
+            )
+        )
+
+    def _publish_sale_identity_cleared(
+        self, address: int, *, transaction_uuid: str | None = None
+    ) -> None:
+        self._events.publish(
+            ControllerEvent(
+                type=ControllerEventType.SALE_IDENTITY_CLEARED,
+                address=address,
+                timestamp=datetime.now(UTC),
+                detail=transaction_uuid or "",
+                payload={"transaction_uuid": transaction_uuid},
+            )
+        )
+
+    def _adopt_sale_identity(self, address: int, tx_uuid: str) -> None:
+        previous = self._tx_by_address.get(address)
+        self._tx_by_address[address] = tx_uuid
+        if previous != tx_uuid:
+            self._publish_sale_identity_bound(
+                address, tx_uuid, previous=previous
+            )
+
+    def _verified_open_uuid(self, address: int) -> str | None:
+        """Recover durable session UUID from verified book when SM id is null."""
+        can_pump, can_nozzle, _ = self._channel_identity(address)
+        try:
+            state = self._verified.get_or_create(
+                pump_id=can_pump,
+                nozzle_id=can_nozzle,
+                dart_address=address,
+            )
+        except Exception:
+            return None
+        tx = state.transaction_id
+        if not tx:
+            return None
+        if state.phase in {
+            VerifiedPhase.VERIFIED_DISPENSING,
+            VerifiedPhase.COMPLETED,
+            VerifiedPhase.FILLING_NO_FLOW,
+        }:
+            return str(tx)
+        return None
+
     def _channel_identity(self, address: int) -> tuple[str, str, str]:
         """Immutable cloud identity for a DART address (pump, nozzle, source)."""
         pump = self._mqtt_pump_by_address.get(
@@ -348,6 +408,9 @@ class PersistenceBridge:
         )
         if self._tx_by_address.get(address) == prior_uuid:
             self._tx_by_address.pop(address, None)
+            self._publish_sale_identity_cleared(
+                address, transaction_uuid=prior_uuid
+            )
         can_pump, can_nozzle, _ = self._channel_identity(address)
         try:
             state = self._verified.get_or_create(
@@ -421,15 +484,19 @@ class PersistenceBridge:
         """
         mapped = await self._open_uuid(uow, self._tx_by_address.get(address))
         if mapped:
-            self._tx_by_address[address] = mapped
+            self._adopt_sale_identity(address, mapped)
             return mapped
-        if candidate:
-            row = await uow.transactions.get_by_uuid(candidate)
+        # SM often null — recover from verified durable session before minting.
+        verified_uuid = self._verified_open_uuid(address)
+        for cand in (candidate, verified_uuid):
+            if not cand:
+                continue
+            row = await uow.transactions.get_by_uuid(cand)
             if row is None:
                 await self._begin_sale(
                     uow,
                     pump_db=pump_db,
-                    tx_uuid=candidate,
+                    tx_uuid=cand,
                     nozzle_id=nozzle_id,
                     address=address,
                     raw_price=raw_price,
@@ -437,18 +504,19 @@ class PersistenceBridge:
                     volume_decimals=volume_decimals,
                     amount_decimals=amount_decimals,
                 )
-                self._tx_by_address[address] = candidate
-                return candidate
+                self._adopt_sale_identity(address, cand)
+                return cand
             if row.status in _OPEN_TX_STATUSES:
-                self._tx_by_address[address] = candidate
-                return candidate
-            logger.info(
-                "new_fill_after_completed_sale",
-                previous_uuid=candidate,
-                previous_status=row.status,
-                address=address,
-                reason=reason,
-            )
+                self._adopt_sale_identity(address, cand)
+                return cand
+            if cand == candidate:
+                logger.info(
+                    "new_fill_after_completed_sale",
+                    previous_uuid=candidate,
+                    previous_status=row.status,
+                    address=address,
+                    reason=reason,
+                )
         tx_uuid = str(uuid4())
         await self._begin_sale(
             uow,
@@ -461,7 +529,7 @@ class PersistenceBridge:
             volume_decimals=volume_decimals,
             amount_decimals=amount_decimals,
         )
-        self._tx_by_address[address] = tx_uuid
+        self._adopt_sale_identity(address, tx_uuid)
         return tx_uuid
 
     def on_event(self, event: ControllerEvent) -> None:
@@ -723,8 +791,18 @@ class PersistenceBridge:
                                 nozzle_id=nozzle_id,
                                 reason="verified_dispensing_started",
                             )
-                            self._tx_by_address[address] = opened
                             verified.transaction_id = opened
+                            self._adopt_sale_identity(address, opened)
+                            await self._mark_controller_filling(
+                                uow,
+                                address=address,
+                                pump_db=pump_db,
+                                nozzle_id=nozzle_id,
+                                transaction_id=opened,
+                                previous_state=str(prev_state.value)
+                                if prev_state
+                                else None,
+                            )
                             logger.info(
                                 "live_sale_session_opened",
                                 stationId=self._station_id,
@@ -736,6 +814,21 @@ class PersistenceBridge:
                                 reason="verified_dispensing_started",
                                 previousState=str(prev_state.value) if prev_state else None,
                                 newState=new_state.value,
+                            )
+                        else:
+                            # Keep hose→UUID + SQLite FILLING + live SM aligned
+                            # with the already-open ACTIVE (SM often lacks UUID).
+                            verified.transaction_id = open_before
+                            self._adopt_sale_identity(address, open_before)
+                            await self._mark_controller_filling(
+                                uow,
+                                address=address,
+                                pump_db=pump_db,
+                                nozzle_id=nozzle_id,
+                                transaction_id=open_before,
+                                previous_state=str(prev_state.value)
+                                if prev_state
+                                else None,
                             )
                 else:
                     logger.info(
@@ -863,19 +956,21 @@ class PersistenceBridge:
                 )
                 amt_raw = filled_amt if isinstance(filled_amt, int) else 0
                 sale_lifecycle = detail_payload.get("sale_lifecycle")
-                suppress = (
-                    may_publish is False
-                    or sale_lifecycle in {
+                intentional_no_sale = (
+                    sale_lifecycle
+                    in {
                         "ABORTED_NO_DELIVERY",
                         "CANCELLED_NO_SALE",
                     }
                     or event_name == "SALE_SUPPRESSED"
-                    or (
-                        may_publish is True
-                        and vol_raw <= 0
-                        and amt_raw <= 0
-                    )
                 )
+                positive_face = vol_raw > 0 or amt_raw > 0
+                # Never suppress solely on may_publish_sale=false when the pump
+                # face shows delivery — that left ACTIVE zombies (live session
+                # opened, hang-up/LIMIT had null SM tx id + may_publish false).
+                # Also never invent a sale from retained face alone (no session
+                # evidence) — that path is audited below, not silently dropped.
+                suppress = intentional_no_sale or not positive_face
                 can_pump, can_nozzle, _ = self._channel_identity(address)
                 returned = self._verified.note_nozzle_returned(
                     pump_id=can_pump,
@@ -888,18 +983,71 @@ class PersistenceBridge:
                     and returned.transaction_id is None
                     and not returned.possible_unintended_flow
                 )
-                # Wayne face totals win: a positive FILLING_COMPLETED must sync
-                # even if the in-memory verified book missed volume↑ (stale
-                # baseline). Otherwise offline sales never reach the cloud.
-                authoritative_delivery = (
-                    may_publish is not False
-                    and (vol_raw > 0 or amt_raw > 0)
-                    and sale_lifecycle
-                    not in {
-                        "ABORTED_NO_DELIVERY",
-                        "CANCELLED_NO_SALE",
-                    }
+                # Positive face alone is not enough — require current-session
+                # dispensing evidence (open ACTIVE, filling this boot, or
+                # verified volume↑). Retained display after restart must not
+                # invent a financial sale (startup_baseline path handles that).
+                mapped_open_preview = self._tx_by_address.get(address)
+                session_dispensing_evidence = bool(
+                    mapped_open_preview
+                    or detail_payload.get("filling_seen_this_boot")
+                    or detail_payload.get("filling_observed")
+                    or (
+                        returned.transaction_id
+                        and returned.phase is VerifiedPhase.COMPLETED
+                        and (
+                            returned.volume_increased
+                            or returned.first_volume_increase_at is not None
+                        )
+                    )
+                    or (
+                        returned.phase is VerifiedPhase.VERIFIED_DISPENSING
+                        and returned.volume_increased
+                    )
                 )
+                # Wayne face totals win when session evidence exists: hang-up /
+                # LIMIT must finalize even if may_publish was false or SM
+                # rejected. Otherwise offline sales never reach the cloud.
+                authoritative_delivery = (
+                    positive_face
+                    and not intentional_no_sale
+                    and session_dispensing_evidence
+                )
+                if (
+                    positive_face
+                    and not intentional_no_sale
+                    and not session_dispensing_evidence
+                ):
+                    suppress = True
+                    self._worker.note_capture_uncertainty(
+                        reason="completion_without_session_evidence"
+                    )
+                    logger.info(
+                        "completion_without_session_evidence_held",
+                        stationId=self._station_id,
+                        pumpId=can_pump,
+                        nozzleId=can_nozzle,
+                        volumeMinorUnits=vol_raw,
+                        amountMinorUnits=amt_raw,
+                        mappedEvent=event_name,
+                        detail=(
+                            "Positive face without open session / filling "
+                            "evidence — not inventing a sale"
+                        ),
+                    )
+                if authoritative_delivery and may_publish is False:
+                    logger.warning(
+                        "authoritative_face_overrides_may_publish_false",
+                        stationId=self._station_id,
+                        pumpId=can_pump,
+                        nozzleId=can_nozzle,
+                        volumeMinorUnits=vol_raw,
+                        amountMinorUnits=amt_raw,
+                        saleLifecycle=sale_lifecycle,
+                        mappedEvent=event_name,
+                        activeTransactionId=active_tx_s,
+                        mappedTransactionId=self._tx_by_address.get(address),
+                    )
                 if verified_cancelled and not authoritative_delivery:
                     suppress = True
                 elif verified_cancelled and authoritative_delivery:
@@ -917,12 +1065,20 @@ class PersistenceBridge:
                         ),
                     )
                 if suppress:
+                    if returned.phase is VerifiedPhase.CANCELLED_NO_SALE:
+                        suppress_action = "CANCELLED_NO_SALE"
+                    elif (
+                        positive_face
+                        and not intentional_no_sale
+                        and not session_dispensing_evidence
+                    ):
+                        suppress_action = "CAPTURE_UNCERTAINTY_NO_SESSION_EVIDENCE"
+                    else:
+                        suppress_action = "SALE_SUPPRESSED_NO_DELIVERY"
                     await uow.audit.append(
                         actor="controller",
                         source="state_machine",
-                        action="CANCELLED_NO_SALE"
-                        if returned.phase is VerifiedPhase.CANCELLED_NO_SALE
-                        else "SALE_SUPPRESSED_NO_DELIVERY",
+                        action=suppress_action,
                         station_id=self._station_id,
                         pump_id=pump_db,
                         previous_state=str(prev_state_s) if prev_state_s else None,
@@ -934,6 +1090,7 @@ class PersistenceBridge:
                             "filled_volume_raw": vol_raw,
                             "filled_amount_raw": amt_raw,
                             "may_publish_sale": may_publish,
+                            "session_dispensing_evidence": session_dispensing_evidence,
                             "warnings": list(warn_tuple),
                             "verified": returned.diagnostic(),
                         },
@@ -1021,16 +1178,14 @@ class PersistenceBridge:
                         nozzle_id=int(nozzle_id if nozzle_id is not None else 0),
                     )
                     # Retained-display suppress: only when explicitly marked
-                    # startup_baseline / may_publish_sale=false, or fingerprint
-                    # matches with no open sale AND no filling observed this boot.
-                    # Never discard a legitimate equal-value sale after a real fill.
+                    # startup_baseline, or fingerprint matches with no open sale
+                    # AND no filling observed this boot. Do not treat
+                    # may_publish_sale=false alone as startup — hang-up timeouts
+                    # publish that flag with a real face volume.
                     open_mapped = await self._open_uuid(
                         uow, self._tx_by_address.get(address) or active_tx_s
                     )
-                    startup_mark = bool(
-                        detail_payload.get("startup_baseline")
-                        or detail_payload.get("may_publish_sale") is False
-                    )
+                    startup_mark = bool(detail_payload.get("startup_baseline"))
                     filling_seen = bool(
                         detail_payload.get("filling_seen_this_boot")
                         or detail_payload.get("filling_observed")
@@ -1167,7 +1322,7 @@ class PersistenceBridge:
                         uow,
                         address=address,
                         pump_db=pump_db,
-                        candidate=active_tx_s,
+                        candidate=active_tx_s or self._verified_open_uuid(address),
                         nozzle_id=nozzle_id,
                         reason="sale_complete",
                     )
@@ -1199,8 +1354,13 @@ class PersistenceBridge:
                             completion_warnings=warn_tuple,
                         )
                     )
-                    # Keep mapping for duplicate DATA handling until new sale.
+                    # Keep hose map for duplicate DATA / same-totals already
+                    # completed; clear live SM UUID so the next dispense cannot
+                    # reuse this COMPLETED identity.
                     self._tx_by_address[address] = complete_uuid
+                    self._publish_sale_identity_cleared(
+                        address, transaction_uuid=complete_uuid
+                    )
                     await uow.nozzle_baselines.upsert_baseline(
                         station_id=self._station_id,
                         pump_id=pump_db,

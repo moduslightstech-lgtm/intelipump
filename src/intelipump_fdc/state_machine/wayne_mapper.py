@@ -647,7 +647,10 @@ def _status_code_to_event(
         )
 
     completion_key: str | None = None
-    if status is WaynePumpStatus.FILLING_COMPLETED:
+    if status in {
+        WaynePumpStatus.FILLING_COMPLETED,
+        WaynePumpStatus.MAX_AMOUNT_VOLUME_REACHED,
+    }:
         frame = obs.source_frame_raw_hex or ""
         completion_key = f"complete:{frame}:{status_code}"
 
@@ -722,10 +725,16 @@ def _status_code_to_event(
         )
 
     if status is WaynePumpStatus.MAX_AMOUNT_VOLUME_REACHED:
+        # Same evidence key shape as FILLING_COMPLETED so hang-up-at-preset
+        # can publish may_publish_sale when sale_evidence accepts the face.
+        # awaiting=False: preset stop is a terminal face; PersistenceBridge
+        # finalizes immediately (hang-up after LIMIT must not mint a twin).
         return MappedWayneObservation(
             event=PumpEvent.LIMIT_REACHED,
             observation=obs,
             raw_wayne_status=status_code,
+            completion_evidence_key=completion_key,
+            awaiting_filling_complete=False,
             inferences=(*inferences, "DC1 STATUS=6 → LIMIT_REACHED."),
         )
 

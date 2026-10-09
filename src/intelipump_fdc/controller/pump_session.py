@@ -311,6 +311,48 @@ class PumpSession:
                 return
         self._confirm_held_completion(now=now)
 
+    def bind_durable_sale_identity(self, transaction_uuid: str) -> None:
+        """Align live PumpContext with the PersistenceBridge hose UUID.
+
+        Wayne rarely carries a sale id; the bridge mints/opens ACTIVE and pushes
+        the identity here so hang-up / LIMIT publish the same UUID.
+        """
+        tx = str(transaction_uuid or "").strip()
+        if not tx:
+            return
+        ctx = self.machine.context
+        prior = ctx.active_transaction_id
+        if prior == tx:
+            if not ctx.has_unresolved_transaction:
+                self.machine._context = ctx.with_updates(  # noqa: SLF001
+                    has_unresolved_transaction=True
+                )
+            return
+        if prior is not None and prior != tx:
+            logger.info(
+                "sale_identity_replaced_on_session",
+                address=self.address,
+                previousUuid=prior,
+                newUuid=tx,
+            )
+        self.machine._context = ctx.with_updates(  # noqa: SLF001
+            active_transaction_id=tx,
+            has_unresolved_transaction=True,
+        )
+
+    def clear_durable_sale_identity(self, *, expected: str | None = None) -> None:
+        """Drop live SM UUID after COMPLETED or a new physical session boundary."""
+        ctx = self.machine.context
+        current = ctx.active_transaction_id
+        if current is None:
+            return
+        if expected is not None and current != expected:
+            return
+        self.machine._context = ctx.with_updates(  # noqa: SLF001
+            active_transaction_id=None,
+            has_unresolved_transaction=False,
+        )
+
     def seed_recovered_context(self, context: PumpContext) -> None:
         """Apply recovery snapshot; require live reconcile before healthy claims."""
         seeded = context.with_updates(communication_healthy=False)
@@ -1221,8 +1263,12 @@ class PumpSession:
                     self._filling_started_at = datetime.now(UTC)
                 self.state.sale_evidence.note_filling()
                 self.state.sale_lifecycle = SaleLifecycle.FILLING
-        # Gate sale finalize: FILLING_COMPLETED without valid evidence → no sale.
-        if mapped.event is PumpEvent.FILLING_COMPLETED:
+        # Gate sale finalize: FILLING_COMPLETED / LIMIT_REACHED without valid
+        # evidence → no sale. Preset stop (STATUS=6) must use the same gate.
+        if mapped.event in {
+            PumpEvent.FILLING_COMPLETED,
+            PumpEvent.LIMIT_REACHED,
+        }:
             ctx0 = self.machine.context
             # Prefer live DC2 peaks. Fall back to SM dispensed_volume_raw only when
             # live peaks are empty (timeout finalize without a recent DC2 tick).
@@ -1388,6 +1434,7 @@ class PumpSession:
             PumpEvent.FILLING_UPDATED,
             PumpEvent.FILLING_STARTED,
             PumpEvent.FILLING_COMPLETED,
+            PumpEvent.LIMIT_REACHED,
         }:
             sm_volume = (
                 int(self.state.filled_volume_raw)
@@ -1408,11 +1455,12 @@ class PumpSession:
             self._await_started_at = None
             self._insufficient_evidence_warned = False
 
-        # FILLING_COMPLETE + FILLING_COMPLETED is a same-state noop in the SM,
-        # but still finalizes a hang-up await and must publish once.
+        # FILLING_COMPLETE + FILLING_COMPLETED / LIMIT_REACHED is a same-state
+        # noop in the SM, but still finalizes a hang-up await and must publish.
         cleared_await = was_awaiting and not after_ctx.awaiting_filling_complete
         finalized = (
-            mapped.event is PumpEvent.FILLING_COMPLETED
+            mapped.event
+            in {PumpEvent.FILLING_COMPLETED, PumpEvent.LIMIT_REACHED}
             and mapped.completion_evidence_key is not None
             and result.accepted
             and (not result.noop or cleared_await or mapped.completion_inferred)
@@ -1423,12 +1471,13 @@ class PumpSession:
             and mapped.event is PumpEvent.NOZZLE_RETURNED
         )
         # Sale evidence already accepted a positive hang-up, but SM rejected
-        # (historically DISCOVERING + FILLING_COMPLETED). Force a complete
-        # publish so PersistenceBridge can write COMPLETED + outbox.
+        # (historically DISCOVERING + FILLING_COMPLETED / LIMIT_REACHED). Force
+        # a complete publish so PersistenceBridge can write COMPLETED + outbox.
         force_complete_publish = False
         if (
             not finalized
-            and mapped.event is PumpEvent.FILLING_COMPLETED
+            and mapped.event
+            in {PumpEvent.FILLING_COMPLETED, PumpEvent.LIMIT_REACHED}
             and mapped.completion_evidence_key is not None
             and not result.accepted
             and self.state.sale_evidence.lifecycle is SaleLifecycle.FILLING_COMPLETED
@@ -1436,9 +1485,14 @@ class PumpSession:
             and not self.state.sale_evidence.aborted
         ):
             force_complete_publish = True
-            after = PumpState.FILLING_COMPLETE
+            forced_state = (
+                PumpState.LIMIT_REACHED
+                if mapped.event is PumpEvent.LIMIT_REACHED
+                else PumpState.FILLING_COMPLETE
+            )
+            after = forced_state
             after_ctx = after_ctx.with_updates(
-                current_state=PumpState.FILLING_COMPLETE,
+                current_state=forced_state,
                 previous_state=before,
                 awaiting_filling_complete=False,
                 completion_inferred=True,
@@ -1452,6 +1506,8 @@ class PumpSession:
                 "forced_filling_complete_after_sm_reject",
                 address=self.address,
                 previousState=before.value,
+                forcedState=forced_state.value,
+                mappedEvent=mapped.event.value,
                 reason=result.reason,
                 volumeMinorUnits=int(self.state.filled_volume_raw or 0),
                 amountMinorUnits=int(self.state.filled_amount_raw or 0),
@@ -1523,12 +1579,20 @@ class PumpSession:
                     "filling_observed": self.state.sale_evidence.filling_observed,
                     "may_publish_sale": (
                         completion_evidence_key is not None
+                        and not self.state.sale_evidence.aborted
                         and (
                             (
                                 self.state.sale_evidence.lifecycle
                                 is SaleLifecycle.FILLING_COMPLETED
                                 and self.state.sale_evidence.has_positive_delivery
-                                and not self.state.sale_evidence.aborted
+                            )
+                            or (
+                                # LIMIT_REACHED / hang-up before evaluate stamped
+                                # FILLING_COMPLETED — still publishable face.
+                                self.state.sale_evidence.filling_observed
+                                and self.state.sale_evidence.has_positive_delivery
+                                and int(self.state.filled_volume_raw or 0) > 0
+                                and int(self.state.filled_amount_raw or 0) > 0
                             )
                             or (
                                 isinstance(completion_evidence_key, str)

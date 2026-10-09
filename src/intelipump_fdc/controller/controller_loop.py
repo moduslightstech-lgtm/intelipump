@@ -159,6 +159,8 @@ class ControllerLoop:
             )
             for addr in runtime.config.addresses
         }
+        # Persist bridge binds hose UUID → keep live SM aligned for hang-up.
+        runtime.events.add_subscriber(self._on_sale_identity_event)
         wires = tuple(encode_wire_address(a) for a in runtime.config.addresses)
         self.demux = AddressFrameDemux(
             wire_addresses=wires,
@@ -1388,6 +1390,24 @@ class ControllerLoop:
     def set_sale_handoff_blocker(self, blocker: Callable[[int], bool] | None) -> None:
         """Block RESET while ``blocker(addr)`` is True (durable handoff pending)."""
         self._sale_handoff_blocker = blocker
+
+    def _on_sale_identity_event(self, event: ControllerEvent) -> None:
+        """Adopt / clear durable sale UUID on the live session (bridge-driven)."""
+        if event.address is None:
+            return
+        session = self.sessions.get(event.address)
+        if session is None:
+            return
+        payload = event.payload or {}
+        if event.type is ControllerEventType.SALE_IDENTITY_BOUND:
+            tx = payload.get("transaction_uuid") or event.detail
+            if isinstance(tx, str) and tx.strip():
+                session.bind_durable_sale_identity(tx.strip())
+        elif event.type is ControllerEventType.SALE_IDENTITY_CLEARED:
+            expected = payload.get("transaction_uuid")
+            session.clear_durable_sale_identity(
+                expected=str(expected) if isinstance(expected, str) else None
+            )
 
     def note_sale_handoff_identity(self, addr: int, identity_key: str) -> None:
         """Bind the persist identity that currently gates RESET for ``addr``."""

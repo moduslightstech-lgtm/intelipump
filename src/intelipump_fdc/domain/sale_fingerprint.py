@@ -61,8 +61,8 @@ def stable_completion_key(
 
     Equal-value consecutive customers (same litres/amount/price) share a
     fingerprint; UUID keeps their completion keys distinct. Cross-path doubles
-    (settle vs hang-up) are suppressed via ``find_recent_completed_same_totals``,
-    not by collapsing keys onto the fingerprint.
+    (settle vs hang-up) for the *same* UUID are idempotent via complete_once —
+    never collapse different UUIDs onto one fingerprint key.
     """
     if transaction_uuid:
         return f"complete:{transaction_uuid}"

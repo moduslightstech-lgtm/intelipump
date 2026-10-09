@@ -26,6 +26,9 @@ class ControllerEventType(StrEnum):
     PUMP_DISCONNECTED = "PUMP_DISCONNECTED"
     STATE_CHANGED = "STATE_CHANGED"
     APPLICATION_TRANSACTION_DECODED = "APPLICATION_TRANSACTION_DECODED"
+    # PersistenceBridge → PumpSession: one durable sale UUID for the hose.
+    SALE_IDENTITY_BOUND = "SALE_IDENTITY_BOUND"
+    SALE_IDENTITY_CLEARED = "SALE_IDENTITY_CLEARED"
 
 
 @dataclass(frozen=True, slots=True)

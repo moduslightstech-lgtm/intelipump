@@ -199,3 +199,59 @@ def test_force_complete_when_sm_rejects_ready() -> None:
         and p.get("filled_amount_raw") == 40000
         for p in published
     )
+
+
+def test_force_complete_limit_reached_when_sm_rejects_discovering() -> None:
+    """Preset stop left ACTIVE when SM was still DISCOVERING."""
+    bus = EventBus()
+    published: list[dict] = []
+
+    def _cap(event: ControllerEvent) -> None:
+        if event.type is ControllerEventType.STATE_CHANGED:
+            published.append(dict(event.payload or {}))
+
+    bus.add_subscriber(_cap)
+    s = _session(events=bus)
+    now = datetime.now(UTC)
+    s.machine = PumpStateMachine(
+        PumpContext(
+            pump_id="pump-2",
+            dart_address=2,
+            current_state=PumpState.DISCOVERING,
+            communication_healthy=True,
+            nozzle_out=False,
+            selected_nozzle=1,
+            active_transaction_id=None,
+            dispensed_volume_raw=3690,
+            was_ready_derivable=True,
+            last_raw_wayne_status=6,
+        )
+    )
+    s.state.filled_volume_raw = 3690
+    s.state.filled_amount_raw = 5000000
+    s.state.unit_price_raw = 1355
+    s.state.nozzle_position = NozzlePosition.IN
+    s._noz_in_edge_at = now - timedelta(seconds=10)
+    s._filling_seen_this_boot = True
+    s._filling_started_at = now - timedelta(seconds=45)
+    s.state.sale_evidence.note_nozzle_out()
+    s.state.sale_evidence.note_authorized(application_confirmed=True)
+    s.state.sale_evidence.note_filling()
+    s.state.sale_evidence.note_dc2(volume_raw=3690, amount_raw=5000000)
+
+    s._apply_mapped(
+        MappedWayneObservation(
+            event=PumpEvent.LIMIT_REACHED,
+            observation=ObservationRef(source_frame_raw_hex="limit500"),
+            raw_wayne_status=6,
+            nozzle_out=False,
+            completion_evidence_key="complete:limit500:6",
+        )
+    )
+    assert s.machine.context.current_state is PumpState.LIMIT_REACHED
+    assert any(
+        p.get("event") == PumpEvent.LIMIT_REACHED.value
+        and p.get("may_publish_sale") is True
+        and p.get("filled_volume_raw") == 3690
+        for p in published
+    )
