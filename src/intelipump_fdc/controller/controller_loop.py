@@ -191,6 +191,15 @@ class ControllerLoop:
         self._startup_reset_attempted: set[int] = set()
         self._bus_silent_warned: set[int] = set()
         self._price_programmed: set[int] = set()
+        # Per-address startup CD5 restore (durable unit-price.json target).
+        # States: pending | deferred | awaiting_verify | verified | failed
+        self._startup_price_state: dict[int, str] = {}
+        self._startup_price_fail_count: dict[int, int] = {}
+        self._startup_price_next_try: dict[int, float] = {}
+        self._startup_price_dc3_baseline: dict[int, int] = {}
+        self._startup_price_verify_deadline: dict[int, float] = {}
+        self._startup_price_max_attempts: int = 6
+        self._startup_price_dc3_timeout_s: float = 30.0
         self._startup_reset_done: set[int] = set()
         self._auth_this_lift: set[int] = set()
         self._auth_deferred_logged: set[int] = set()
@@ -1597,76 +1606,8 @@ class ControllerLoop:
             await self._reset_after_sale_display_hold(session)
             return
 
-        if (
-            flags.automatic_startup_price_programming
-            and addr not in self._price_programmed
-            and addr not in self._startup_price_attempted
-            and self.runtime.startup_unit_price is not None
-        ):
-            # Cloud SET_PRICE owns CD5 while a request file is pending — do not
-            # also fire startup CD5 on the same tick (bus contention / timeout spam).
-            from intelipump_fdc.cloud.set_price_request import (
-                read_persisted_unit_price,
-                read_set_price_request,
-            )
-
-            if read_set_price_request() is not None:
-                pass  # cloud request owns the bus
-            else:
-                # Prefer durable dashboard price over a stale CLI --price default.
-                persisted = read_persisted_unit_price()
-                if (
-                    persisted is not None
-                    and persisted.unit_price_raw > 0
-                    and persisted.unit_price_raw != self.runtime.startup_unit_price
-                ):
-                    logger.info(
-                        "owned_lab_startup_price_deferred_to_persisted",
-                        address=addr,
-                        cliStartupPrice=self.runtime.startup_unit_price,
-                        persistedUnitPriceRaw=persisted.unit_price_raw,
-                        persistedSource=persisted.source,
-                    )
-                    self.runtime.startup_unit_price = persisted.unit_price_raw
-                # Face already shows the target price — do not re-blast CD5.
-                if session.state.unit_price_raw == self.runtime.startup_unit_price:
-                    self._price_programmed.add(addr)
-                    self._startup_price_attempted.add(addr)
-                else:
-                    self._startup_price_attempted.add(addr)
-                    payload = encode_cd5_price_update(
-                        prices_raw=[self.runtime.startup_unit_price]
-                        * self.runtime.logical_nozzle_count
-                    )
-                    result = await self._run_owned_command(
-                        session,
-                        payload,
-                        PumpCommand.SET_PRICE,
-                        idempotency=IdempotencyClass.NON_IDEMPOTENT,
-                    )
-                    print(
-                        f"[OWNED-LAB addr={addr}] CD5 price "
-                        f"{self.runtime.startup_unit_price} result={result.status.value}"
-                    )
-                    if result.status in {
-                        ExchangeResultStatus.LINK_ACKNOWLEDGED,
-                        ExchangeResultStatus.APPLICATION_CONFIRMED,
-                    }:
-                        self._price_programmed.add(addr)
-                        price = self.runtime.startup_unit_price
-                        if isinstance(price, int) and price > 0:
-                            self._note_command_price_lifecycle(
-                                session,
-                                unit_price_raw=price,
-                                link_acked=(
-                                    result.status
-                                    is ExchangeResultStatus.LINK_ACKNOWLEDGED
-                                ),
-                                application_confirmed=(
-                                    result.status
-                                    is ExchangeResultStatus.APPLICATION_CONFIRMED
-                                ),
-                            )
+        if flags.automatic_startup_price_programming:
+            await self._maybe_startup_price_restore(session)
 
         if flags.automatic_reset and addr not in self._startup_reset_done:
             if session.should_skip_reset():
@@ -1743,6 +1684,368 @@ class ControllerLoop:
     def _authorize_request_dir(self) -> Path:
         return Path(
             os.environ.get("INTELIPUMP_AUTHORIZE_REQUEST_DIR", "/var/lib/intelipump")
+        )
+
+    def _startup_price_target(self) -> int | None:
+        """Durable dashboard price preferred over stale CLI ``startup_unit_price``."""
+        from intelipump_fdc.cloud.set_price_request import read_persisted_unit_price
+
+        persisted = read_persisted_unit_price()
+        if (
+            persisted is not None
+            and persisted.unit_price_raw > 0
+            and persisted.unit_price_raw != self.runtime.startup_unit_price
+        ):
+            logger.info(
+                "owned_lab_startup_price_deferred_to_persisted",
+                cliStartupPrice=self.runtime.startup_unit_price,
+                persistedUnitPriceRaw=persisted.unit_price_raw,
+                persistedSource=persisted.source,
+            )
+            self.runtime.startup_unit_price = persisted.unit_price_raw
+        elif (
+            persisted is not None
+            and persisted.unit_price_raw > 0
+            and self.runtime.startup_unit_price is None
+        ):
+            self.runtime.startup_unit_price = persisted.unit_price_raw
+        price = self.runtime.startup_unit_price
+        if isinstance(price, int) and price > 0:
+            return price
+        return None
+
+    def _startup_price_restore_unnecessary(
+        self, session: PumpSession, target: int
+    ) -> tuple[bool, str]:
+        """Skip CD5 only with fresh observation evidence the pump is programmed.
+
+        Matching ``unit_price_raw`` alone is insufficient: Wayne can retain a
+        prior DC3 face while DC1 reports ``NOT_PROGRAMMED``. Freshness uses
+        ``last_nozio_time`` / ``last_status_time`` ages (not sticky caches).
+        Completed-sale / handoff / LCD-hold states never count as skip — they
+        must flow through ``_set_price_defer_reason`` like cloud SET_PRICE.
+        """
+        addr = session.address
+        status = session.state.observed_status
+        if status is ObservedStatus.NOT_PROGRAMMED:
+            return False, "not_programmed"
+        if status is ObservedStatus.UNKNOWN:
+            return False, "status_unknown"
+        if status in {
+            ObservedStatus.AUTHORIZED,
+            ObservedStatus.FILLING,
+            ObservedStatus.SUSPENDED,
+        }:
+            return False, "busy_live_sale"
+        if addr in self._sale_display_held:
+            return False, "sale_display_held"
+        if addr in self._sale_handoff_pending:
+            return False, "sale_handoff_pending"
+        if self._sale_reset_blocked_by_handoff(addr):
+            return False, "sale_handoff_pending"
+        ev = session.state.sale_evidence
+        if ev.has_positive_delivery and not (
+            ev.sale_published or addr in self._last_completed_sale
+        ):
+            return False, "sale_unpersisted"
+        if session.state.unit_price_raw != target:
+            return False, "face_mismatch"
+        if self._set_price_evidence_stale(session):
+            return False, "observation_stale"
+        if status is ObservedStatus.RESET:
+            return True, "fresh_reset_face_match"
+        # FILLING_COMPLETED / LCD hold: never "skip as done" — defer until idle
+        # RESET so we do not compete with sale finalization / display hold / RESET.
+        if status in {
+            ObservedStatus.FILLING_COMPLETED,
+            ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+        }:
+            return False, "sale_face_held"
+        return False, f"status_{status.value.lower()}"
+
+    def _startup_price_mark(
+        self, addr: int, state: str, *, reason: str, **extra: object
+    ) -> None:
+        prev = self._startup_price_state.get(addr)
+        self._startup_price_state[addr] = state
+        logger.info(
+            "startup_price_restore",
+            address=addr,
+            state=state,
+            previousState=prev,
+            reason=reason,
+            **extra,
+        )
+
+    def _startup_price_schedule_retry(self, addr: int, *, reason: str) -> None:
+        fails = int(self._startup_price_fail_count.get(addr, 0)) + 1
+        self._startup_price_fail_count[addr] = fails
+        if fails >= self._startup_price_max_attempts:
+            self._startup_price_mark(
+                addr,
+                "failed",
+                reason=reason,
+                failCount=fails,
+                exhausted=True,
+            )
+            # Keep next_try far out; do not mark _price_programmed.
+            self._startup_price_next_try[addr] = time.monotonic() + 300.0
+            return
+        delay = min(60.0, float(2 ** min(fails, 5)))
+        self._startup_price_next_try[addr] = time.monotonic() + delay
+        self._startup_price_mark(
+            addr,
+            "failed",
+            reason=reason,
+            failCount=fails,
+            retryInS=delay,
+            exhausted=False,
+        )
+
+    def _startup_price_mark_verified(
+        self, session: PumpSession, target: int, *, reason: str
+    ) -> None:
+        addr = session.address
+        self._price_programmed.add(addr)
+        self._startup_price_attempted.add(addr)
+        self._startup_price_fail_count.pop(addr, None)
+        self._startup_price_next_try.pop(addr, None)
+        self._startup_price_dc3_baseline.pop(addr, None)
+        self._startup_price_verify_deadline.pop(addr, None)
+        self._startup_price_mark(
+            addr,
+            "verified",
+            reason=reason,
+            unitPriceRaw=target,
+            observedStatus=session.state.observed_status.value,
+            faceUnitPriceRaw=session.state.unit_price_raw,
+        )
+
+    def _startup_price_check_awaiting_verify(
+        self, session: PumpSession, target: int
+    ) -> bool:
+        """True while in awaiting_verify (no CD5 resend until timeout/retry)."""
+        addr = session.address
+        if self._startup_price_state.get(addr) != "awaiting_verify":
+            return False
+        deadline = self._startup_price_verify_deadline.get(addr)
+        now = time.monotonic()
+        status = session.state.observed_status
+        face = session.state.unit_price_raw
+        baseline = self._startup_price_dc3_baseline.get(addr)
+        gen = int(getattr(session.state, "unit_price_obs_gen", 0) or 0)
+        left_unprogrammed = status is not ObservedStatus.NOT_PROGRAMMED
+        face_ok = face == target
+        gen_advanced = baseline is not None and gen > int(baseline)
+        fresh = not self._set_price_evidence_stale(session)
+        # Prefer DC3 generation advance; allow RESET only with fresh observations.
+        verified = False
+        verify_reason = ""
+        if left_unprogrammed and face_ok and gen_advanced and fresh:
+            verified = True
+            verify_reason = "post_link_ack_dc3_gen"
+        elif (
+            left_unprogrammed
+            and face_ok
+            and status is ObservedStatus.RESET
+            and fresh
+        ):
+            verified = True
+            verify_reason = "post_link_ack_fresh_reset"
+        if verified:
+            self._startup_price_mark_verified(
+                session, target, reason=verify_reason
+            )
+            return True
+        if deadline is not None and now >= deadline:
+            self._startup_price_dc3_baseline.pop(addr, None)
+            self._startup_price_verify_deadline.pop(addr, None)
+            self._startup_price_schedule_retry(
+                addr, reason="link_ack_verify_timeout"
+            )
+            return True
+        # Rate-limit waiting logs (still no CD5 on this tick).
+        throttle_key = f"startup_await:{addr}"
+        last = self._set_price_defer_log_at.get(throttle_key)
+        if last is None or (now - last) >= 30.0:
+            self._set_price_defer_log_at[throttle_key] = now
+            logger.info(
+                "startup_price_restore",
+                address=addr,
+                state="awaiting_verify",
+                reason="waiting_application_or_dc3",
+                unitPriceRaw=target,
+                observedStatus=status.value,
+                faceUnitPriceRaw=face,
+                unitPriceObsGen=gen,
+                baselineObsGen=baseline,
+                observationFresh=fresh,
+                deadlineInS=None if deadline is None else round(deadline - now, 2),
+            )
+        return True
+
+    async def _maybe_startup_price_restore(self, session: PumpSession) -> None:
+        """Per-address CD5 restore from durable saved price after controller restart.
+
+        Cloud ``set-price-request.json`` always wins the bus. Matching cached face
+        price does not prove the pump is programmed when DC1 is NOT_PROGRAMMED.
+        LINK_ACK alone is not verification — await status/DC3 evidence.
+        """
+        from intelipump_fdc.cloud.set_price_request import read_set_price_request
+
+        addr = session.address
+        target = self._startup_price_target()
+        if target is None:
+            return
+
+        # Invalid sticky "programmed" if pump still reports NOT_PROGRAMMED.
+        if (
+            addr in self._price_programmed
+            and session.state.observed_status is ObservedStatus.NOT_PROGRAMMED
+        ):
+            self._price_programmed.discard(addr)
+            self._startup_price_mark(
+                addr,
+                "pending",
+                reason="reopened_not_programmed_despite_cached_flag",
+                unitPriceRaw=target,
+                faceUnitPriceRaw=session.state.unit_price_raw,
+            )
+
+        if read_set_price_request() is not None:
+            self._startup_price_mark(
+                addr,
+                "deferred",
+                reason="cloud_set_price_pending",
+                unitPriceRaw=target,
+            )
+            return
+
+        if self._startup_price_check_awaiting_verify(session, target):
+            return
+
+        if addr in self._price_programmed or self._startup_price_state.get(addr) == "verified":
+            return
+
+        unnecessary, why = self._startup_price_restore_unnecessary(session, target)
+        if unnecessary:
+            self._startup_price_mark_verified(session, target, reason=f"skip_{why}")
+            return
+
+        now = time.monotonic()
+        next_try = self._startup_price_next_try.get(addr)
+        if next_try is not None and now < next_try:
+            self._startup_price_mark(
+                addr,
+                "deferred",
+                reason="backoff",
+                unitPriceRaw=target,
+                retryInS=round(next_try - now, 2),
+                evidenceGap=why,
+            )
+            return
+
+        # Do not CD5 (or treat as verified) while a completed sale face is held —
+        # preserve finalization / persistence / RESET sequencing.
+        if session.state.observed_status in {
+            ObservedStatus.FILLING_COMPLETED,
+            ObservedStatus.MAX_AMOUNT_VOLUME_REACHED,
+        } or addr in self._sale_display_held:
+            self._startup_price_mark(
+                addr,
+                "deferred",
+                reason="eligible_sale_face_held",
+                unitPriceRaw=target,
+                evidenceGap=why,
+                observedStatus=session.state.observed_status.value,
+                nozzleState=session.state.nozzle_position.value,
+            )
+            return
+
+        defer = self._set_price_defer_reason(addr, session)
+        if defer is not None:
+            self._startup_price_mark(
+                addr,
+                "deferred",
+                reason=f"eligible_{defer}",
+                unitPriceRaw=target,
+                evidenceGap=why,
+                observedStatus=session.state.observed_status.value,
+                nozzleState=session.state.nozzle_position.value,
+            )
+            return
+
+        if (
+            self._startup_price_fail_count.get(addr, 0)
+            >= self._startup_price_max_attempts
+        ):
+            self._startup_price_mark(
+                addr,
+                "failed",
+                reason="attempts_exhausted",
+                unitPriceRaw=target,
+                failCount=self._startup_price_fail_count.get(addr),
+            )
+            return
+
+        self._startup_price_attempted.add(addr)
+        self._startup_price_mark(
+            addr,
+            "pending",
+            reason="attempt_cd5",
+            unitPriceRaw=target,
+            evidenceGap=why,
+            observedStatus=session.state.observed_status.value,
+            faceUnitPriceRaw=session.state.unit_price_raw,
+            failCount=self._startup_price_fail_count.get(addr, 0),
+        )
+        payload = encode_cd5_price_update(
+            prices_raw=[target] * self.runtime.logical_nozzle_count
+        )
+        result = await self._run_owned_command(
+            session,
+            payload,
+            PumpCommand.SET_PRICE,
+            idempotency=IdempotencyClass.NON_IDEMPOTENT,
+        )
+        print(
+            f"[OWNED-LAB addr={addr}] CD5 price {target} result={result.status.value}"
+        )
+        if result.status is ExchangeResultStatus.APPLICATION_CONFIRMED:
+            self._note_command_price_lifecycle(
+                session,
+                unit_price_raw=target,
+                link_acked=True,
+                application_confirmed=True,
+            )
+            self._startup_price_mark_verified(
+                session, target, reason="application_confirmed"
+            )
+            return
+        if result.status is ExchangeResultStatus.LINK_ACKNOWLEDGED:
+            self._note_command_price_lifecycle(
+                session,
+                unit_price_raw=target,
+                link_acked=True,
+                application_confirmed=False,
+            )
+            self._startup_price_dc3_baseline[addr] = int(
+                getattr(session.state, "unit_price_obs_gen", 0) or 0
+            )
+            self._startup_price_verify_deadline[addr] = (
+                time.monotonic() + self._startup_price_dc3_timeout_s
+            )
+            self._startup_price_mark(
+                addr,
+                "awaiting_verify",
+                reason="link_ack_not_application_confirm",
+                unitPriceRaw=target,
+                baselineObsGen=self._startup_price_dc3_baseline[addr],
+                verifyTimeoutS=self._startup_price_dc3_timeout_s,
+            )
+            return
+        self._startup_price_schedule_retry(
+            addr, reason=f"exchange_{result.status.value.lower()}"
         )
 
     @staticmethod
@@ -3310,9 +3613,10 @@ class ControllerLoop:
             any_ok = False
             for addr, session in eligible:
                 # Suppress parallel startup CD5 while cloud is driving this address.
-                # Do not clear _startup_price_attempted — that re-opens OWNED-LAB CD5
-                # spam on every TIMED_OUT cloud attempt.
+                # Startup restore also defers while set-price-request.json exists;
+                # mark attempted so diagnostics show cloud owned this tick.
                 self._startup_price_attempted.add(addr)
+                self._startup_price_state[addr] = "deferred"
                 status = session.state.observed_status
                 needs_clear = (
                     status
