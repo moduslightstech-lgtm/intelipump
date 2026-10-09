@@ -27,12 +27,14 @@ _last_read_monotonic: dict[str, float] = {}
 VOLUME_COUN_MIN = 0x01
 VOLUME_COUN_MAX = 0x09
 
+# Live sale only — not post-hangup FILLING_COMPLETED / CANCELLED_NO_SALE.
+# Wayne idles in FILLING_COMPLETE after hang-up until the next lift; that must
+# not block attended CD101 when the nozzle is verified IN.
 _BUSY_SALE_LIFECYCLES = frozenset(
     {
         "NOZZLE_LIFTED",
         "AUTHORIZED",
         "FILLING",
-        "FILLING_COMPLETED",
     }
 )
 
@@ -89,7 +91,13 @@ def nozzle_from_payload(payload: dict[str, Any] | None, *, default: str = "nozzl
 
 
 def dispensing_blocks_read(state: PumpState | str | None) -> bool:
-    """True when CD101 must not run — protect live sale / nozzle-lift path."""
+    """True when CD101 must not run — protect live sale / nozzle-lift path.
+
+    ``FILLING_COMPLETE`` is intentionally excluded: after hang-up the pump
+    stays there (real sale face or CANCELLED_NO_SALE) until the next lift.
+    Post-hangup safety is nozzle-IN freshness, sale lifecycle, active tx,
+    and completion-hold checks in ``evaluate_meter_tx_eligibility``.
+    """
     if state is None:
         return False
     value = state.value if isinstance(state, PumpState) else str(state)
@@ -97,7 +105,6 @@ def dispensing_blocks_read(state: PumpState | str | None) -> bool:
         PumpState.FILLING.value,
         PumpState.AUTHORIZED.value,
         PumpState.SUSPENDED.value,
-        PumpState.FILLING_COMPLETE.value,
         PumpState.LIMIT_REACHED.value,
         PumpState.NOZZLE_UP.value,
         "NOZZLE_UP",

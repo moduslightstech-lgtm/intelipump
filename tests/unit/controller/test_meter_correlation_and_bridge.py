@@ -186,6 +186,48 @@ def test_eligibility_refuses_unknown_stale_out_and_sale() -> None:
     )
     assert ok6
 
+    # Post-hangup idle: SM stays FILLING_COMPLETE (CANCELLED_NO_SALE or face
+    # hold). Must allow CD101 when nozzle IN and no live sale/hold.
+    ok7, _, _ = meter_svc.evaluate_meter_tx_eligibility(
+        current_state=PumpState.FILLING_COMPLETE,
+        nozzle_position=NozzlePosition.IN,
+        last_nozio_mono=now,
+        now_mono=now,
+        nozzle_in_max_age_s=300,
+        sale_lifecycle="CANCELLED_NO_SALE",
+    )
+    assert ok7
+
+    ok8, _, _ = meter_svc.evaluate_meter_tx_eligibility(
+        current_state=PumpState.FILLING_COMPLETE,
+        nozzle_position=NozzlePosition.IN,
+        last_nozio_mono=now,
+        now_mono=now,
+        nozzle_in_max_age_s=300,
+        sale_lifecycle="FILLING_COMPLETED",
+    )
+    assert ok8
+
+    ok9, code9, _ = meter_svc.evaluate_meter_tx_eligibility(
+        current_state=PumpState.AUTHORIZED,
+        nozzle_position=NozzlePosition.IN,
+        last_nozio_mono=now,
+        now_mono=now,
+        nozzle_in_max_age_s=300,
+        sale_lifecycle="AUTHORIZED",
+    )
+    assert not ok9 and code9 == "METER_READ_DEFERRED_DISPENSING"
+
+    ok10, code10, _ = meter_svc.evaluate_meter_tx_eligibility(
+        current_state=PumpState.READY,
+        nozzle_position=NozzlePosition.IN,
+        last_nozio_mono=now,
+        now_mono=now,
+        nozzle_in_max_age_s=300,
+        sale_lifecycle="FILLING",
+    )
+    assert not ok10 and code10 == "METER_READ_DEFERRED_SALE_LIFECYCLE"
+
 
 def test_liters_only_when_volume_coun_and_decimals(tmp_path, monkeypatch) -> None:
     assert meter_svc.liters_from_raw_scaled(1959090277, 3, counter_select=1) == 1959090.277
