@@ -225,7 +225,8 @@ async def test_meter_reset_1476_then_074_two_identities(
     first = bridge._tx_by_address[2]
     assert first
 
-    # New physical session after RESET — face drops; prior stays unresolved.
+    # New physical session after RESET without hang-up — face drops; prior
+    # must finalize (COMPLETED + outbox) so the sale still reaches the cloud.
     _seed_verified(bridge, address=2, baseline=0)
     await _begin_filling(bridge, address=2, version=2)
     await _dc2(bridge, address=2, volume=74, amount=100270)
@@ -240,12 +241,19 @@ async def test_meter_reset_1476_then_074_two_identities(
         prior = await uow.transactions.get_by_uuid(first)
         sold = await uow.transactions.get_by_uuid(second)
         assert prior is not None
-        assert prior.status == "ACTIVE"
+        assert prior.status == "COMPLETED"
         assert prior.raw_volume == 1476
         assert sold is not None
         assert sold.status == "COMPLETED"
         assert sold.raw_volume == 74
         assert int(prior.raw_volume or 0) + int(sold.raw_volume or 0) == 1550
+        claimed = await uow.sync_queue.claim_batch(limit=50)
+        prior_outbox = [
+            row
+            for row in claimed
+            if row.entity_id == first and row.event_type == "TRANSACTION_COMPLETED"
+        ]
+        assert prior_outbox, "prior sale must be queued for cloud after session boundary"
 
 
 @pytest.mark.asyncio

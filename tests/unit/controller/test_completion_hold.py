@@ -55,6 +55,43 @@ def _filling_session(*, filling_age: timedelta) -> tuple[PumpSession, datetime]:
     return s, now
 
 
+def test_limit_with_nozzle_still_out_publishes_immediately() -> None:
+    """Preset stop without hang-up must not enter micro-fill hold.
+
+    Hold + nozzle-OUT tick previously suppressed the sale forever
+    (``noz_out_during_hold``), so operator RESET for the next car lost it.
+    """
+    bus = EventBus()
+    published: list[dict] = []
+
+    def _cap(event: ControllerEvent) -> None:
+        if event.type is ControllerEventType.STATE_CHANGED:
+            published.append(dict(event.payload or {}))
+
+    bus.add_subscriber(_cap)
+    s, _now = _filling_session(filling_age=timedelta(seconds=1))
+    s.events = bus
+    # Nozzle still OUT at LIMIT (never hung up).
+    assert s.state.nozzle_position is NozzlePosition.OUT
+
+    s._apply_mapped(
+        MappedWayneObservation(
+            event=PumpEvent.LIMIT_REACHED,
+            observation=ObservationRef(source_frame_raw_hex="limitNoHang"),
+            raw_wayne_status=6,
+            nozzle_out=True,
+            completion_evidence_key="complete:limitNoHang:6",
+        )
+    )
+    assert s._held_completion is None
+    assert s.state.sale_lifecycle is SaleLifecycle.FILLING_COMPLETED
+    assert any(
+        p.get("event") == PumpEvent.LIMIT_REACHED.value
+        and p.get("may_publish_sale") is True
+        for p in published
+    )
+
+
 def test_micro_fill_completion_held_then_suppressed_on_relift() -> None:
     bus = EventBus()
     published: list[dict] = []

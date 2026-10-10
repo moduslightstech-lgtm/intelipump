@@ -372,6 +372,126 @@ class PersistenceBridge:
             return uuid
         return None
 
+    async def _finalize_open_sale_on_session_boundary(
+        self,
+        uow: Any,
+        *,
+        address: int,
+        prior_uuid: str,
+        prior_volume: int,
+        prior_amount: int,
+        prior_row: Any,
+    ) -> bool:
+        """Complete a still-open prior sale before hose→UUID detach.
+
+        Operator path: sale finishes (LIMIT / trigger stop) without hang-up,
+        then RESET+AUTHORIZE for the next car clears the face. Without this,
+        ``is_new_physical_session`` detaches an ACTIVE row that never reaches
+        the cloud outbox.
+        """
+        if prior_row is None or str(prior_row.status) not in _OPEN_TX_STATUSES:
+            return False
+        vol = int(prior_volume or 0)
+        amt = int(prior_amount or 0)
+        if vol <= 0 and amt <= 0:
+            return False
+        wire_noz = (
+            int(prior_row.nozzle_id)
+            if isinstance(prior_row.nozzle_id, int)
+            else None
+        )
+        price_raw = (
+            int(prior_row.raw_price)
+            if isinstance(prior_row.raw_price, int)
+            and not isinstance(prior_row.raw_price, bool)
+            and prior_row.raw_price > 0
+            else None
+        )
+        price_decimals = (
+            int(prior_row.price_decimals)
+            if isinstance(prior_row.price_decimals, int)
+            else None
+        )
+        fp = sale_fingerprint(
+            station_id=self._station_id,
+            dart_address=address,
+            nozzle_id=wire_noz,
+            raw_volume=vol,
+            raw_amount=amt,
+            raw_price=price_raw,
+        )
+        key = stable_completion_key(
+            transaction_uuid=prior_uuid, fingerprint=fp
+        )
+        _tx, newly = await TransactionService(
+            uow, fill_book=self._fill_book
+        ).complete(
+            CompleteTransactionRequest(
+                transaction_uuid=prior_uuid,
+                source_completion_key=key,
+                raw_volume=vol,
+                raw_amount=amt,
+                raw_price=price_raw,
+                price_decimals=price_decimals,
+                completion_inferred=True,
+                completion_warnings=(
+                    "session_boundary_finalize_no_hangup",
+                ),
+                publish_completion=True,
+            )
+        )
+        logical = self._logical_by_address.get(address) or prior_row.pump_id
+        pump_db = self._pump_id_by_address.get(address)
+        if newly and pump_db is not None:
+            await uow.audit.append(
+                actor="controller",
+                source="session_boundary",
+                action="TRANSACTION_COMPLETED_INFERRED",
+                station_id=self._station_id,
+                pump_id=pump_db,
+                previous_state=None,
+                resulting_state=PumpState.FILLING_COMPLETE.value,
+                result="OK",
+                details={
+                    "transaction_uuid": prior_uuid,
+                    "source_completion_key": key,
+                    "fingerprint": fp,
+                    "completion_inferred": True,
+                    "reason": "new_physical_session_without_hangup",
+                    "raw_volume": vol,
+                    "raw_amount": amt,
+                },
+            )
+        if newly and self._live is not None and self._auto_publish_sales:
+            self._live.publish_typed(
+                LiveEventType.TRANSACTION_COMPLETED,
+                station_id=self._station_id,
+                environment=self._environment,
+                simulated=self._simulated,
+                pump_id=logical,
+                transaction_id=prior_uuid,
+                payload={
+                    "source_completion_key": key,
+                    "deduplicationKey": (
+                        f"tx-completed:{self._station_id}:{key}"
+                    ),
+                    "completion_inferred": True,
+                    "fingerprint": fp,
+                    "reason": "session_boundary_finalize_no_hangup",
+                },
+            )
+        logger.info(
+            "prior_sale_finalized_on_session_boundary",
+            stationId=self._station_id,
+            sourceAddress=address,
+            priorUuid=prior_uuid,
+            newlyCompleted=newly,
+            volumeMinorUnits=vol,
+            amountMinorUnits=amt,
+            fingerprint=fp,
+        )
+        return newly
+
     def _detach_mapped_sale_for_new_session(
         self,
         *,
@@ -383,9 +503,10 @@ class PersistenceBridge:
         new_amount: int,
         prior_status: str | None,
     ) -> None:
-        """Leave the prior physical session row intact; clear hose→UUID glue.
+        """Clear hose→UUID glue after the prior session is settled or abandoned.
 
-        Next verified DC2 mints a new identity. Never high-water across RESET.
+        Prefer ``_finalize_open_sale_on_session_boundary`` first so ACTIVE rows
+        with delivery are COMPLETED + outboxed. Never high-water across RESET.
         """
         reason = session_boundary_reason(
             prior_volume=prior_volume,
@@ -1570,6 +1691,14 @@ class PersistenceBridge:
                         new_volume=raw_volume,
                         new_amount=raw_amount,
                     ):
+                        await self._finalize_open_sale_on_session_boundary(
+                            uow,
+                            address=address,
+                            prior_uuid=prev_uuid,
+                            prior_volume=int(prev_row.raw_volume or 0),
+                            prior_amount=int(prev_row.raw_amount or 0),
+                            prior_row=prev_row,
+                        )
                         self._detach_mapped_sale_for_new_session(
                             address=address,
                             prior_uuid=prev_uuid,
@@ -1640,6 +1769,14 @@ class PersistenceBridge:
                     new_volume=raw_volume,
                     new_amount=raw_amount,
                 ):
+                    await self._finalize_open_sale_on_session_boundary(
+                        uow,
+                        address=address,
+                        prior_uuid=open_mapped,
+                        prior_volume=int(open_row.raw_volume or 0),
+                        prior_amount=int(open_row.raw_amount or 0),
+                        prior_row=open_row,
+                    )
                     self._detach_mapped_sale_for_new_session(
                         address=address,
                         prior_uuid=open_mapped,

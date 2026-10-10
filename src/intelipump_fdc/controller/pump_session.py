@@ -134,7 +134,19 @@ class PumpSession:
             self._filling_started_at = at or datetime.now(UTC)
 
     def _completion_hold_reason(self, *, now: datetime) -> str | None:
-        """Return hold reason if FILLING_COMPLETED publish should be deferred."""
+        """Return hold reason if FILLING_COMPLETED publish should be deferred.
+
+        Hold is only for hang-up bounce / micro-fill re-lift. Preset stop or
+        FILLING_COMPLETED while the nozzle is still OUT must publish immediately
+        — otherwise ``_tick_completion_hold`` suppresses as ``noz_out_during_hold``
+        and the sale never reaches the cloud.
+        """
+        nozzle_out = (
+            self.state.nozzle_position is NozzlePosition.OUT
+            or self.machine.context.nozzle_out is True
+        )
+        if nozzle_out:
+            return None
         started = self._filling_started_at
         # Prefer micro-fill hold over brief NOZIO debounce so ghost splits
         # (₦122 then re-lift to ₦1000) stay suppressed for the full window.

@@ -4337,6 +4337,12 @@ class ControllerLoop:
                 # Do not retry endlessly on this lift.
                 self._auth_this_lift.add(addr)
                 return
+            # Flush any hang-up hold before wiping face evidence. Otherwise a
+            # short fill that completed without hang-up (or held on holster
+            # bounce) is discarded when the operator RESET+AUTHORIZEs the next
+            # car with the nozzle still OUT.
+            if session._held_completion is not None:
+                session._confirm_held_completion(now=datetime.now(UTC))
             # Invalidate retained-sale DC2 cache. Wayne often keeps LCD totals
             # after RESET without immediately emitting a zero DC2; stale cache
             # must not permanently block AUTHORIZE.
