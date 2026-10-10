@@ -132,6 +132,9 @@ class ControllerLoop:
         # After DEFERRED / quarantine, wait before re-queuing the same OPENING addr.
         self._meter_startup_next_try_mono: dict[int, float] = {}
         self._meter_startup_defer_backoff_s: float = 15.0
+        # METER_DC101_TIMEOUT often means a pre-TX stale DC101 was ignored; retry.
+        self._meter_startup_timeout_attempts: dict[int, int] = {}
+        self._meter_startup_timeout_max_attempts: int = 3
         thresholds = HealthThresholds(
             degraded_after_timeouts=runtime.config.degraded_after_timeouts,
             disconnected_after_timeouts=runtime.config.max_consecutive_timeouts,
@@ -2872,8 +2875,27 @@ class ControllerLoop:
                     timezone=tz,
                 )
                 self._meter_startup_next_try_mono.pop(int(address), None)
+                self._meter_startup_timeout_attempts.pop(int(address), None)
                 return
             if status_u in {"UNSUPPORTED", "ERROR"}:
+                # Timeout after ignoring pre-TX DC101 is often recoverable — retry
+                # a few times before marking the address done for the day.
+                if (
+                    status_u == "UNSUPPORTED"
+                    and str(error_code or "") == "METER_DC101_TIMEOUT"
+                ):
+                    n = int(self._meter_startup_timeout_attempts.get(int(address), 0)) + 1
+                    self._meter_startup_timeout_attempts[int(address)] = n
+                    if n < int(self._meter_startup_timeout_max_attempts):
+                        self._startup_meter_backoff(int(address))
+                        logger.info(
+                            "meter_startup_capture_timeout_retry",
+                            address=address,
+                            attempt=n,
+                            maxAttempts=self._meter_startup_timeout_max_attempts,
+                            correlationId=corr,
+                        )
+                        return
                 from intelipump_fdc.controller.meter_startup_capture import (
                     mark_address_failed,
                 )
@@ -2886,6 +2908,7 @@ class ControllerLoop:
                     timezone=tz,
                 )
                 self._meter_startup_next_try_mono.pop(int(address), None)
+                self._meter_startup_timeout_attempts.pop(int(address), None)
                 logger.info(
                     "meter_startup_capture_address_finished",
                     address=address,
@@ -3067,7 +3090,23 @@ class ControllerLoop:
             return
         if pending.get("outbound_correlation_id") != item.correlation_id:
             return
-        pending["tx_started_at_mono"] = float(write_mono)
+        # First TX stamp wins — never push the floor later on a retry path.
+        first_tx = pending.get("tx_started_at_mono") is None
+        if first_tx:
+            pending["tx_started_at_mono"] = float(write_mono)
+        addr = int(pending.get("address", item.address))
+        session = self.sessions.get(addr)
+        if session is not None and first_tx:
+            q_until = session.state.meter_dc101_quarantine_until_mono
+            # Claim already waited out quarantine; drop it so it cannot keep
+            # raising the match floor above a valid post-TX DC101.
+            if q_until is not None and float(write_mono) >= float(q_until):
+                session.state.meter_dc101_quarantine_until_mono = None
+            # Drop any pre-TX observation so a late/unsolicited DC101 cannot
+            # stick as before_request_window for the whole timeout window.
+            session.state.last_dc101 = None
+            session.state.last_dc101_at_mono = None
+            session.state.last_dc101_frame_hex = None
 
     def _meter_cancel_pending(
         self, *, status: str, code: str, message: str
@@ -3510,7 +3549,8 @@ class ControllerLoop:
             and dc101_at is not None
             and reason in {"wrong_coun", "before_request_window", "wrong_address"}
         ):
-            # Keep waiting until timeout; do not bind a wrong reply to this request.
+            # Do not bind a wrong/stale reply. Clear before_request_window frames
+            # so they cannot block matching a later post-TX DC101.
             logger.info(
                 "meter_read_dc101_ignored",
                 correlationId=pending["correlation_id"],
@@ -3518,7 +3558,14 @@ class ControllerLoop:
                 reason=reason,
                 observedCoun=dc101.get("counter_select"),
                 expectedCoun=pending["counter_select"],
+                observedAtMono=dc101_at,
+                txStartedAtMono=pending.get("tx_started_at_mono"),
+                queuedAtMono=pending.get("queued_at_mono"),
             )
+            if reason == "before_request_window":
+                session.state.last_dc101 = None
+                session.state.last_dc101_at_mono = None
+                session.state.last_dc101_frame_hex = None
 
         if now >= float(pending["deadline_mono"]):
             # Quarantine: late DC101 must not satisfy the next same-address/COUN TX.
