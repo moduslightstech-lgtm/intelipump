@@ -741,8 +741,10 @@ class ControllerLoop:
             return ("eot", False, first_byte_marked)
 
         if frame.control_type is ControlType.DATA:
+            # last_byte matches command-response path; first_byte can predate
+            # CD101 TX when demux was mid-frame and break meter correlation.
             ack = session.handle_response_frame(
-                frame, capture_mono=stamped.first_byte_time
+                frame, capture_mono=stamped.last_byte_time
             )
             if ack is not None:
                 await self._write_frame(ack, address=session.address, note="ACK")

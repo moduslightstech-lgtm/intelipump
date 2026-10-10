@@ -703,7 +703,10 @@ class PumpSession:
             # Do not decode, do not mutate state, do not ACK.
             return None
 
-        # Duplicate DATA: ACK, do not re-apply application events.
+        # Duplicate DATA: ACK, do not re-apply sale/SM events.
+        # Exception: refresh last_dc101 — Wayne often reuses the DATA sequence on
+        # CD101 replies; skipping decode left meter correlation stuck on a
+        # pre-request observation (before_request_window → false TIMEOUT).
         if (
             self.state.last_accepted_rx_sequence is not None
             and frame.sequence == self.state.last_accepted_rx_sequence
@@ -712,6 +715,9 @@ class PumpSession:
             self._mark_valid_response(kind="DATA", capture_mono=capture_mono)
             self._set_communication(CommunicationHealth.HEALTHY)
             self._clear_transient_communication_error()
+            self._refresh_meter_dc101_from_frame(
+                frame, capture_mono=capture_mono
+            )
             ack = build_ack(self.wire_address, frame.sequence)
             self.state.stats.ack_sent_count += 1
             self.events.publish(
@@ -788,6 +794,32 @@ class PumpSession:
             )
         )
         return ack
+
+    def _refresh_meter_dc101_from_frame(
+        self, frame: DartLineFrame, *, capture_mono: float | None = None
+    ) -> bool:
+        """Update last_dc101 only (safe on duplicate DATA). Returns True if set."""
+        del capture_mono  # apply-time stamp; see obs_mono below
+        bundle = decode_data_payload(
+            frame.payload,
+            pump_address=self.address,
+            line_sequence=frame.sequence,
+            source_frame_raw_hex=frame.raw_frame.hex(" "),
+        )
+        # Prefer decode/apply time over first-byte: assembler first_byte can
+        # predate our CD101 TX when a prior frame was mid-assembly.
+        obs_mono = time.monotonic()
+        for tx in bundle.transactions:
+            if tx.transaction_type.value != "DC101_TOTAL_COUNTERS":
+                continue
+            decoded = tx.decoded_body or {}
+            self.state.last_dc101 = (
+                dict(decoded) if isinstance(decoded, dict) else {"raw": decoded}
+            )
+            self.state.last_dc101_at_mono = obs_mono
+            self.state.last_dc101_frame_hex = tx.source_frame_raw_hex
+            return True
+        return False
 
     def _decode_and_apply(
         self, frame: DartLineFrame, *, capture_mono: float | None = None
@@ -889,10 +921,12 @@ class PumpSession:
                 # Cumulative totalizer only. Never touch sale face, evidence,
                 # or the state machine — CD101/DC101 must not interfere with
                 # nozzle-lift / authorize / dispense paths.
+                # Stamp with apply-time so first_byte from a stale assemble
+                # cannot mark a live reply as before_request_window.
                 self.state.last_dc101 = (
                     dict(decoded) if isinstance(decoded, dict) else {"raw": decoded}
                 )
-                self.state.last_dc101_at_mono = obs_mono
+                self.state.last_dc101_at_mono = time.monotonic()
                 self.state.last_dc101_frame_hex = tx.source_frame_raw_hex
                 continue
             if isinstance(raw_volume, int):
