@@ -58,11 +58,15 @@ class FrameStreamAssembler:
         return events
 
     def _feed_byte(self, byte: int) -> list[AssemblerEvent]:
+        # DLE escapes only SF. DLE + non-SF ⇒ literal DLE; re-process the
+        # following byte (may start another escape: wire ``10 10 FA``).
         if self._after_dle:
             self._after_dle = False
-            self._buf.append(byte)
-            # Escaped SF is data, not a terminator.
-            return self._check_overflow()
+            if byte == SF:
+                # Escaped SF is data, not a terminator.
+                self._buf.append(byte)
+                return self._check_overflow()
+            return self._feed_byte(byte)
 
         if byte == DLE:
             self._buf.append(DLE)

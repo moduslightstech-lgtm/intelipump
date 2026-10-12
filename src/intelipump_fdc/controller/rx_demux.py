@@ -200,19 +200,25 @@ class AddressFrameDemux:
             n = len(raw)
             times = self._pending_byte_times[:n]
             del self._pending_byte_times[:n]
-            first = (
-                times[0]
-                if times
-                else (
-                    self._frame_first_byte_time
-                    if self._frame_first_byte_time is not None
-                    else last_byte_time
-                )
-            )
-            last = times[-1] if times else last_byte_time
+            # Prefer exact per-byte capture times. If the pending queue was
+            # drained by a prior REJECTED/resync, never inherit a sticky
+            # first-byte from an earlier address poll — use this chunk's
+            # last_byte_time so post-TX replies are not marked stale.
+            if len(times) == n and n > 0:
+                first = times[0]
+                last = times[-1]
+            elif times:
+                first = times[0]
+                last = last_byte_time
+            else:
+                first = last_byte_time
+                last = last_byte_time
             self._frame_first_byte_time = None
             return self._enqueue_frame(event.frame, raw=raw, first=first, last=last)
 
+        # REJECTED / OVERFLOW / PARTIAL: drop timestamp ownership for the
+        # rejected candidate only. Do not leave a sticky first-byte that
+        # subsequent short replies (e.g. 51 70 FA) would inherit.
         if event.raw:
             n = min(len(event.raw), len(self._pending_byte_times))
             del self._pending_byte_times[:n]

@@ -171,10 +171,16 @@ class LegacyIgemStreamAssembler:
         return self._feed_data_body(byte)
 
     def _feed_data_body(self, byte: int) -> list[AssemblerEvent]:
+        # DLE escapes only SF (see escaping.unescape_dle). A DLE followed by a
+        # non-SF byte is a literal 0x10; the following byte must be processed
+        # normally (it may itself start a new DLE escape, e.g. wire 10 10 FA).
         if self._after_dle:
             self._after_dle = False
-            self._buf.append(byte)
-            return self._check_overflow()
+            if byte == SF:
+                # Escaped SF is payload/CRC data — never a frame terminator.
+                self._buf.append(byte)
+                return self._check_overflow()
+            return self._feed_data_body(byte)
 
         if byte == DLE:
             self._buf.append(DLE)
@@ -276,6 +282,14 @@ class LegacyIgemStreamAssembler:
         )
 
     def _reject_and_resync(self, raw: bytes, message: str) -> list[AssemblerEvent]:
+        """Reject a candidate and return to HUNT.
+
+        Do **not** resynchronize onto ADR-looking bytes inside the rejected
+        candidate. Payload bytes such as ``0x51`` are not frame starts; hunting
+        inside a rejected DATA body corrupts trailing bytes / timestamps and
+        can invent short frames (e.g. ``51 00 03``). Subsequent stream bytes
+        (not yet consumed) continue from HUNT via the normal feed path.
+        """
         events = [
             AssemblerEvent(
                 kind=AssemblerEventKind.REJECTED,
@@ -284,15 +298,12 @@ class LegacyIgemStreamAssembler:
                 captured=self._view_from_raw(raw),
             )
         ]
+        # Preserve rejected bytes for diagnostics; do not re-feed them.
+        if len(raw) > 1:
+            self._discarded.extend(raw[1:])
         self._buf.clear()
         self._after_dle = False
         self._state = _State.HUNT
-        for idx, b in enumerate(raw[1:], start=1):
-            if b in LEGACY_IGEM_WIRE_ADDRESS_SET:
-                for rest in raw[idx:]:
-                    events.extend(self._feed_byte(rest))
-                break
-            self._discarded.append(b)
         return events
 
     def _check_overflow(self) -> list[AssemblerEvent]:
