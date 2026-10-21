@@ -298,6 +298,53 @@ async def test_link_ack_awaits_verify_not_sticky_programmed(
     assert loop._startup_price_state[1] == "verified"
 
 
+def test_startup_price_mark_throttles_repeated_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _loop()
+    calls: list[dict] = []
+
+    def _capture(*_a: object, **kwargs: object) -> None:
+        calls.append(dict(kwargs))
+
+    monkeypatch.setattr(
+        "intelipump_fdc.controller.controller_loop.logger.info",
+        _capture,
+    )
+    loop._startup_price_mark(
+        1,
+        "deferred",
+        reason="eligible_nozzle_stale",
+        evidenceGap="face_mismatch",
+    )
+    loop._startup_price_mark(
+        1,
+        "deferred",
+        reason="eligible_nozzle_stale",
+        evidenceGap="face_mismatch",
+    )
+    assert len(calls) == 1
+    # Different reason still logs immediately.
+    loop._startup_price_mark(
+        1,
+        "deferred",
+        reason="eligible_busy",
+        evidenceGap="busy_live_sale",
+    )
+    assert len(calls) == 2
+    # After throttle window, same key logs again.
+    loop._set_price_defer_log_at[
+        "startup_price_mark:1:deferred:eligible_nozzle_stale:face_mismatch"
+    ] = time.monotonic() - 31.0
+    loop._startup_price_mark(
+        1,
+        "deferred",
+        reason="eligible_nozzle_stale",
+        evidenceGap="face_mismatch",
+    )
+    assert len(calls) == 3
+
+
 @pytest.mark.asyncio
 async def test_unpersisted_completed_sale_defers_without_cd5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

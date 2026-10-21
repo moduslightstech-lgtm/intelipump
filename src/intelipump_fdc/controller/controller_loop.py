@@ -1787,6 +1787,17 @@ class ControllerLoop:
     ) -> None:
         prev = self._startup_price_state.get(addr)
         self._startup_price_state[addr] = state
+        # Deferred / waiting states are polled every tick — log once, then at
+        # most every 30s while reason/evidenceGap stay the same.
+        if state in {"deferred", "awaiting_verify", "failed"}:
+            gap = extra.get("evidenceGap", "")
+            throttle_key = f"startup_price_mark:{addr}:{state}:{reason}:{gap}"
+            now = time.monotonic()
+            if prev == state:
+                last = self._set_price_defer_log_at.get(throttle_key)
+                if last is not None and (now - last) < 30.0:
+                    return
+            self._set_price_defer_log_at[throttle_key] = now
         logger.info(
             "startup_price_restore",
             address=addr,
