@@ -291,3 +291,44 @@ def test_exclusive_request_and_correlation_scoped_result(tmp_path, monkeypatch) 
         MeterReadRequest(correlation_id="ddd-444", dart_address=2, counter_select=1)
     )
     assert json.loads(bridge.request_path().read_text())["dartAddress"] == 2
+
+
+def test_stale_inflight_auto_expires_so_startup_can_queue(
+    tmp_path, monkeypatch
+) -> None:
+    """Abandoned inflight (e.g. Oct-9 crash) must not block forever."""
+    import os
+    import time
+
+    monkeypatch.setenv("INTELIPUMP_METER_READ_REQUEST_DIR", str(tmp_path))
+    inflight = bridge.inflight_path()
+    inflight.write_text(
+        json.dumps(
+            {
+                "correlationId": "stale-old",
+                "dartAddress": 2,
+                "counterSelect": 1,
+                "startupOpening": True,
+                "slot": "OPENING",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Age the file beyond DEFAULT_REQUEST_MAX_AGE_S (120s).
+    old = time.time() - 600
+    os.utime(inflight, (old, old))
+
+    assert bridge.request_busy() is False
+    assert not inflight.is_file()
+
+    # Bridge is free — startup OPENING can write again.
+    bridge.write_meter_read_request(
+        MeterReadRequest(
+            correlation_id="fresh-opening",
+            dart_address=1,
+            counter_select=1,
+            slot="OPENING",
+            startup_opening=True,
+        )
+    )
+    assert bridge.request_path().is_file()

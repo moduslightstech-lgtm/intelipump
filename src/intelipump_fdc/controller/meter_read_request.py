@@ -135,23 +135,41 @@ def _load_request_file(path: Path) -> MeterReadRequest | None:
 
 def request_busy(*, max_age_s: float = DEFAULT_REQUEST_MAX_AGE_S) -> bool:
     """True if an exclusive request or inflight claim currently owns the bridge."""
-    _expire_stale_request(max_age_s=max_age_s)
+    _expire_stale_bridge_files(max_age_s=max_age_s)
     return request_path().is_file() or inflight_path().is_file()
 
 
-def _expire_stale_request(*, max_age_s: float) -> None:
-    path = request_path()
+def _expire_stale_path(path: Path, *, max_age_s: float) -> bool:
+    """Unlink path if older than max_age_s. Returns True if removed."""
     if not path.is_file():
-        return
+        return False
     try:
         age = time_monotonic_file_age_s(path)
     except OSError:
-        return
-    if age is not None and age > float(max_age_s):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        return False
+    if age is None or age <= float(max_age_s):
+        return False
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _expire_stale_bridge_files(*, max_age_s: float) -> None:
+    """Drop stale request and inflight so a crashed claim cannot block forever.
+
+    Request already expired after ``max_age_s``. Inflight used to live forever
+    (pump-3 Oct 9 file blocked morning OPENING until manually removed).
+    CD101 response timeout is ~8s — 120s is a safe abandoned-claim ceiling.
+    """
+    _expire_stale_path(request_path(), max_age_s=max_age_s)
+    _expire_stale_path(inflight_path(), max_age_s=max_age_s)
+
+
+# Back-compat alias for callers/tests that imported the old name.
+def _expire_stale_request(*, max_age_s: float) -> None:
+    _expire_stale_bridge_files(max_age_s=max_age_s)
 
 
 def time_monotonic_file_age_s(path: Path) -> float | None:
@@ -164,7 +182,7 @@ def time_monotonic_file_age_s(path: Path) -> float | None:
 
 def write_meter_read_request(req: MeterReadRequest) -> Path:
     """Atomically create the sole request file (O_EXCL). Raises FileExistsError if busy."""
-    _expire_stale_request(max_age_s=DEFAULT_REQUEST_MAX_AGE_S)
+    _expire_stale_bridge_files(max_age_s=DEFAULT_REQUEST_MAX_AGE_S)
     path = request_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if inflight_path().is_file() or path.is_file():
@@ -189,6 +207,7 @@ def read_meter_read_request() -> MeterReadRequest | None:
 
 def claim_meter_read_request() -> MeterReadRequest | None:
     """Atomically move request → inflight and return it. None if nothing to claim."""
+    _expire_stale_bridge_files(max_age_s=DEFAULT_REQUEST_MAX_AGE_S)
     src = request_path()
     dst = inflight_path()
     if not src.is_file():
