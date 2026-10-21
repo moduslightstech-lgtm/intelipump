@@ -98,9 +98,12 @@ class CloudRuntime:
     def health_dict(self) -> dict[str, Any]:
         meta = self.mqtt.metadata
         pending = self._stats_extra.get("pendingOutboxCount")
+        sqlite_ok = not bool(
+            self.sync_worker and self.sync_worker.stats.database_degraded
+        )
         return {
             "processRunning": self.started,
-            "sqliteHealthy": True,
+            "sqliteHealthy": sqlite_ok,
             "mqttEnabled": self.enabled,
             "mqttConnected": self.mqtt.is_connected,
             "mqttHost": f"{meta.host}:{meta.port}" if meta.host else None,
@@ -132,9 +135,13 @@ class CloudRuntime:
             "syncDeliveredCount": self.sync_stats.delivered,
             "syncFailedCount": self.sync_stats.failed,
             "connectivityStatus": (
-                "ONLINE"
-                if self.mqtt.is_connected
-                else ("DEGRADED" if self.started else "OFFLINE")
+                "DEGRADED"
+                if not sqlite_ok
+                else (
+                    "ONLINE"
+                    if self.mqtt.is_connected
+                    else ("DEGRADED" if self.started else "OFFLINE")
+                )
             ),
         }
 
@@ -185,6 +192,7 @@ class CloudRuntime:
             simulated=simulated,
             channel_mappings=channel_mappings,
         )
+        db = self.settings.database
         self.sync_worker = SyncWorker(
             session_factory=self.session_factory,
             mqtt=self.mqtt,
@@ -196,6 +204,11 @@ class CloudRuntime:
             require_application_sale_ack=bool(
                 getattr(self.settings.mqtt, "require_application_sale_ack", False)
             ),
+            delivered_retention_days=int(db.delivered_sync_queue_retention_days),
+            prune_batch_size=int(db.sync_queue_prune_batch_size),
+            prune_interval_seconds=float(db.sync_queue_prune_interval_seconds),
+            total_alert_threshold=int(db.sync_queue_total_alert_threshold),
+            pending_alert_threshold=int(db.sync_queue_pending_alert_threshold),
         )
         self.heartbeat = HeartbeatService(
             mqtt=self.mqtt,

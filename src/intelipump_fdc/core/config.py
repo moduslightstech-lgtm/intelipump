@@ -56,12 +56,18 @@ class SafetySettings(BaseModel):
 
 class DatabaseSettings(BaseModel):
     url: str = "sqlite+aiosqlite:///./data/intelipump.db"
-    # Retention knobs only — deletion not implemented in Phase 7.
+    # Most retention knobs are still future; delivered sync_queue prune runs
+    # in intelipump-cloud-sync only (never on the RS-485 controller path).
     raw_frames_retention_days: int = Field(default=30, ge=1)
     state_snapshot_retention_days: int = Field(default=14, ge=1)
     transaction_retention_days: int = Field(default=365, ge=1)
     audit_retention_days: int = Field(default=730, ge=1)
     delivered_sync_queue_retention_days: int = Field(default=30, ge=1)
+    sync_queue_prune_batch_size: int = Field(default=500, ge=1, le=5000)
+    sync_queue_prune_interval_seconds: float = Field(default=300.0, ge=30.0)
+    # Soft alerts only (journal); never restart the controller.
+    sync_queue_total_alert_threshold: int = Field(default=20000, ge=1000)
+    sync_queue_pending_alert_threshold: int = Field(default=5000, ge=100)
 
 
 class MqttSettings(BaseModel):

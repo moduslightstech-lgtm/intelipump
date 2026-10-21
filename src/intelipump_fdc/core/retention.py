@@ -1,4 +1,9 @@
-"""Retention configuration models only (no deletion implemented)."""
+"""Retention configuration models.
+
+Delivered ``sync_queue`` prune is implemented in cloud-sync
+(``SyncWorker`` / ``SyncQueueRepository.delete_delivered_older_than``).
+Other tables are still knobs-only.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,7 @@ from pydantic import BaseModel, Field
 
 
 class RetentionSettings(BaseModel):
-    """Future retention knobs. Unresolved txs and undelivered queue items
+    """Retention knobs. Unresolved txs and undelivered queue items
     must never be deleted by automated retention."""
 
     raw_frames_days: int = Field(default=30, ge=1)

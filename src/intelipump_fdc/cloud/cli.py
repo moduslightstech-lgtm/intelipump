@@ -9,6 +9,8 @@ import json
 import signal
 from datetime import UTC, datetime
 
+import structlog
+
 from intelipump_fdc.cloud.mqtt.fake import FakeMqttClient
 from intelipump_fdc.cloud.runtime import CloudRuntime
 from intelipump_fdc.core.config import get_settings
@@ -19,8 +21,11 @@ from intelipump_fdc.persistence.database import (
     dispose_engine,
 )
 from intelipump_fdc.persistence.migrations import init_schema
+from intelipump_fdc.persistence.sqlite_health import sqlite_quick_check
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 from intelipump_fdc.services.recovery_service import RecoveryService
+
+logger = structlog.get_logger(__name__)
 
 
 def build_parser(settings: object | None = None) -> argparse.ArgumentParser:
@@ -107,32 +112,69 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     engine = create_engine(args.database_url)
     await configure_sqlite_pragmas(engine)
-    await init_schema(engine)
+
+    # Integrity gate is cloud-sync only. Corrupt DB → degrade MQTT outbox;
+    # never stop or restart intelipump.service from this path.
+    db_ok, db_detail = await sqlite_quick_check(engine)
+    db_degraded = not db_ok
+    if db_degraded:
+        logger.error(
+            "cloud_sync_sqlite_corrupt",
+            detail=db_detail,
+            action="degraded_no_outbox",
+            controllerUntouched=True,
+        )
+
+    report_warnings: list[str] = []
+    if not db_degraded:
+        await init_schema(engine)
     factory = create_session_factory(engine)
-    recovery = RecoveryService(
-        engine,
-        factory,
-        station_id=args.station_id,
-        environment=settings.environment,
-    )
-    await recovery.ensure_pumps((1, 2))
-    report = await recovery.recover()
+    if not db_degraded:
+        recovery = RecoveryService(
+            engine,
+            factory,
+            station_id=args.station_id,
+            environment=settings.environment,
+        )
+        try:
+            await recovery.ensure_pumps((1, 2))
+            report = await recovery.recover()
+            report_warnings = list(report.warnings)
+        except Exception as exc:  # noqa: BLE001 — stay up for ops visibility
+            logger.exception("cloud_sync_recovery_failed")
+            report_warnings.append(f"{type(exc).__name__}: {exc}")
+            db_degraded = True
+            db_detail = report_warnings[-1]
 
     started = datetime.now(UTC)
 
     async def payload_provider() -> dict[str, object]:
         pending = 0
         unresolved = 0
-        async with unit_of_work(factory) as uow:
-            pending = await uow.sync_queue.pending_count()
-            unresolved = len(
-                await uow.transactions.list_unresolved(station_id=args.station_id)
-            )
+        status = "DEGRADED" if db_degraded else "ONLINE"
+        db_status = "CORRUPT" if db_degraded else "OK"
+        if not db_degraded:
+            try:
+                async with unit_of_work(factory) as uow:
+                    pending = await uow.sync_queue.pending_count()
+                    unresolved = len(
+                        await uow.transactions.list_unresolved(
+                            station_id=args.station_id
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "cloud_sync_heartbeat_db_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                status = "DEGRADED"
+                db_status = "ERROR"
         return {
             "controllerMode": settings.controller.mode.value,
-            "status": "ONLINE",
+            "status": status,
             "uptimeSeconds": (datetime.now(UTC) - started).total_seconds(),
-            "databaseStatus": "OK",
+            "databaseStatus": db_status,
+            "databaseDetail": db_detail if db_degraded else None,
             # Sidecar does not own the Wayne loop. Do not report pumps as
             # disconnected — that made the digital twin paint both nozzles red.
             "controllerLoopRunning": True,
@@ -169,6 +211,8 @@ async def _async_main(args: argparse.Namespace) -> None:
             loop.add_signal_handler(sig, _signal)
 
     await cloud.start()
+    if db_degraded and cloud.sync_worker is not None:
+        cloud.sync_worker.mark_database_degraded(detail=db_detail)
     if args.log_messages and isinstance(mqtt, FakeMqttClient):
         print(json.dumps({"fake_mqtt": True, "host": args.mqtt_host}))
 
@@ -181,22 +225,29 @@ async def _async_main(args: argparse.Namespace) -> None:
         pass
     finally:
         await cloud.stop()
-        pending, age, delivered, failed = await cloud.pending_sync_snapshot()
+        pending, age, delivered, failed = (0, None, 0, 0)
+        if not db_degraded:
+            pending, age, delivered, failed = await cloud.pending_sync_snapshot()
         stats = {
             # session_* = this process run; db_*_total = lifetime SQLite counters
             "session_delivered": cloud.sync_stats.delivered,
             "session_failed": cloud.sync_stats.failed,
+            "session_pruned_delivered": cloud.sync_stats.pruned_delivered,
             "pending": pending,
             "oldest_pending_age_seconds": age,
             "db_delivered_total": delivered,
             "db_failed_total": failed,
+            "database_degraded": bool(
+                db_degraded or cloud.sync_stats.database_degraded
+            ),
+            "database_detail": db_detail if db_degraded else None,
             "online_published": cloud.online_published,
             "heartbeat_last_published_at": (
                 cloud.heartbeat.last_published_at.isoformat()
                 if cloud.heartbeat and cloud.heartbeat.last_published_at
                 else None
             ),
-            "recovery_warnings": list(report.warnings)[:10],
+            "recovery_warnings": report_warnings[:10],
             "mqtt_connected": cloud.mqtt.is_connected,
             # Back-compat aliases (session counts / lifetime DB totals)
             "delivered": cloud.sync_stats.delivered,

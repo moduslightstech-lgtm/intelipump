@@ -100,3 +100,127 @@ async def test_failed_queue_retry_metadata(engine_factory: tuple) -> None:
             available = available.replace(tzinfo=UTC)
         assert available > datetime.now(UTC)
         await uow.sync_queue.mark_delivered(claimed[0].id)
+
+
+@pytest.mark.asyncio
+async def test_delete_delivered_older_than_preserves_pending(
+    engine_factory: tuple,
+) -> None:
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        old = await uow.sync_queue.enqueue(
+            entity_type="transaction",
+            entity_id="tx-old",
+            event_type="TRANSACTION_COMPLETED",
+            payload={},
+            deduplication_key="old-delivered",
+        )
+        pending = await uow.sync_queue.enqueue(
+            entity_type="transaction",
+            entity_id="tx-pending",
+            event_type="TRANSACTION_COMPLETED",
+            payload={},
+            deduplication_key="still-pending",
+        )
+        assert old is not None and pending is not None
+        await uow.sync_queue.mark_delivered(old.id)
+
+        from sqlalchemy import select
+
+        from intelipump_fdc.persistence.models import SyncQueueRow
+
+        row = (
+            await uow.session.execute(
+                select(SyncQueueRow).where(SyncQueueRow.id == old.id)
+            )
+        ).scalar_one()
+        row.updated_at = datetime.now(UTC) - timedelta(days=45)
+        await uow.session.flush()
+
+        deleted = await uow.sync_queue.delete_delivered_older_than(
+            older_than_days=30, limit=500
+        )
+        assert deleted == 1
+        assert await uow.sync_queue.pending_count() == 1
+        assert await uow.sync_queue.delivered_count() == 0
+        assert await uow.sync_queue.total_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_delivered_respects_batch_limit(
+    engine_factory: tuple,
+) -> None:
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        ids: list[str] = []
+        for i in range(5):
+            item = await uow.sync_queue.enqueue(
+                entity_type="transaction",
+                entity_id=f"tx-{i}",
+                event_type="TRANSACTION_COMPLETED",
+                payload={},
+                deduplication_key=f"batch-{i}",
+            )
+            assert item is not None
+            await uow.sync_queue.mark_delivered(item.id)
+            ids.append(item.id)
+
+        from sqlalchemy import select
+
+        from intelipump_fdc.persistence.models import SyncQueueRow
+
+        cutoff = datetime.now(UTC) - timedelta(days=40)
+        for row_id in ids:
+            row = (
+                await uow.session.execute(
+                    select(SyncQueueRow).where(SyncQueueRow.id == row_id)
+                )
+            ).scalar_one()
+            row.updated_at = cutoff
+        await uow.session.flush()
+
+        deleted = await uow.sync_queue.delete_delivered_older_than(
+            older_than_days=30, limit=2
+        )
+        assert deleted == 2
+        assert await uow.sync_queue.delivered_count() == 3
+        deleted2 = await uow.sync_queue.delete_delivered_older_than(
+            older_than_days=30, limit=10
+        )
+        assert deleted2 == 3
+        assert await uow.sync_queue.delivered_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_delivered_never_touches_awaiting_app_ack(
+    engine_factory: tuple,
+) -> None:
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        item = await uow.sync_queue.enqueue(
+            entity_type="transaction",
+            entity_id="tx-ack",
+            event_type="TRANSACTION_COMPLETED",
+            payload={},
+            deduplication_key="awaiting-ack",
+        )
+        assert item is not None
+        await uow.sync_queue.mark_awaiting_app_ack(item.id)
+
+        from sqlalchemy import select
+
+        from intelipump_fdc.persistence.models import SyncQueueRow
+
+        row = (
+            await uow.session.execute(
+                select(SyncQueueRow).where(SyncQueueRow.id == item.id)
+            )
+        ).scalar_one()
+        row.updated_at = datetime.now(UTC) - timedelta(days=90)
+        await uow.session.flush()
+
+        deleted = await uow.sync_queue.delete_delivered_older_than(
+            older_than_days=30, limit=100
+        )
+        assert deleted == 0
+        assert await uow.sync_queue.awaiting_app_ack_count() == 1

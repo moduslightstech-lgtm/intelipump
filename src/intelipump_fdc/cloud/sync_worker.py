@@ -15,6 +15,7 @@ from intelipump_fdc.cloud.backoff import compute_backoff_seconds
 from intelipump_fdc.cloud.delivery import DeliveryMapper
 from intelipump_fdc.cloud.mqtt.base import MqttClient
 from intelipump_fdc.cloud.mqtt.errors import MqttError, MqttNotConnectedError
+from intelipump_fdc.persistence.sqlite_health import looks_like_sqlite_corruption
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 
 logger = structlog.get_logger(__name__)
@@ -25,8 +26,11 @@ class SyncWorkerStats:
     delivered: int = 0
     failed: int = 0
     skipped_malformed: int = 0
+    pruned_delivered: int = 0
     last_delivery_at: datetime | None = None
+    last_prune_at: datetime | None = None
     last_error: str | None = None
+    database_degraded: bool = False
 
 
 @dataclass
@@ -39,9 +43,17 @@ class SyncWorker:
     stale_lock_seconds: int = 60
     max_attempts: int = 20
     require_application_sale_ack: bool = False
+    # Delivered outbox prune (cloud-sync only; never touches controller).
+    delivered_retention_days: int = 30
+    prune_batch_size: int = 500
+    prune_interval_seconds: float = 300.0
+    total_alert_threshold: int = 20000
+    pending_alert_threshold: int = 5000
     stats: SyncWorkerStats = field(default_factory=SyncWorkerStats)
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
+    _last_prune_monotonic: float = field(default=0.0, repr=False)
+    _size_alert_latched: bool = field(default=False, repr=False)
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -57,20 +69,85 @@ class SyncWorker:
                 self._task.cancel()
             self._task = None
 
+    def mark_database_degraded(self, *, detail: str) -> None:
+        """Fail closed on outbox publish; controller service is untouched."""
+        self.stats.database_degraded = True
+        self.stats.last_error = detail
+        logger.error("sync_worker_database_degraded", detail=detail)
+
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                if self.stats.database_degraded:
+                    await asyncio.sleep(self.poll_interval_seconds)
+                    continue
                 if not self.mqtt.is_connected:
                     await asyncio.sleep(self.poll_interval_seconds)
                     continue
                 await self._cycle()
             except Exception as exc:
                 self.stats.last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("sync_worker_cycle_error", error=self.stats.last_error)
+                if looks_like_sqlite_corruption(exc):
+                    self.mark_database_degraded(detail=self.stats.last_error)
+                else:
+                    logger.warning(
+                        "sync_worker_cycle_error", error=self.stats.last_error
+                    )
             await asyncio.sleep(self.poll_interval_seconds)
 
+    async def _maybe_prune_and_alert(self) -> None:
+        now = asyncio.get_running_loop().time()
+        due = (now - self._last_prune_monotonic) >= float(self.prune_interval_seconds)
+        if not due and self._last_prune_monotonic > 0:
+            return
+        self._last_prune_monotonic = now
+        try:
+            async with unit_of_work(self.session_factory) as uow:
+                deleted = await uow.sync_queue.delete_delivered_older_than(
+                    older_than_days=self.delivered_retention_days,
+                    limit=self.prune_batch_size,
+                )
+                pending = await uow.sync_queue.pending_count()
+                total = await uow.sync_queue.total_count()
+            if deleted:
+                self.stats.pruned_delivered += deleted
+                self.stats.last_prune_at = datetime.now(UTC)
+                logger.info(
+                    "sync_queue_delivered_pruned",
+                    deleted=deleted,
+                    retentionDays=self.delivered_retention_days,
+                    batchLimit=self.prune_batch_size,
+                )
+            over_total = total >= int(self.total_alert_threshold)
+            over_pending = pending >= int(self.pending_alert_threshold)
+            if over_total or over_pending:
+                if not self._size_alert_latched:
+                    self._size_alert_latched = True
+                    logger.warning(
+                        "sync_queue_size_alert",
+                        totalCount=total,
+                        pendingCount=pending,
+                        totalThreshold=self.total_alert_threshold,
+                        pendingThreshold=self.pending_alert_threshold,
+                    )
+            else:
+                self._size_alert_latched = False
+        except Exception as exc:
+            if looks_like_sqlite_corruption(exc):
+                self.mark_database_degraded(
+                    detail=f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                logger.warning(
+                    "sync_queue_prune_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
     async def _cycle(self) -> None:
-        if not self.mqtt.is_connected:
+        if not self.mqtt.is_connected or self.stats.database_degraded:
+            return
+        await self._maybe_prune_and_alert()
+        if self.stats.database_degraded:
             return
         async with unit_of_work(self.session_factory) as uow:
             await uow.sync_queue.release_stale_locks(

@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from intelipump_fdc.persistence.dto import SyncQueueRecord
@@ -304,6 +304,44 @@ class SyncQueueRepository:
             .where(SyncQueueRow.status == "DELIVERED")
         )
         return int(result.scalar_one())
+
+    async def total_count(self) -> int:
+        result = await self._session.execute(
+            select(func.count()).select_from(SyncQueueRow)
+        )
+        return int(result.scalar_one())
+
+    async def delete_delivered_older_than(
+        self,
+        *,
+        older_than_days: int,
+        limit: int = 500,
+    ) -> int:
+        """Delete old DELIVERED outbox rows only (never PENDING / CLAIMED / ACK).
+
+        Batched so cloud-sync never holds a long write lock against the
+        controller. Uses ``updated_at`` (set when marked DELIVERED).
+        """
+        if older_than_days < 1 or limit < 1:
+            return 0
+        cutoff = datetime.now(UTC) - timedelta(days=int(older_than_days))
+        id_result = await self._session.execute(
+            select(SyncQueueRow.id)
+            .where(
+                SyncQueueRow.status == "DELIVERED",
+                SyncQueueRow.updated_at < cutoff,
+            )
+            .order_by(SyncQueueRow.updated_at.asc())
+            .limit(int(limit))
+        )
+        ids = list(id_result.scalars().all())
+        if not ids:
+            return 0
+        await self._session.execute(
+            delete(SyncQueueRow).where(SyncQueueRow.id.in_(ids))
+        )
+        await self._session.flush()
+        return len(ids)
 
     async def failed_count(self) -> int:
         """Rows permanently failed or pending with prior errors."""
