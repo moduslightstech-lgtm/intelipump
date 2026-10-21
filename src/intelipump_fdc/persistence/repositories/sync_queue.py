@@ -343,6 +343,34 @@ class SyncQueueRepository:
         await self._session.flush()
         return len(ids)
 
+    async def delete_failed_older_than(
+        self,
+        *,
+        older_than_days: int,
+        limit: int = 500,
+    ) -> int:
+        """Delete old terminal FAILED outbox rows only (never PENDING/CLAIMED/ACK)."""
+        if older_than_days < 1 or limit < 1:
+            return 0
+        cutoff = datetime.now(UTC) - timedelta(days=int(older_than_days))
+        id_result = await self._session.execute(
+            select(SyncQueueRow.id)
+            .where(
+                SyncQueueRow.status == "FAILED",
+                SyncQueueRow.updated_at < cutoff,
+            )
+            .order_by(SyncQueueRow.updated_at.asc())
+            .limit(int(limit))
+        )
+        ids = list(id_result.scalars().all())
+        if not ids:
+            return 0
+        await self._session.execute(
+            delete(SyncQueueRow).where(SyncQueueRow.id.in_(ids))
+        )
+        await self._session.flush()
+        return len(ids)
+
     async def failed_count(self) -> int:
         """Rows permanently failed or pending with prior errors."""
         result = await self._session.execute(

@@ -24,6 +24,7 @@ from intelipump_fdc.persistence.database import (
     dispose_engine,
 )
 from intelipump_fdc.persistence.migrations import init_schema
+from intelipump_fdc.persistence.sqlite_health import sqlite_quick_check
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 from intelipump_fdc.services.lab_persistence import _persist_recovery_path
 from intelipump_fdc.services.persist_recovery import PersistRecoveryStore
@@ -109,11 +110,21 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 transport_kind = meta.kind
                 transport_open = app_state.controller_loop.runtime.transport.is_open
         started_at = app_state.started_at if app_state else datetime.now(UTC)
+        db_status = "OK"
+        status = "ONLINE"
+        if (
+            app_state is not None
+            and app_state.cloud is not None
+            and app_state.cloud.sync_worker is not None
+            and app_state.cloud.sync_worker.stats.database_degraded
+        ):
+            db_status = "CORRUPT"
+            status = "DEGRADED"
         return {
             "controllerMode": settings.controller.mode.value,
-            "status": "ONLINE",
+            "status": status,
             "uptimeSeconds": (datetime.now(UTC) - started_at).total_seconds(),
-            "databaseStatus": "OK",
+            "databaseStatus": db_status,
             "controllerLoopRunning": loop_running,
             "transportKind": transport_kind,
             "transportOpen": transport_open,
@@ -147,6 +158,15 @@ async def app_lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.mqtt.enabled:
         await cloud.start()
         state.cloud = cloud
+        # Outbox integrity gate only — never abort the hose/controller loop.
+        db_ok, db_detail = await sqlite_quick_check(engine)
+        if not db_ok and cloud.sync_worker is not None:
+            cloud.sync_worker.mark_database_degraded(detail=db_detail)
+            logger.error(
+                "api_sqlite_outbox_degraded",
+                detail=db_detail,
+                controllerUntouched=True,
+            )
 
     broker.publish_typed(
         LiveEventType.CONTROLLER_RECOVERED,

@@ -192,6 +192,55 @@ async def test_delete_delivered_respects_batch_limit(
 
 
 @pytest.mark.asyncio
+async def test_delete_failed_older_than_preserves_pending(
+    engine_factory: tuple,
+) -> None:
+    _engine, factory = engine_factory
+    async with unit_of_work(factory) as uow:
+        failed = await uow.sync_queue.enqueue(
+            entity_type="transaction",
+            entity_id="tx-fail",
+            event_type="TRANSACTION_COMPLETED",
+            payload={},
+            deduplication_key="old-failed",
+        )
+        pending = await uow.sync_queue.enqueue(
+            entity_type="transaction",
+            entity_id="tx-pend",
+            event_type="TRANSACTION_COMPLETED",
+            payload={},
+            deduplication_key="keep-pending",
+        )
+        assert failed is not None and pending is not None
+        claimed = await uow.sync_queue.claim_batch(limit=1)
+        await uow.sync_queue.mark_failed(
+            claimed[0].id,
+            error="permanent",
+            backoff_seconds=1,
+            max_attempts=1,
+        )
+
+        from sqlalchemy import select
+
+        from intelipump_fdc.persistence.models import SyncQueueRow
+
+        row = (
+            await uow.session.execute(
+                select(SyncQueueRow).where(SyncQueueRow.id == failed.id)
+            )
+        ).scalar_one()
+        assert row.status == "FAILED"
+        row.updated_at = datetime.now(UTC) - timedelta(days=45)
+        await uow.session.flush()
+
+        deleted = await uow.sync_queue.delete_failed_older_than(
+            older_than_days=30, limit=100
+        )
+        assert deleted == 1
+        assert await uow.sync_queue.pending_count() == 1
+
+
+@pytest.mark.asyncio
 async def test_delete_delivered_never_touches_awaiting_app_ack(
     engine_factory: tuple,
 ) -> None:

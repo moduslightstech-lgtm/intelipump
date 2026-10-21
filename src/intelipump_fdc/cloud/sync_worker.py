@@ -30,6 +30,7 @@ class SyncWorkerStats:
     failed: int = 0
     skipped_malformed: int = 0
     pruned_delivered: int = 0
+    pruned_failed: int = 0
     last_delivery_at: datetime | None = None
     last_prune_at: datetime | None = None
     last_integrity_at: datetime | None = None
@@ -139,14 +140,20 @@ class SyncWorker:
                     older_than_days=self.delivered_retention_days,
                     limit=self.prune_batch_size,
                 )
+                deleted_failed = await uow.sync_queue.delete_failed_older_than(
+                    older_than_days=self.delivered_retention_days,
+                    limit=self.prune_batch_size,
+                )
                 pending = await uow.sync_queue.pending_count()
                 total = await uow.sync_queue.total_count()
-            if deleted:
+            if deleted or deleted_failed:
                 self.stats.pruned_delivered += deleted
+                self.stats.pruned_failed += deleted_failed
                 self.stats.last_prune_at = datetime.now(UTC)
                 logger.info(
-                    "sync_queue_delivered_pruned",
-                    deleted=deleted,
+                    "sync_queue_pruned",
+                    deletedDelivered=deleted,
+                    deletedFailed=deleted_failed,
                     retentionDays=self.delivered_retention_days,
                     batchLimit=self.prune_batch_size,
                 )

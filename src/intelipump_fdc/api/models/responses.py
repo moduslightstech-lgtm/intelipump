@@ -71,6 +71,8 @@ class ControllerHealthResponse(BaseModel):
     sync_failed_count: int = 0
     heartbeat_last_published_at: datetime | None = None
     cloud_command_subscription_active: bool = False
+    # True unless cloud-sync marked the shared SQLite outbox degraded.
+    sqlite_healthy: bool = True
 
 
 class ControllerMetricsResponse(BaseModel):

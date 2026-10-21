@@ -98,12 +98,19 @@ class CloudRuntime:
     def health_dict(self) -> dict[str, Any]:
         meta = self.mqtt.metadata
         pending = self._stats_extra.get("pendingOutboxCount")
-        sqlite_ok = not bool(
+        degraded = bool(
             self.sync_worker and self.sync_worker.stats.database_degraded
+        )
+        sqlite_ok = not degraded
+        degrade_detail = (
+            self.sync_worker.stats.last_error
+            if degraded and self.sync_worker is not None
+            else None
         )
         return {
             "processRunning": self.started,
             "sqliteHealthy": sqlite_ok,
+            "sqliteDegradedDetail": degrade_detail,
             "mqttEnabled": self.enabled,
             "mqttConnected": self.mqtt.is_connected,
             "mqttHost": f"{meta.host}:{meta.port}" if meta.host else None,

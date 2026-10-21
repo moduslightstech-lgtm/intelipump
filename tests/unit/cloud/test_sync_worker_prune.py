@@ -104,6 +104,62 @@ async def test_sync_worker_degraded_skips_cycle(
 
 
 @pytest.mark.asyncio
+async def test_sync_worker_prune_deletes_old_failed(
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with unit_of_work(db_factory) as uow:
+        item = await uow.sync_queue.enqueue(
+            entity_type="transaction",
+            entity_id="tx-fail",
+            event_type="TRANSACTION_COMPLETED",
+            payload={"environment": "LAB"},
+            deduplication_key="prune-failed",
+        )
+        assert item is not None
+        claimed = await uow.sync_queue.claim_batch(limit=1)
+        await uow.sync_queue.mark_failed(
+            claimed[0].id,
+            error="gone",
+            backoff_seconds=1,
+            max_attempts=1,
+        )
+        row = (
+            await uow.session.execute(
+                select(SyncQueueRow).where(SyncQueueRow.id == item.id)
+            )
+        ).scalar_one()
+        row.updated_at = datetime.now(UTC) - timedelta(days=40)
+        await uow.session.flush()
+
+    mqtt = FakeMqttClient(client_id="prune-failed")
+    await mqtt.connect()
+    worker = _worker(db_factory, mqtt)
+    await worker._maybe_prune_and_alert()
+    assert worker.stats.pruned_failed == 1
+
+
+@pytest.mark.asyncio
+async def test_health_dict_reports_sqlite_degraded(
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from intelipump_fdc.cloud.runtime import CloudRuntime
+    from intelipump_fdc.core.config import Settings
+
+    settings = Settings()
+    settings.mqtt.enabled = True
+    cloud = CloudRuntime.create(settings=settings, session_factory=db_factory)
+    # Build worker without full MQTT start
+    mqtt = FakeMqttClient(client_id="health-deg")
+    await mqtt.connect()
+    cloud.sync_worker = _worker(db_factory, mqtt)
+    cloud.sync_worker.mark_database_degraded(detail="simulated")
+    health = cloud.health_dict()
+    assert health["sqliteHealthy"] is False
+    assert health["sqliteDegradedDetail"] == "simulated"
+    assert health["connectivityStatus"] == "DEGRADED"
+
+
+@pytest.mark.asyncio
 async def test_sync_worker_periodic_integrity_ok(
     db_factory: async_sessionmaker[AsyncSession],
 ) -> None:

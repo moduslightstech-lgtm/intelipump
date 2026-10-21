@@ -104,9 +104,17 @@ async def controller_health(
         recovery = RecoverySummary(**summary)
 
     cloud = state.cloud.health_dict() if state.cloud is not None else {}
+    sqlite_healthy = True
     if state.cloud is not None:
         sync_delivered = max(sync_delivered, int(cloud.get("syncDeliveredCount", 0)))
         sync_failed = max(sync_failed, int(cloud.get("syncFailedCount", 0)))
+        if cloud.get("sqliteHealthy") is False:
+            sqlite_healthy = False
+            detail = cloud.get("sqliteDegradedDetail") or "outbox_corrupt"
+            warnings.append(f"sqlite_outbox_degraded:{detail}")
+            # Do not upgrade OFFLINE (shutdown) back to DEGRADED.
+            if status != "OFFLINE":
+                status = "DEGRADED"
 
     return ControllerHealthResponse(
         status=status,
@@ -145,6 +153,7 @@ async def controller_health(
         cloud_command_subscription_active=bool(
             cloud.get("cloudCommandSubscriptionActive", False)
         ),
+        sqlite_healthy=sqlite_healthy,
     )
 
 
