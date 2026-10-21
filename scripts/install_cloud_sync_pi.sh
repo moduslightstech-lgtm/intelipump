@@ -118,6 +118,12 @@ sudo systemctl daemon-reload
 "$VENV_BIN" --help >/dev/null
 echo "OK: ${VENV_BIN}"
 
+echo "==> SQLite daily backup + integrity cron (controller untouched)"
+sudo "${SCRIPT_DIR}/install_pi_sqlite_cron.sh" || {
+  echo "WARN: sqlite cron install failed; run later:" >&2
+  echo "  sudo ${SCRIPT_DIR}/install_pi_sqlite_cron.sh" >&2
+}
+
 if grep -q '^INTELIPUMP_MQTT__PASSWORD=$' "$ENV_DST" 2>/dev/null \
   || grep -q '^INTELIPUMP_MQTT__PASSWORD=$' <(sudo cat "$ENV_DST"); then
   echo "WARN: set INTELIPUMP_MQTT__PASSWORD in ${ENV_DST} before starting." >&2
@@ -139,3 +145,5 @@ fi
 
 echo
 echo "Done. intelipump.service is unchanged (MQTT stays off on the controller)."
+echo "DB recover: sudo ${SCRIPT_DIR}/pi_sqlite_recover.sh"
+echo "Republish meters after recover: sudo ${SCRIPT_DIR}/pi_sqlite_republish_meter_results.sh"

@@ -76,5 +76,6 @@ systemctl start intelipump-cloud-sync.service || true
 echo
 echo "Done. Backup of pre-recover live file: ${DB}.pre-recover.${STAMP}"
 echo "Original copy: $BAK"
-echo "If meter OPENING missing on dashboard, re-touch meter-read-result*.json and"
-echo "  systemctl restart intelipump-cloud-sync.service"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "Republish meter OPENING (controller untouched):"
+echo "  sudo ${SCRIPT_DIR}/pi_sqlite_republish_meter_results.sh"

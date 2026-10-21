@@ -68,6 +68,8 @@ class DatabaseSettings(BaseModel):
     # Soft alerts only (journal); never restart the controller.
     sync_queue_total_alert_threshold: int = Field(default=20000, ge=1000)
     sync_queue_pending_alert_threshold: int = Field(default=5000, ge=100)
+    # Periodic PRAGMA quick_check in cloud-sync (0 = startup check only).
+    sqlite_integrity_interval_seconds: float = Field(default=600.0, ge=0.0)
 
 
 class MqttSettings(BaseModel):

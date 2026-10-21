@@ -18,6 +18,16 @@ async def test_sqlite_quick_check_ok(engine_factory: tuple) -> None:
     assert detail == "ok"
 
 
+@pytest.mark.asyncio
+async def test_sqlite_quick_check_factory_ok(engine_factory: tuple) -> None:
+    from intelipump_fdc.persistence.sqlite_health import sqlite_quick_check_factory
+
+    _engine, factory = engine_factory
+    ok, detail = await sqlite_quick_check_factory(factory)
+    assert ok is True
+    assert detail == "ok"
+
+
 def test_looks_like_sqlite_corruption() -> None:
     assert looks_like_sqlite_corruption(
         Exception("database disk image is malformed")

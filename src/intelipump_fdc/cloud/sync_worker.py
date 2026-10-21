@@ -15,7 +15,10 @@ from intelipump_fdc.cloud.backoff import compute_backoff_seconds
 from intelipump_fdc.cloud.delivery import DeliveryMapper
 from intelipump_fdc.cloud.mqtt.base import MqttClient
 from intelipump_fdc.cloud.mqtt.errors import MqttError, MqttNotConnectedError
-from intelipump_fdc.persistence.sqlite_health import looks_like_sqlite_corruption
+from intelipump_fdc.persistence.sqlite_health import (
+    looks_like_sqlite_corruption,
+    sqlite_quick_check_factory,
+)
 from intelipump_fdc.persistence.unit_of_work import unit_of_work
 
 logger = structlog.get_logger(__name__)
@@ -29,6 +32,7 @@ class SyncWorkerStats:
     pruned_delivered: int = 0
     last_delivery_at: datetime | None = None
     last_prune_at: datetime | None = None
+    last_integrity_at: datetime | None = None
     last_error: str | None = None
     database_degraded: bool = False
 
@@ -49,10 +53,13 @@ class SyncWorker:
     prune_interval_seconds: float = 300.0
     total_alert_threshold: int = 20000
     pending_alert_threshold: int = 5000
+    # 0 disables periodic re-check (startup gate in cloud CLI still runs).
+    integrity_interval_seconds: float = 600.0
     stats: SyncWorkerStats = field(default_factory=SyncWorkerStats)
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
     _last_prune_monotonic: float = field(default=0.0, repr=False)
+    _last_integrity_monotonic: float = field(default=0.0, repr=False)
     _size_alert_latched: bool = field(default=False, repr=False)
 
     def start(self) -> None:
@@ -94,6 +101,31 @@ class SyncWorker:
                         "sync_worker_cycle_error", error=self.stats.last_error
                     )
             await asyncio.sleep(self.poll_interval_seconds)
+
+    async def _maybe_integrity_check(self) -> None:
+        interval = float(self.integrity_interval_seconds)
+        if interval <= 0:
+            return
+        now = asyncio.get_running_loop().time()
+        due = (now - self._last_integrity_monotonic) >= interval
+        if not due and self._last_integrity_monotonic > 0:
+            return
+        self._last_integrity_monotonic = now
+        try:
+            ok, detail = await sqlite_quick_check_factory(self.session_factory)
+            self.stats.last_integrity_at = datetime.now(UTC)
+            if not ok:
+                self.mark_database_degraded(detail=detail)
+        except Exception as exc:
+            if looks_like_sqlite_corruption(exc):
+                self.mark_database_degraded(
+                    detail=f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                logger.warning(
+                    "sync_queue_integrity_check_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
 
     async def _maybe_prune_and_alert(self) -> None:
         now = asyncio.get_running_loop().time()
@@ -145,6 +177,9 @@ class SyncWorker:
 
     async def _cycle(self) -> None:
         if not self.mqtt.is_connected or self.stats.database_degraded:
+            return
+        await self._maybe_integrity_check()
+        if self.stats.database_degraded:
             return
         await self._maybe_prune_and_alert()
         if self.stats.database_degraded:

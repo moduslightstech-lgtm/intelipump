@@ -209,6 +209,7 @@ class CloudRuntime:
             prune_interval_seconds=float(db.sync_queue_prune_interval_seconds),
             total_alert_threshold=int(db.sync_queue_total_alert_threshold),
             pending_alert_threshold=int(db.sync_queue_pending_alert_threshold),
+            integrity_interval_seconds=float(db.sqlite_integrity_interval_seconds),
         )
         self.heartbeat = HeartbeatService(
             mqtt=self.mqtt,

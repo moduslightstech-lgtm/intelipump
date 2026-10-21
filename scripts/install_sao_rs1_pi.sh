@@ -230,6 +230,11 @@ fi
 echo "==> systemctl daemon-reload"
 sudo systemctl daemon-reload
 
+echo "==> SQLite daily backup + integrity cron (controller untouched)"
+sudo "${SCRIPT_DIR}/install_pi_sqlite_cron.sh" || {
+  echo "WARN: sqlite cron install failed; run: sudo ${SCRIPT_DIR}/install_pi_sqlite_cron.sh" >&2
+}
+
 if [[ ! -e "$PORT" ]]; then
   echo "WARN: serial device ${PORT} not present yet (plug USB-RS485 before start)." >&2
 else

@@ -101,3 +101,37 @@ async def test_sync_worker_degraded_skips_cycle(
     worker.mark_database_degraded(detail="malformed")
     assert worker.stats.database_degraded is True
     await worker._cycle()  # must no-op without raising
+
+
+@pytest.mark.asyncio
+async def test_sync_worker_periodic_integrity_ok(
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    mqtt = FakeMqttClient(client_id="integrity-ok")
+    await mqtt.connect()
+    worker = _worker(db_factory, mqtt)
+    worker.integrity_interval_seconds = 1.0
+    await worker._maybe_integrity_check()
+    assert worker.stats.database_degraded is False
+    assert worker.stats.last_integrity_at is not None
+
+
+@pytest.mark.asyncio
+async def test_sync_worker_periodic_integrity_degrades(
+    db_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _bad(_factory: object) -> tuple[bool, str]:
+        return False, "btree corruption simulated"
+
+    monkeypatch.setattr(
+        "intelipump_fdc.cloud.sync_worker.sqlite_quick_check_factory",
+        _bad,
+    )
+    mqtt = FakeMqttClient(client_id="integrity-bad")
+    await mqtt.connect()
+    worker = _worker(db_factory, mqtt)
+    worker.integrity_interval_seconds = 1.0
+    await worker._maybe_integrity_check()
+    assert worker.stats.database_degraded is True
+    assert "btree" in (worker.stats.last_error or "")
