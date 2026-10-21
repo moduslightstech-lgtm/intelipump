@@ -341,6 +341,41 @@ class TransactionRepository:
         await self._session.flush()
         return _tx(row)
 
+    async def abandon_no_delivery(
+        self,
+        transaction_uuid: str,
+        *,
+        reason: str = "zero_fill_flash",
+    ) -> TransactionRecord | None:
+        """Close an ACTIVE sale that never dispensed — do not publish COMPLETED."""
+        result = await self._session.execute(
+            select(TransactionRow).where(
+                TransactionRow.transaction_uuid == transaction_uuid
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        if row.status in {"COMPLETED", "COMPLETE", "VOID", "CANCELLED"}:
+            return _tx(row)
+        now = datetime.now(UTC)
+        row.status = "CANCELLED"
+        row.closed_at = now
+        row.updated_at = now
+        row.source_completion_key = (
+            f"abandoned-no-delivery:{transaction_uuid}:{reason}"
+        )[:256]
+        await self._session.flush()
+        await self.add_event(
+            transaction_id=row.id,
+            event_type="CANCELLED_NO_DELIVERY",
+            event_key=f"cancel-no-delivery:{transaction_uuid}:{reason}",
+            raw_payload={"reason": reason, "status": "CANCELLED"},
+            source_frame_ref=None,
+            observed_at=now,
+        )
+        return _tx(row)
+
     async def add_event(
         self,
         *,

@@ -584,6 +584,75 @@ class PersistenceBridge:
             )
         )
 
+    async def _sale_has_fill_evidence(self, uow: Any, tx_uuid: str | None) -> bool:
+        """True when this UUID saw live dispensing (fill tick or persisted volume).
+
+        Used to reject residual-face flash completes: STARTED → COMPLETED with
+        no FILLING_UPDATE (pump-3 0.08 L / 9 ms ghosts). Sticky
+        ``filling_seen_this_boot`` is not enough — it survives the prior sale.
+        """
+        if not tx_uuid:
+            return False
+        row = await uow.transactions.get_by_uuid(str(tx_uuid))
+        if row is None:
+            return False
+        if int(row.raw_volume or 0) > 0 or int(row.raw_amount or 0) > 0:
+            return True
+        events = await uow.transactions.list_events(row.id)
+        return any(ev.event_type == "FILLING_UPDATE" for ev in events)
+
+    async def _suppress_zero_fill_flash(
+        self,
+        uow: Any,
+        *,
+        address: int,
+        pump_db: str,
+        tx_uuid: str,
+        vol_raw: int,
+        amt_raw: int,
+        prev_state_s: str | None,
+        new_state_s: str | None,
+        logical: str | None,
+        nozzle_id: int | None,
+    ) -> None:
+        """Cancel an ACTIVE UUID that never filled; do not cloud-publish COMPLETED."""
+        await uow.transactions.abandon_no_delivery(
+            tx_uuid, reason="zero_fill_flash"
+        )
+        if self._tx_by_address.get(address) == tx_uuid:
+            self._tx_by_address.pop(address, None)
+        self._publish_sale_identity_cleared(address, transaction_uuid=tx_uuid)
+        await uow.audit.append(
+            actor="controller",
+            source="state_machine",
+            action="ZERO_FILL_FLASH_SUPPRESSED",
+            station_id=self._station_id,
+            pump_id=pump_db,
+            previous_state=prev_state_s,
+            resulting_state=new_state_s,
+            result="CANCELLED",
+            details={
+                "transaction_uuid": tx_uuid,
+                "raw_volume": vol_raw,
+                "raw_amount": amt_raw,
+                "pumpId": logical,
+                "nozzleId": nozzle_id,
+                "detail": (
+                    "ACTIVE sale had no FILLING_UPDATE / persisted volume "
+                    "before hang-up — residual face, not a delivery"
+                ),
+            },
+        )
+        logger.info(
+            "zero_fill_flash_suppressed",
+            stationId=self._station_id,
+            pumpId=logical,
+            nozzleId=nozzle_id,
+            transactionId=tx_uuid,
+            volumeMinorUnits=vol_raw,
+            amountMinorUnits=amt_raw,
+        )
+
     async def _ensure_open_sale(
         self,
         uow: Any,
@@ -1108,16 +1177,19 @@ class PersistenceBridge:
                     and returned.transaction_id is None
                     and not returned.possible_unintended_flow
                 )
-                # Positive face alone is not enough — require current-session
-                # dispensing evidence (open ACTIVE, filling this boot, or
-                # verified volume↑). Retained display after restart must not
-                # invent a financial sale (startup_baseline path handles that).
-                mapped_open_preview = self._tx_by_address.get(address)
-                session_dispensing_evidence = bool(
-                    mapped_open_preview
-                    or detail_payload.get("filling_seen_this_boot")
-                    or detail_payload.get("filling_observed")
-                    or (
+                # Positive face alone is not enough — require per-sale fill
+                # evidence. An open ACTIVE without FILLING_UPDATE is not
+                # enough (pump-3 flash COMPLETED from residual face). Sticky
+                # filling_seen_this_boot also is not enough — it survives the
+                # prior sale on the same hose.
+                mapped_open_preview = (
+                    self._tx_by_address.get(address) or active_tx_s
+                )
+                open_has_fill = await self._sale_has_fill_evidence(
+                    uow, mapped_open_preview
+                )
+                verified_volume_rise = bool(
+                    (
                         returned.transaction_id
                         and returned.phase is VerifiedPhase.COMPLETED
                         and (
@@ -1130,6 +1202,33 @@ class PersistenceBridge:
                         and returned.volume_increased
                     )
                 )
+                session_dispensing_evidence = bool(
+                    open_has_fill or verified_volume_rise
+                )
+                # Open ACTIVE + residual face + never filled → cancel (do not
+                # leave an ACTIVE zombie or publish COMPLETED).
+                if (
+                    mapped_open_preview
+                    and not open_has_fill
+                    and positive_face
+                    and not intentional_no_sale
+                ):
+                    sel_noz = detail_payload.get("selected_nozzle")
+                    await self._suppress_zero_fill_flash(
+                        uow,
+                        address=address,
+                        pump_db=pump_db,
+                        tx_uuid=str(mapped_open_preview),
+                        vol_raw=int(vol_raw),
+                        amt_raw=int(amt_raw),
+                        prev_state_s=(
+                            str(prev_state_s) if prev_state_s else None
+                        ),
+                        new_state_s=new_state_s,
+                        logical=can_pump,
+                        nozzle_id=sel_noz if isinstance(sel_noz, int) else None,
+                    )
+                    return
                 # Wayne face totals win when session evidence exists: hang-up /
                 # LIMIT must finalize even if may_publish was false or SM
                 # rejected. Otherwise offline sales never reach the cloud.
@@ -1443,6 +1542,64 @@ class PersistenceBridge:
                     # match a recent COMPLETED sale — two equal-value purchases
                     # must remain two identities. Same-UUID already-completed
                     # (above) is the only totals-based suppress.
+                    #
+                    # Zero-fill flash: ACTIVE with no fill ticks must not become
+                    # COMPLETED from residual face (STARTED→COMPLETED in ~10ms).
+                    flash_candidate = (
+                        active_tx_s
+                        or self._tx_by_address.get(address)
+                        or self._verified_open_uuid(address)
+                    )
+                    if flash_candidate and not await self._sale_has_fill_evidence(
+                        uow, flash_candidate
+                    ):
+                        await self._suppress_zero_fill_flash(
+                            uow,
+                            address=address,
+                            pump_db=pump_db,
+                            tx_uuid=str(flash_candidate),
+                            vol_raw=int(vol_raw),
+                            amt_raw=int(amt_raw),
+                            prev_state_s=(
+                                str(prev_state_s) if prev_state_s else None
+                            ),
+                            new_state_s=new_state_s,
+                            logical=logical,
+                            nozzle_id=nozzle_id,
+                        )
+                        return
+                    if not flash_candidate and not verified_volume_rise:
+                        # Would mint a brand-new UUID at complete with no fill
+                        # history — residual face after sticky filling_seen.
+                        self._worker.note_capture_uncertainty(
+                            reason="complete_would_mint_without_fill"
+                        )
+                        logger.info(
+                            "zero_fill_complete_mint_suppressed",
+                            stationId=self._station_id,
+                            pumpId=logical,
+                            nozzleId=nozzle_id,
+                            volumeMinorUnits=vol_raw,
+                            amountMinorUnits=amt_raw,
+                        )
+                        await uow.audit.append(
+                            actor="controller",
+                            source="state_machine",
+                            action="ZERO_FILL_FLASH_SUPPRESSED",
+                            station_id=self._station_id,
+                            pump_id=pump_db,
+                            previous_state=(
+                                str(prev_state_s) if prev_state_s else None
+                            ),
+                            resulting_state=new_state_s,
+                            result="IGNORED",
+                            details={
+                                "raw_volume": vol_raw,
+                                "raw_amount": amt_raw,
+                                "detail": "hang-up would mint UUID without fill",
+                            },
+                        )
+                        return
                     complete_uuid = await self._ensure_open_sale(
                         uow,
                         address=address,

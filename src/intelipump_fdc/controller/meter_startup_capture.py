@@ -98,6 +98,23 @@ def finished_addresses_for_today(
     return _int_keys(data.get("captured")) | _int_keys(data.get("failed"))
 
 
+def business_day_rolled(
+    active_business_date: str | None,
+    *,
+    timezone: str = "Africa/Lagos",
+) -> tuple[bool, str]:
+    """Return (rolled, today) — True when the local business day changed.
+
+    Startup OPENING must reopen on each local morning even if the controller
+    process stayed up overnight (no Pi power cycle). Callers reset the in-memory
+    settle/window when this returns True.
+    """
+    today = business_date_today(timezone=timezone)
+    if active_business_date is None or str(active_business_date) != today:
+        return True, today
+    return False, today
+
+
 def mark_address_captured(
     *,
     address: int,

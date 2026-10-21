@@ -129,12 +129,16 @@ class ControllerLoop:
         self._meter_last_attempt_mono: dict[int, float] = {}
         self._meter_loop_started_mono: float | None = None
         self._meter_startup_window_closed: bool = False
+        # Local business date for which the settle/window above applies. Reset
+        # when the calendar day rolls so always-on Pis still capture OPENING.
+        self._meter_startup_business_date: str | None = None
         # After DEFERRED / quarantine, wait before re-queuing the same OPENING addr.
         self._meter_startup_next_try_mono: dict[int, float] = {}
         self._meter_startup_defer_backoff_s: float = 15.0
         # METER_DC101_TIMEOUT often means a pre-TX stale DC101 was ignored; retry.
         self._meter_startup_timeout_attempts: dict[int, int] = {}
         self._meter_startup_timeout_max_attempts: int = 3
+        self._meter_startup_busy_logged: bool = False
         thresholds = HealthThresholds(
             degraded_after_timeouts=runtime.config.degraded_after_timeouts,
             disconnected_after_timeouts=runtime.config.max_consecutive_timeouts,
@@ -2928,8 +2932,29 @@ class ControllerLoop:
                 error=str(exc),
             )
 
+    def _reset_startup_meter_window_for_business_day(self, today: str) -> None:
+        """Re-open settle/window when the local business day changes."""
+        prev = self._meter_startup_business_date
+        self._meter_startup_business_date = today
+        self._meter_startup_window_closed = False
+        self._meter_loop_started_mono = None
+        self._meter_startup_next_try_mono.clear()
+        self._meter_startup_timeout_attempts.clear()
+        self._meter_startup_busy_logged = False
+        if prev is not None and prev != today:
+            logger.info(
+                "meter_startup_capture_new_business_day",
+                previousDate=prev,
+                businessDate=today,
+            )
+
     async def _maybe_queue_startup_meter_capture(self) -> None:
-        """Once per local morning after boot: queue OPENING CD101 per address."""
+        """Once per local business day: queue OPENING CD101 per address.
+
+        Window is relative to the first attempt on that business day (boot or
+        calendar rollover), not process lifetime — so always-on Pis still
+        capture each morning without a power cycle.
+        """
         from uuid import uuid4
 
         from intelipump_fdc.controller.meter_read_request import (
@@ -2938,6 +2963,7 @@ class ControllerLoop:
             MeterReadRequest,
         )
         from intelipump_fdc.controller.meter_startup_capture import (
+            business_day_rolled,
             finished_addresses_for_today,
         )
 
@@ -2945,10 +2971,27 @@ class ControllerLoop:
             return
         if not self.runtime.meter_startup_capture_enabled:
             return
+
+        tz = self.runtime.meter_startup_capture_timezone or "Africa/Lagos"
+        rolled, today = business_day_rolled(
+            self._meter_startup_business_date, timezone=tz
+        )
+        if rolled:
+            self._reset_startup_meter_window_for_business_day(today)
+
         if self._meter_startup_window_closed:
             return
         if self._meter_pending is not None or request_busy():
+            # Avoid log spam while a prior read is in flight.
+            if not self._meter_startup_busy_logged:
+                logger.info(
+                    "meter_startup_capture_deferred_busy",
+                    meterPending=self._meter_pending is not None,
+                    requestBusy=bool(request_busy()),
+                )
+                self._meter_startup_busy_logged = True
             return
+        self._meter_startup_busy_logged = False
 
         now = time.monotonic()
         if self._meter_loop_started_mono is None:
@@ -2962,10 +3005,10 @@ class ControllerLoop:
                 "meter_startup_capture_window_closed",
                 elapsed_s=round(elapsed, 1),
                 window_s=self.runtime.meter_startup_capture_window_s,
+                businessDate=today,
             )
             return
 
-        tz = self.runtime.meter_startup_capture_timezone or "Africa/Lagos"
         done = finished_addresses_for_today(timezone=tz)
         safety = self.runtime.safety
         allowed = set(safety.hardware_meter_allowed_addresses)
@@ -2979,6 +3022,7 @@ class ControllerLoop:
             logger.info(
                 "meter_startup_capture_all_addresses_done",
                 finished=sorted(done),
+                businessDate=today,
             )
             return
 
@@ -2999,11 +3043,16 @@ class ControllerLoop:
                 session, startup_opening=True
             )
             if not ok:
-                logger.debug(
+                # Info (not debug): otherwise morning capture looks "dead" in
+                # journalctl while silently backing off for the whole window.
+                logger.info(
                     "meter_startup_capture_wait",
                     address=addr,
                     errorCode=code,
                     detail=msg,
+                    saleLifecycle=str(session.state.sale_lifecycle.value),
+                    nozzle=str(session.state.nozzle_position),
+                    dc1=str(session.machine.context.current_state),
                 )
                 self._startup_meter_backoff(int(addr))
                 continue

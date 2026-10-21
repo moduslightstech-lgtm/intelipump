@@ -190,9 +190,11 @@ class MeterReadingSettings(BaseModel):
     # After CD101 timeout, block new TX on that address this long so late DC101
     # cannot bind to the next request (protocol has no request UUID).
     post_timeout_quarantine_seconds: float = Field(default=8.0, ge=1.0, le=120.0)
-    # Once per local business day after controller boot: auto CD101 → OPENING.
-    # Uses relaxed nozzle freshness (no re-seat ritual). Still refuses nozzle OUT
-    # and active dispensing / sale lifecycle.
+    # Once per local business day: auto CD101 → OPENING (boot or date rollover).
+    # Settle/window restart when Africa/Lagos (or configured TZ) day changes so
+    # always-on Pis still capture without a morning power cycle. Uses relaxed
+    # nozzle freshness (no re-seat ritual). Still refuses nozzle OUT and active
+    # dispensing / sale lifecycle.
     startup_capture_enabled: bool = False
     startup_capture_timezone: str = "Africa/Lagos"
     startup_capture_settle_seconds: float = Field(default=20.0, ge=5.0, le=600.0)
