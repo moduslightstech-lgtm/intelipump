@@ -94,7 +94,12 @@ class HeartbeatService:
                 extras.get("unresolvedTransactionCount", 0)
             ),
             simulated=self.simulated,
-        ).model_dump()
+        ).model_dump(exclude_none=True)
+        # Sidecar heartbeats must not publish transportOpen=null — that was
+        # mapped to serialPortOpen and sticky-flagged pumps as "RS485 down".
+        if extras.get("sidecarPublishOnly"):
+            body.pop("transportOpen", None)
+            body.pop("transportKind", None)
         self._seq += 1
         envelope = build_envelope(
             event_type="HEARTBEAT",

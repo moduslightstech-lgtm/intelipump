@@ -54,6 +54,19 @@ class MeterResultPublisher:
         corr = str(result.get("correlationId") or "").strip()
         if not corr or corr in self._seen:
             return 0
+        # Local troubleshoot reads (intelipump-meter-read-local / --local-only).
+        publish = result.get("publishToCloud")
+        if publish is None:
+            publish = result.get("publish_to_cloud")
+        if publish is False:
+            self._seen.add(corr)
+            logger.info(
+                "meter_result_skipped_local_only",
+                correlationId=corr,
+                status=result.get("status"),
+                dartAddress=result.get("dartAddress"),
+            )
+            return 0
         status = str(result.get("status") or "").upper()
         if status not in {
             "CAPTURED",

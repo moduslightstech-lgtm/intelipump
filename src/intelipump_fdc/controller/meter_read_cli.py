@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from pathlib import Path
 
 from intelipump_fdc.controller.meter_read_request import (
     MeterReadRequest,
@@ -76,6 +78,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print documented CD101 payload hex and exit without requesting",
     )
+    p.add_argument(
+        "--local-only",
+        action="store_true",
+        help=(
+            "Troubleshoot read: do NOT publish to cloud dashboard / sync_queue. "
+            "Still uses the running controller CD101 bridge. Does not count as "
+            "morning STARTUP_OPENING."
+        ),
+    )
+    p.add_argument(
+        "--with-recent-sales",
+        action="store_true",
+        help=(
+            "After each CAPTURED read, print recent COMPLETED sales from the "
+            "local SQLite DB (manual compare; not sent to cloud)."
+        ),
+    )
+    p.add_argument(
+        "--sales-limit",
+        type=int,
+        default=15,
+        help="Max recent sales rows when --with-recent-sales (default 15)",
+    )
     return p
 
 
@@ -104,6 +129,61 @@ def _parse_addresses(args: argparse.Namespace, allowed: frozenset[int]) -> list[
     return [int(args.address)]
 
 
+def _print_recent_sales(*, limit: int) -> None:
+    """Best-effort local SQLite dump for manual meter vs sale compare."""
+    db = os.environ.get("INTELIPUMP_DB_PATH", "/var/lib/intelipump/intelipump.db")
+    print(f"\n=== recent COMPLETED sales (local {db}, limit={limit}) ===")
+    if not Path(db).is_file():
+        print(f"(no db at {db})")
+        return
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        cols = {r[1] for r in con.execute("PRAGMA table_info(transactions)").fetchall()}
+        if "transactions" not in {
+            r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }:
+            print("(no transactions table)")
+            con.close()
+            return
+        time_col = (
+            "completed_at"
+            if "completed_at" in cols
+            else ("updated_at" if "updated_at" in cols else "created_at")
+        )
+        vol = "volume_liters" if "volume_liters" in cols else None
+        nozzle = "nozzle_id" if "nozzle_id" in cols else None
+        pump = "pump_id" if "pump_id" in cols else None
+        status_col = "status" if "status" in cols else None
+        select_bits = [f"{time_col} AS at"]
+        if pump:
+            select_bits.append(pump)
+        if nozzle:
+            select_bits.append(nozzle)
+        if vol:
+            select_bits.append(vol)
+        if status_col:
+            select_bits.append(status_col)
+        where = f"WHERE UPPER(COALESCE({status_col},'')) = 'COMPLETED'" if status_col else ""
+        q = (
+            f"SELECT {', '.join(select_bits)} FROM transactions {where} "
+            f"ORDER BY {time_col} DESC LIMIT ?"
+        )
+        rows = list(con.execute(q, (int(limit),)))
+        con.close()
+        if not rows:
+            print("(no rows)")
+            return
+        for r in rows:
+            print(dict(r))
+    except Exception as exc:  # noqa: BLE001 — troubleshoot aid only
+        print(f"(sales query failed: {type(exc).__name__}: {exc})")
+
+
 def _request_one(
     *,
     address: int,
@@ -111,6 +191,9 @@ def _request_one(
     nozzle_hint: str | None,
     notes: str | None,
     wait_seconds: float,
+    local_only: bool,
+    with_recent_sales: bool,
+    sales_limit: int,
 ) -> int:
     """Write one exclusive request; return 0 CAPTURED, 1 other result, 2 busy, 3 timeout."""
     if request_busy():
@@ -123,15 +206,23 @@ def _request_one(
         return 2
 
     corr = new_correlation_id()
+    requested_by = (
+        "intelipump-meter-read-local"
+        if local_only
+        else "intelipump-meter-read-once"
+    )
     try:
         path = write_meter_read_request(
             MeterReadRequest(
                 correlation_id=corr,
                 dart_address=int(address),
                 counter_select=coun,
-                requested_by="intelipump-meter-read-once",
+                requested_by=requested_by,
                 nozzle_hint=nozzle_hint,
                 notes=notes,
+                slot="AD_HOC",
+                startup_opening=False,
+                publish_to_cloud=not local_only,
             )
         )
     except FileExistsError as exc:
@@ -141,6 +232,8 @@ def _request_one(
     cd101 = build_cd101_request(counter_select=coun)
     result_file = result_path_for(corr)
     print(f"REQUEST_WRITTEN path={path} address={address} correlationId={corr}")
+    if local_only:
+        print("LOCAL_ONLY publishToCloud=false (will not appear on dashboard)")
     print(f"CD101_PAYLOAD {cd101.payload_hex}")
     print(f"RESULT_FILE path={result_file}")
     print(f"AWAITING_RESULT path={result_file} wait={wait_seconds}s")
@@ -156,9 +249,14 @@ def _request_one(
         last = read_meter_read_result(correlation_id=corr)
         if last and last.get("correlationId") == corr:
             print(json.dumps(last, indent=2, sort_keys=True))
+            liters = last.get("volumeLiters")
+            if liters is not None:
+                print(f"VOLUME_LITERS {liters}")
             print(f"RESULT_FILE_EXPORT path={result_file}")
             status = str(last.get("status") or "")
             if status in {"CAPTURED", "CAPTURED_AMBIGUOUS"}:
+                if with_recent_sales:
+                    _print_recent_sales(limit=sales_limit)
                 return 0 if status == "CAPTURED" else 1
             return 1
         time.sleep(0.25)
@@ -235,6 +333,10 @@ def run(argv: list[str] | None = None) -> None:
             raise SystemExit(2)
 
     exit_code = 0
+    local_only = bool(args.local_only)
+    notes = args.notes
+    if local_only and not notes:
+        notes = "local-troubleshoot-no-cloud"
     for i, addr in enumerate(addresses):
         hint = args.nozzle_hint
         if hint is None and len(addresses) > 1:
@@ -243,8 +345,11 @@ def run(argv: list[str] | None = None) -> None:
             address=addr,
             coun=coun,
             nozzle_hint=hint,
-            notes=args.notes,
+            notes=notes,
             wait_seconds=float(args.wait_seconds),
+            local_only=local_only,
+            with_recent_sales=bool(args.with_recent_sales),
+            sales_limit=max(1, int(args.sales_limit)),
         )
         if rc != 0:
             exit_code = rc
@@ -254,6 +359,14 @@ def run(argv: list[str] | None = None) -> None:
                 print(f"GAP {gap}s before next address…")
                 time.sleep(gap)
     raise SystemExit(exit_code)
+
+
+def run_local(argv: list[str] | None = None) -> None:
+    """Entry point: same as meter-read-once with --local-only always on."""
+    args = list(argv) if argv is not None else sys.argv[1:]
+    if "--local-only" not in args:
+        args = ["--local-only", *args]
+    run(args)
 
 
 if __name__ == "__main__":

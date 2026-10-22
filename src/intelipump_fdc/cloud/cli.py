@@ -147,13 +147,42 @@ async def _async_main(args: argparse.Namespace) -> None:
             db_detail = report_warnings[-1]
 
     started = datetime.now(UTC)
+    # Mutable so heartbeats see later sync-worker degrade / cloud handle.
+    hb_state: dict[str, object] = {
+        "db_degraded": db_degraded,
+        "db_detail": db_detail,
+        "cloud": None,
+    }
+
+    def _controller_unit_active() -> bool:
+        """True when intelipump.service is active (best-effort; never raise)."""
+        import subprocess
+
+        try:
+            proc = subprocess.run(
+                ["systemctl", "is-active", "--quiet", "intelipump.service"],
+                check=False,
+                timeout=2.0,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return True
 
     async def payload_provider() -> dict[str, object]:
         pending = 0
         unresolved = 0
-        status = "DEGRADED" if db_degraded else "ONLINE"
-        db_status = "CORRUPT" if db_degraded else "OK"
-        if not db_degraded:
+        degraded = bool(hb_state["db_degraded"])
+        detail = hb_state.get("db_detail")
+        cloud_rt = hb_state.get("cloud")
+        if (
+            cloud_rt is not None
+            and getattr(cloud_rt, "sync_worker", None) is not None
+            and cloud_rt.sync_worker.stats.database_degraded
+        ):
+            degraded = True
+            detail = cloud_rt.sync_worker.stats.last_error or detail
+        db_status = "CORRUPT" if degraded else "OK"
+        if not degraded:
             try:
                 async with unit_of_work(factory) as uow:
                     pending = await uow.sync_queue.pending_count()
@@ -167,17 +196,22 @@ async def _async_main(args: argparse.Namespace) -> None:
                     "cloud_sync_heartbeat_db_error",
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                status = "DEGRADED"
+                degraded = True
                 db_status = "ERROR"
+                detail = f"{type(exc).__name__}: {exc}"
+        ctrl_running = _controller_unit_active()
+        status = "ONLINE"
+        if degraded or not ctrl_running:
+            status = "DEGRADED"
+        # Keep pump health green on the twin — sidecar does not own RS-485.
+        # Controller-down / DB-corrupt are carried as explicit fields + alerts.
         return {
             "controllerMode": settings.controller.mode.value,
             "status": status,
             "uptimeSeconds": (datetime.now(UTC) - started).total_seconds(),
             "databaseStatus": db_status,
-            "databaseDetail": db_detail if db_degraded else None,
-            # Sidecar does not own the Wayne loop. Do not report pumps as
-            # disconnected — that made the digital twin paint both nozzles red.
-            "controllerLoopRunning": True,
+            "databaseDetail": detail if degraded else None,
+            "controllerLoopRunning": ctrl_running,
             "sidecarPublishOnly": True,
             "transportKind": None,
             "transportOpen": None,
@@ -200,6 +234,7 @@ async def _async_main(args: argparse.Namespace) -> None:
         mqtt=mqtt,
         payload_provider=payload_provider,
     )
+    hb_state["cloud"] = cloud
     stop = asyncio.Event()
 
     def _signal(*_args: object) -> None:

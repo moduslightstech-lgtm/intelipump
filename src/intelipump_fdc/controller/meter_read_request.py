@@ -64,6 +64,8 @@ class MeterReadRequest:
     notes: str | None = None
     slot: str | None = None  # OPENING | CLOSING | AD_HOC
     startup_opening: bool = False
+    # When False, cloud-sync must not enqueue/MQTT this result (local troubleshoot).
+    publish_to_cloud: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,8 +79,9 @@ class MeterReadRequest:
             "notes": self.notes,
             "slot": self.slot,
             "startupOpening": bool(self.startup_opening),
+            "publishToCloud": bool(self.publish_to_cloud),
             "readOnly": True,
-            "schemaVersion": "1.1",
+            "schemaVersion": "1.2",
         }
 
 
@@ -107,6 +110,11 @@ def _parse_request_dict(raw: dict[str, Any]) -> MeterReadRequest | None:
     startup = raw.get("startupOpening")
     if startup is None:
         startup = raw.get("startup_opening")
+    publish = raw.get("publishToCloud")
+    if publish is None:
+        publish = raw.get("publish_to_cloud")
+    if publish is None:
+        publish = True
     return MeterReadRequest(
         correlation_id=corr,
         dart_address=addr,
@@ -118,6 +126,7 @@ def _parse_request_dict(raw: dict[str, Any]) -> MeterReadRequest | None:
         notes=(str(raw["notes"]) if raw.get("notes") else None),
         slot=(str(slot) if slot else None),
         startup_opening=bool(startup),
+        publish_to_cloud=bool(publish),
     )
 
 

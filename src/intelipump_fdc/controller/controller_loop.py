@@ -3263,6 +3263,10 @@ class ControllerLoop:
         addr = int(req.dart_address)
         coun = int(req.counter_select or self.runtime.meter_counter_select)
         startup_opening = bool(req.startup_opening) or str(req.slot or "").upper() == "OPENING"
+        # Local troubleshoot reads must not become morning OPENING or cloud MQTT.
+        publish_to_cloud = bool(getattr(req, "publish_to_cloud", True))
+        if not publish_to_cloud:
+            startup_opening = False
         result_base = {
             "correlationId": req.correlation_id,
             "dartAddress": addr,
@@ -3271,8 +3275,13 @@ class ControllerLoop:
             "requestedBy": req.requested_by,
             "nozzleHint": req.nozzle_hint,
             "pumpId": req.pump_id,
-            "slot": req.slot or ("OPENING" if startup_opening else "AD_HOC"),
+            "slot": (
+                "AD_HOC"
+                if not publish_to_cloud
+                else (req.slot or ("OPENING" if startup_opening else "AD_HOC"))
+            ),
             "startupOpening": startup_opening,
+            "publishToCloud": publish_to_cloud,
             "deviceId": safety.hardware_meter_device_id,
             "status": "ERROR",
             "readOnly": True,
