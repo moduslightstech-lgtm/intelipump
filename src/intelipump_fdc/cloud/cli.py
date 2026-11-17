@@ -115,7 +115,12 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     # Integrity gate is cloud-sync only. Corrupt DB → degrade MQTT outbox;
     # never stop or restart intelipump.service from this path.
-    db_ok, db_detail = await sqlite_quick_check(engine)
+    # quick_check must not raise — keep heartbeats with databaseStatus=CORRUPT
+    # so the twin can raise EDGE_SQLITE_CORRUPT (+ email) instead of only Offline.
+    try:
+        db_ok, db_detail = await sqlite_quick_check(engine)
+    except Exception as exc:  # noqa: BLE001 — belt-and-suspenders
+        db_ok, db_detail = False, f"{type(exc).__name__}: {exc}"
     db_degraded = not db_ok
     if db_degraded:
         logger.error(

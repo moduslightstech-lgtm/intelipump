@@ -6,6 +6,18 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 
+def looks_like_sqlite_corruption(exc: BaseException) -> bool:
+    """True when an exception message indicates a corrupt SQLite file."""
+    text_s = f"{type(exc).__name__}: {exc}".lower()
+    needles = (
+        "database disk image is malformed",
+        "file is not a database",
+        "corrupt",
+        "malformed",
+    )
+    return any(n in text_s for n in needles)
+
+
 def _interpret_quick_check_rows(rows: list[object]) -> tuple[bool, str]:
     if not rows:
         return False, "quick_check returned no rows"
@@ -31,35 +43,38 @@ async def sqlite_quick_check(engine: AsyncEngine) -> tuple[bool, str]:
     Non-SQLite engines always report ok. Used at cloud-sync startup so a
     corrupt outbox DB can degrade MQTT delivery without touching
     ``intelipump.service``.
+
+    Never raises for SQLite I/O / malformed errors — returns ``(False, detail)``
+    so cloud-sync can keep heartbeating with ``databaseStatus=CORRUPT``.
     """
     if engine.dialect.name != "sqlite":
         return True, "ok"
-    async with engine.connect() as conn:
-        result = await conn.exec_driver_sql("PRAGMA quick_check")
-        rows = list(result.fetchall())
-    return _interpret_quick_check_rows(rows)
+    try:
+        async with engine.connect() as conn:
+            result = await conn.exec_driver_sql("PRAGMA quick_check")
+            rows = list(result.fetchall())
+        return _interpret_quick_check_rows(rows)
+    except Exception as exc:  # noqa: BLE001 — degrade, do not crash sidecar
+        detail = f"{type(exc).__name__}: {exc}"
+        if looks_like_sqlite_corruption(exc):
+            return False, detail[:500]
+        return False, f"quick_check_error: {detail}"[:500]
 
 
 async def sqlite_quick_check_factory(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[bool, str]:
     """Same as ``sqlite_quick_check`` via a session factory (SyncWorker path)."""
-    async with session_factory() as session:
-        bind = session.get_bind()
-        if bind is not None and getattr(bind.dialect, "name", None) != "sqlite":
-            return True, "ok"
-        result = await session.execute(text("PRAGMA quick_check"))
-        rows = list(result.fetchall())
-    return _interpret_quick_check_rows(rows)
-
-
-def looks_like_sqlite_corruption(exc: BaseException) -> bool:
-    """True when an exception message indicates a corrupt SQLite file."""
-    text_s = f"{type(exc).__name__}: {exc}".lower()
-    needles = (
-        "database disk image is malformed",
-        "file is not a database",
-        "corrupt",
-        "malformed",
-    )
-    return any(n in text_s for n in needles)
+    try:
+        async with session_factory() as session:
+            bind = session.get_bind()
+            if bind is not None and getattr(bind.dialect, "name", None) != "sqlite":
+                return True, "ok"
+            result = await session.execute(text("PRAGMA quick_check"))
+            rows = list(result.fetchall())
+        return _interpret_quick_check_rows(rows)
+    except Exception as exc:  # noqa: BLE001 — degrade, do not crash sidecar
+        detail = f"{type(exc).__name__}: {exc}"
+        if looks_like_sqlite_corruption(exc):
+            return False, detail[:500]
+        return False, f"quick_check_error: {detail}"[:500]

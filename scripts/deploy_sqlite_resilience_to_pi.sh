@@ -115,6 +115,7 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3
 fi
 sudo ./scripts/install_pi_sqlite_cron.sh
+sudo ./scripts/install_pi_sqlite_auto_recover.sh
 REMOTE
 
 echo
@@ -134,8 +135,10 @@ ssh "$HOST" "bash -s" <<'REMOTE'
 set -euo pipefail
 echo "--- units ---"
 systemctl is-active intelipump.service intelipump-cloud-sync.service || true
-echo "--- cron ---"
-ls -l /etc/cron.d/intelipump-sqlite /usr/local/sbin/pi_sqlite_backup_and_check.sh 2>/dev/null || true
+echo "--- cron + auto-recover timer ---"
+ls -l /etc/cron.d/intelipump-sqlite /usr/local/sbin/pi_sqlite_backup_and_check.sh \
+  /usr/local/sbin/pi_sqlite_auto_recover.sh 2>/dev/null || true
+systemctl list-timers 'intelipump-sqlite-auto-recover*' --no-pager 2>/dev/null || true
 echo "--- integrity (quick) ---"
 DB=/var/lib/intelipump/intelipump.db
 if [[ -f "$DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
